@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import ValidationError
 
-from finki_hub.settings import Settings
+from shell_hub.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable

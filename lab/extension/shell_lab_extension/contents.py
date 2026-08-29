@@ -23,7 +23,7 @@ UPLOAD_SIZE_HEADER: Final = "X-Upload-Size"
 FIRST_CHUNK: Final = 1
 
 _declared_upload_size: ContextVar[int | None] = ContextVar(
-    "finki_lab_declared_upload_size",
+    "shell_lab_extension_declared_upload_size",
     default=None,
 )
 

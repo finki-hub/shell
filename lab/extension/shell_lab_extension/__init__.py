@@ -1,6 +1,6 @@
-"""Server extension for the FINKI shell-lab user container.
+"""Jupyter Server extension for Shell user environments.
 
-Discovery is the `jupyter_server_config.d/finki_lab.json` data file installed
+Discovery is the `jupyter_server_config.d/shell_lab_extension.json` data file installed
 into the venv's `etc/jupyter` (jupyter_server has no entry-point mechanism for
 server extensions: `ServerApp.init_server_extension_config` merges
 `jupyter_server_config.d/*.json` from every config path and nothing else).
@@ -20,9 +20,12 @@ from jupyter_server.services.contents.handlers import (
 )
 from jupyter_server.utils import url_path_join
 
-from finki_lab.contents import QuotaAwareFileManager, UploadSizeContentsHandler
-from finki_lab.storage import StorageHandler
-from finki_lab.terminals import CappedTerminalManager
+from shell_lab_extension.contents import (
+    QuotaAwareFileManager,
+    UploadSizeContentsHandler,
+)
+from shell_lab_extension.storage import StorageHandler
+from shell_lab_extension.terminals import CappedTerminalManager
 
 if TYPE_CHECKING:
     from jupyter_server.serverapp import ServerApp
@@ -36,7 +39,7 @@ __all__ = [
 
 
 def _jupyter_server_extension_points() -> list[dict[str, str]]:
-    return [{"module": "finki_lab"}]
+    return [{"module": "shell_lab_extension"}]
 
 
 #: `(?P<checkpoint_id>...)` exactly as jupyter_server's own route spells it.
@@ -77,4 +80,6 @@ def _load_jupyter_server_extension(server_app: ServerApp) -> None:
         (contents, UploadSizeContentsHandler),
     ]
     web_app.add_handlers(".*$", handlers)  # type: ignore[no-untyped-call]
-    server_app.log.info("finki_lab: storage and quota-aware contents routes registered")
+    server_app.log.info(
+        "shell_lab_extension: storage and quota-aware contents routes registered"
+    )

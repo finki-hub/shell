@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from finki_hub import quota, readiness
-from finki_hub.quota import (
+from shell_hub import quota, readiness
+from shell_hub.quota import (
     QuotaError,
     QuotaRefusalError,
     assert_admission,
@@ -20,13 +20,13 @@ from finki_hub.quota import (
     remove_home,
     run_command,
 )
-from finki_hub.readiness import PoolAssertionError
+from shell_hub.readiness import PoolAssertionError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from pathlib import Path
 
-    from finki_hub.settings import Settings
+    from shell_hub.settings import Settings
 
 XFS_PRJQUOTA = "xfs /dev/sda1 rw,prjquota,noatime"
 

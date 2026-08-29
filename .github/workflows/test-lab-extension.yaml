@@ -1,4 +1,4 @@
-name: Tests (Lab ext)
+name: Tests (Lab Extension)
 
 on:
   push:
@@ -14,6 +14,6 @@ jobs:
   pytest:
     uses: finki-hub/.github/.github/workflows/pytest.yaml@main
     with:
-      working-directory: ./lab/ext
+      working-directory: ./lab/extension
       sync-args: --frozen
       pytest-args: -q

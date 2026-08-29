@@ -1,5 +1,5 @@
 [project]
-name = "finki-lab-ext"
+name = "shell-lab-extension"
 version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
@@ -15,10 +15,10 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["finki_lab"]
+packages = ["shell_lab_extension"]
 
 [tool.hatch.build.targets.wheel.shared-data]
-"jupyter-config/jupyter_server_config.d/finki_lab.json" = "etc/jupyter/jupyter_server_config.d/finki_lab.json"
+"jupyter-config/jupyter_server_config.d/shell_lab_extension.json" = "etc/jupyter/jupyter_server_config.d/shell_lab_extension.json"
 
 [dependency-groups]
 dev = [
@@ -38,7 +38,7 @@ warn_unused_configs = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["finki_lab", "finki_lab.*"]
+module = ["shell_lab_extension", "shell_lab_extension.*"]
 disallow_any_generics = true
 disallow_incomplete_defs = true
 disallow_subclassing_any = true

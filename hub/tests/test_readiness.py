@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from docker.errors import DockerException
 
-from finki_hub.readiness import (
+from shell_hub.readiness import (
     ReadinessReport,
     docker_reasons,
     free_space_pct,

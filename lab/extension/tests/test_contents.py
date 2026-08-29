@@ -4,7 +4,7 @@ import pytest
 from tornado import web
 from tornado.httpclient import HTTPClientError
 
-from finki_lab.contents import (
+from shell_lab_extension.contents import (
     declared_upload_size,
     set_declared_upload_size,
 )
@@ -153,7 +153,7 @@ def test_saving_through_a_symlinked_directory_entry_is_refused(manager, tmp_path
 @pytest.fixture
 def jp_server_config(jp_server_config):
     jp_server_config.ServerApp.contents_manager_class = (
-        "finki_lab.contents.QuotaAwareFileManager"
+        "shell_lab_extension.contents.QuotaAwareFileManager"
     )
     return jp_server_config
 

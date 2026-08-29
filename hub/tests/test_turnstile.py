@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from finki_hub.turnstile import (
+from shell_hub.turnstile import (
     SITEVERIFY_TIMEOUT_S,
     SITEVERIFY_URL,
     check,

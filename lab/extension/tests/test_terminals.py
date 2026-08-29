@@ -2,7 +2,7 @@ import pytest
 from jupyter_server_terminals.terminalmanager import TerminalManager
 from tornado import web
 
-from finki_lab.terminals import (
+from shell_lab_extension.terminals import (
     DEFAULT_MAX_TERMINALS,
     CappedTerminalManager,
     max_terminals,

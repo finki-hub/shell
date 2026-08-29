@@ -441,7 +441,7 @@ wheels = [
 ]
 
 [[package]]
-name = "finki-lab-ext"
+name = "shell-lab-extension"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

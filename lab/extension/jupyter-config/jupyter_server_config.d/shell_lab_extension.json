@@ -1,7 +1,7 @@
 {
   "ServerApp": {
     "jpserver_extensions": {
-      "finki_lab": true
+      "shell_lab_extension": true
     }
   }
 }

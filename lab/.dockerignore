@@ -1,5 +1,5 @@
-ext/.venv
-ext/.mypy_cache
-ext/.pytest_cache
-ext/.ruff_cache
+extension/.venv
+extension/.mypy_cache
+extension/.pytest_cache
+extension/.ruff_cache
 **/__pycache__

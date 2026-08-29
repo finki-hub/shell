@@ -1,6 +1,6 @@
-"""JupyterHub configuration for the FINKI shell hub (image ``shell-hub``).
+"""JupyterHub configuration for Shell's Hub image, ``shell-hub``.
 
-Deliberately thin: every value comes from :class:`finki_hub.settings.Settings`,
+Deliberately thin: every value comes from :class:`shell_hub.settings.Settings`,
 and the boot invariants are asserted here at import time. JupyterHub runs with
 ``raise_config_file_errors=True``, so anything raised below stops the hub before
 it can serve a single request.
@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from traitlets.config import get_config
 
-from finki_hub.auth import EnvironmentTokenAuthenticator
-from finki_hub.quota import pre_spawn_hook
-from finki_hub.readiness import assert_pool
-from finki_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
+from shell_hub.auth import EnvironmentTokenAuthenticator
+from shell_hub.quota import pre_spawn_hook
+from shell_hub.readiness import assert_pool
+from shell_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
 
 c = get_config()
 

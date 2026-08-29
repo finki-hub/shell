@@ -8,9 +8,9 @@ import pytest
 from docker.errors import DockerException
 from jupyterhub.apihandlers.base import APIHandler
 
-from finki_hub import handlers, readiness
-from finki_hub.auth import username_for_token
-from finki_hub.handlers import (
+from shell_hub import handlers, readiness
+from shell_hub.auth import username_for_token
+from shell_hub.handlers import (
     CreationWindow,
     LoginError,
     LoginRequest,
@@ -18,14 +18,14 @@ from finki_hub.handlers import (
     check_login_headers,
     perform_login,
 )
-from finki_hub.turnstile import TurnstileVerdict
+from shell_hub.turnstile import TurnstileVerdict
 from tests.fakes import FakeDocker
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from finki_hub.settings import Settings
+    from shell_hub.settings import Settings
 
 TOKEN = "AbC012_-" * 4
 PASSED = TurnstileVerdict(outcome="passed")

@@ -23,13 +23,13 @@ from jupyterhub.handlers.base import BaseHandler
 from jupyterhub.utils import maybe_future
 from tornado import web
 
-from finki_hub.auth import is_valid_token, username_for_token
-from finki_hub.readiness import docker_client, has_free_space, readiness_report
-from finki_hub.settings import get_settings
-from finki_hub.turnstile import TurnstileVerdict, check
+from shell_hub.auth import is_valid_token, username_for_token
+from shell_hub.readiness import docker_client, has_free_space, readiness_report
+from shell_hub.settings import get_settings
+from shell_hub.turnstile import TurnstileVerdict, check
 
 if TYPE_CHECKING:
-    from finki_hub.settings import Settings
+    from shell_hub.settings import Settings
 
 #: Ceiling on a ``/hub/lab/*`` request body, enforced per handler.
 MAX_BODY_BYTES: Final[int] = 16 * 1024

@@ -5,8 +5,9 @@ environment admission and lifecycle, persistent home directories, XFS project qu
 creation of isolated user containers. It has no standalone user interface.
 
 The source directory and Compose service are named `hub`; the Python distribution is
-`finki-hub`, its import package is `finki_hub`, and its container image is `shell-hub`. These
-names belong to different technical namespaces and all refer to the Hub component.
+`shell-hub`, its import package is `shell_hub`, and its container image is
+`ghcr.io/finki-hub/shell-hub`. These names belong to different technical namespaces and all
+refer to the Hub component.
 
 ## Responsibilities
 
@@ -21,7 +22,7 @@ names belong to different technical namespaces and all refer to the Hub componen
 ## Runtime Integration
 
 [`jupyterhub_config.py`](./jupyterhub_config.py) is the JupyterHub entry point. It loads typed
-settings from `finki_hub`, validates the host and pool prerequisites, configures DockerSpawner,
+settings from `shell_hub`, validates the host and pool prerequisites, configures DockerSpawner,
 and registers Shell's request handlers.
 
 The Hub runs as a trusted service because it must access the Docker socket and manage project

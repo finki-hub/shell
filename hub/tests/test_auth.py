@@ -9,20 +9,20 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from finki_hub import auth
-from finki_hub.auth import (
+from shell_hub import auth
+from shell_hub.auth import (
     USERNAME_LENGTH,
     EnvironmentTokenAuthenticator,
     is_valid_token,
     username_for_token,
 )
-from finki_hub.quota import QuotaError
+from shell_hub.quota import QuotaError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from finki_hub.settings import Settings
+    from shell_hub.settings import Settings
 
 VALID_TOKEN = "AbC012_-" * 4  # 32 characters, the shortest accepted form
 

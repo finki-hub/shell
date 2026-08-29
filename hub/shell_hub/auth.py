@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 from jupyterhub.auth import Authenticator
 from jupyterhub.utils import maybe_future
 
-from finki_hub.quota import QuotaError, remove_home
-from finki_hub.settings import get_settings
+from shell_hub.quota import QuotaError, remove_home
+from shell_hub.settings import get_settings
 
 if TYPE_CHECKING:
     from tornado.web import RequestHandler
@@ -70,8 +70,8 @@ class EnvironmentTokenAuthenticator(Authenticator):  # type: ignore[misc] # jupy
         app: Any,  # ruff: ignore[any-type, unused-method-argument] - JupyterHub hands over its application object
     ) -> list[tuple[str, type[RequestHandler]]]:
         """The routes JupyterHub mounts under ``/hub``; deliberately no login page."""
-        # Imported here because finki_hub.handlers imports this module.
-        from finki_hub import handlers  # ruff: ignore[import-outside-top-level]
+        # Imported here because shell_hub.handlers imports this module.
+        from shell_hub import handlers  # ruff: ignore[import-outside-top-level]
 
         return [
             ("/lab/login", handlers.LabLoginHandler),

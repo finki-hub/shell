@@ -13,10 +13,10 @@ c.ServerApp.terminals_enabled = True
 c.ServerApp.terminado_settings = {"shell_command": ["/bin/bash", "-l"]}
 c.ServerApp.max_body_size = 8 * 1024 * 1024  # one chunk + base64 overhead
 c.ServerApp.max_buffer_size = 8 * 1024 * 1024
-c.ServerApp.contents_manager_class = "finki_lab.contents.QuotaAwareFileManager"
+c.ServerApp.contents_manager_class = "shell_lab_extension.contents.QuotaAwareFileManager"
 c.ContentsManager.allow_hidden = True
 c.FileContentsManager.delete_to_trash = False
-c.TerminalsExtensionApp.terminal_manager_class = "finki_lab.terminals.CappedTerminalManager"
+c.TerminalsExtensionApp.terminal_manager_class = "shell_lab_extension.terminals.CappedTerminalManager"
 # Safety net for a pty whose browser tab vanished without a DELETE; the SPA
 # deletes its own terminal on pagehide, so this rarely fires.
 c.TerminalManager.cull_inactive_timeout = 900

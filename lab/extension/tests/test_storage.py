@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from tornado.httpclient import HTTPClientError
 
-from finki_lab.storage import DEFAULT_HOME, home_directory, storage_report
+from shell_lab_extension.storage import DEFAULT_HOME, home_directory, storage_report
 from tests.support import fake_statvfs
 
 REPORT_KEYS = {"bytesUsed", "bytesLimit", "inodesUsed", "inodesLimit"}

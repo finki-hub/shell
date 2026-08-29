@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from finki_hub.handlers import (
+from shell_hub.handlers import (
     MAX_BODY_BYTES,
     LoginError,
     LoginRequest,

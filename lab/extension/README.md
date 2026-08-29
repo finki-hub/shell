@@ -5,9 +5,9 @@ The Lab Extension is an internal Jupyter Server extension installed in every
 and terminal safeguards for the web application. It is built into the user-environment image
 and is not deployed as a standalone service or image.
 
-`ext` is short for “extension.” The source directory is `lab/ext/`, the Python distribution is
-`finki-lab-ext`, its import and Jupyter extension package is `finki_lab`, and the complete
-user-environment image is `shell-lab`.
+The source directory is `lab/extension/`, the Python distribution is `shell-lab-extension`, and
+its import and Jupyter Server extension package is `shell_lab_extension`. The complete
+user-environment image remains `shell-lab`.
 
 ## Responsibilities
 
@@ -25,8 +25,8 @@ the authoritative storage limit.
 
 The [Lab Dockerfile](../Dockerfile) installs this Python project into the Jupyter environment
 while building the user-environment image. The extension configuration at
-[`jupyter-config/jupyter_server_config.d/finki_lab.json`](./jupyter-config/jupyter_server_config.d/finki_lab.json)
-enables `finki_lab`, and the parent
+[`jupyter-config/jupyter_server_config.d/shell_lab_extension.json`](./jupyter-config/jupyter_server_config.d/shell_lab_extension.json)
+enables `shell_lab_extension`, and the parent
 [`jupyter_server_config.py`](../jupyter_server_config.py) selects its contents and terminal
 managers.
 
@@ -39,7 +39,7 @@ and applies their project quotas.
 Requires Python 3.14 and [`uv`](https://docs.astral.sh/uv/).
 
 ```sh
-cd lab/ext
+cd lab/extension
 uv sync --frozen
 uv run ruff check .
 uv run ruff format --check .

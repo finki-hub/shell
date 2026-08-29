@@ -4,7 +4,7 @@ Every key of the rebuild contract section 5 is represented here. The boot-time
 invariants that can be decided from configuration alone are model validators, so
 an invalid ``.env`` makes ``Settings()`` raise and JupyterHub refuses to start
 (``raise_config_file_errors`` is on by default). The invariants that need the
-filesystem or the Docker daemon live in :mod:`finki_hub.readiness`.
+filesystem or the Docker daemon live in :mod:`shell_hub.readiness`.
 """
 
 from __future__ import annotations

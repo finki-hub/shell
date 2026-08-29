@@ -136,14 +136,13 @@ alternative product names.
 | Component | Source | Role | Packaged identifiers |
 | --- | --- | --- | --- |
 | Web application | `web/` | Browser interface and web entry point | workspace and image `shell-web` |
-| [Hub](./hub/README.md) | `hub/` | JupyterHub-based control service for identity, environments, quotas, and lifecycle | distribution `finki-hub`, import `finki_hub`, image `shell-hub` |
+| [Hub](./hub/README.md) | `hub/` | JupyterHub-based control service for identity, environments, quotas, and lifecycle | distribution `shell-hub`, import `shell_hub`, image `ghcr.io/finki-hub/shell-hub` |
 | User environment | `lab/` | Ubuntu image used for each visitor's container | image `shell-lab` |
-| [Lab Extension](./lab/ext/README.md) | `lab/ext/` | Jupyter Server extension embedded in the user-environment image | distribution `finki-lab-ext`, import `finki_lab` |
+| [Lab Extension](./lab/extension/README.md) | `lab/extension/` | Jupyter Server extension embedded in the user-environment image | distribution `shell-lab-extension`, import `shell_lab_extension` |
 
-`ext` is short for “extension.” It is a separately tested Python project installed inside the
-user-environment image, not a standalone service or container. The `lab` Compose profile entry
-exists only so the image can be pulled with the rest of the stack; the Hub creates the actual
-user containers.
+The Lab Extension is a separately tested Python project installed inside the user-environment
+image, not a standalone service or container. The `lab` Compose profile entry exists only so the
+image can be pulled with the rest of the stack; the Hub creates the actual user containers.
 
 ## Security
 
@@ -173,7 +172,7 @@ uv run pytest -q
 Lab Extension, starting again from the repository root:
 
 ```sh
-cd lab/ext
+cd lab/extension
 uv sync --frozen
 uv run ruff check .
 uv run ruff format --check .

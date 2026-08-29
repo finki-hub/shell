@@ -21,13 +21,13 @@ RUN uv python install 3.14
 WORKDIR /src
 
 # Dependencies first: they change far less often than the extension itself.
-COPY ext/pyproject.toml ext/uv.lock ext/.python-version ./
+COPY extension/pyproject.toml extension/uv.lock extension/.python-version ./
 RUN uv sync --frozen --no-dev --no-editable --no-install-project
 
-COPY ext/ ./
+COPY extension/ ./
 # --no-editable so the runtime image carries a real install rather than a .pth
 # pointing back at this build stage's source tree. The extension's
-# jupyter_server_config.d/finki_lab.json data file lands in
+# jupyter_server_config.d/shell_lab_extension.json data file lands in
 # /opt/jupyter/etc/jupyter, which is what enables it at startup.
 RUN uv sync --frozen --no-dev --no-editable
 

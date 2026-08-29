@@ -1,7 +1,7 @@
 import pytest
 from traitlets.config import Config
 
-from finki_lab.contents import QuotaAwareFileManager, set_declared_upload_size
+from shell_lab_extension.contents import QuotaAwareFileManager, set_declared_upload_size
 
 pytest_plugins = ["pytest_jupyter.jupyter_server"]
 
@@ -14,7 +14,7 @@ def jp_server_config():
             "ServerApp": {
                 "jpserver_extensions": {
                     "jupyter_server_terminals": True,
-                    "finki_lab": True,
+                    "shell_lab_extension": True,
                 },
             },
         }

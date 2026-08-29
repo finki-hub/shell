@@ -1,4 +1,4 @@
-name: Linters (Lab ext)
+name: Linters (Lab Extension)
 
 on:
   push:
@@ -14,11 +14,11 @@ jobs:
   ruff:
     uses: finki-hub/.github/.github/workflows/ruff.yaml@main
     with:
-      working-directory: ./lab/ext
+      working-directory: ./lab/extension
     secrets: inherit
 
   mypy:
     uses: finki-hub/.github/.github/workflows/mypy.yaml@main
     with:
-      working-directory: ./lab/ext
+      working-directory: ./lab/extension
     secrets: inherit

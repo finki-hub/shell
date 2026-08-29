@@ -23,13 +23,13 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
-from finki_hub.readiness import assert_pool, free_space_pct
-from finki_hub.settings import get_settings
+from shell_hub.readiness import assert_pool, free_space_pct
+from shell_hub.settings import get_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from finki_hub.settings import Settings
+    from shell_hub.settings import Settings
 
 #: Files ``scripts/pool-init.sh`` creates and this module maintains.
 LOCK_NAME: Final[str] = ".lock"

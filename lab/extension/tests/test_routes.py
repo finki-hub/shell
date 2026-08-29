@@ -3,7 +3,7 @@ import json
 import pytest
 from tornado.httpclient import HTTPClientError
 
-from finki_lab import _drop_upload_leftovers
+from shell_lab_extension import _drop_upload_leftovers
 
 NOTEBOOK = {
     "cells": [],
@@ -18,7 +18,7 @@ def jp_server_config(jp_server_config):
     # Given the lab image's contents manager, so the /api/contents override that
     # shadows these routes is genuinely in place.
     jp_server_config.ServerApp.contents_manager_class = (
-        "finki_lab.contents.QuotaAwareFileManager"
+        "shell_lab_extension.contents.QuotaAwareFileManager"
     )
     return jp_server_config
 
