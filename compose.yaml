@@ -1,9 +1,5 @@
 name: finki-hub-shell
 
-# Production stack. A single loopback port (web, Caddy) is published; everything
-# else binds 127.0.0.1 or the users-bridge gateway address. The outer reverse
-# proxy terminates TLS in front of this stack.
-
 x-logging: &default-logging
   driver: json-file
   options:
@@ -100,17 +96,12 @@ services:
       start_period: 60s
     logging: *default-logging
 
-  # Never started: it exists so that `docker compose --profile images pull`
-  # fetches the user container image alongside the three real services. The hub
-  # spawns lab containers itself, through DockerSpawner.
   lab:
     image: ${LAB_IMAGE:-ghcr.io/finki-hub/shell-lab:latest}
     profiles: ["images"]
     command: ["true"]
     restart: "no"
 
-# Created by scripts/pool-init.sh, not by Compose: the bridge and its gateway
-# address must outlive `docker compose down`, because the hub binds 172.30.0.1.
 networks:
   users:
     external: true

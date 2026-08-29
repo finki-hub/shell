@@ -1,11 +1,3 @@
-# Repository-root build context. Only `web/Dockerfile` builds from here
-# (`.github/workflows/docker-web.yaml` sets `context: .`); hub, lab and helper
-# build from their own directories and carry their own .dockerignore.
-#
-# `npm ci` inside the build stage populates web/node_modules for linux/amd64;
-# without these rules the host's own node_modules (possibly built for another
-# architecture) and a stale web/dist would be uploaded into the context and
-# copied straight over it by `COPY web/ web/`.
 **/node_modules/
 **/dist/
 **/.venv/
