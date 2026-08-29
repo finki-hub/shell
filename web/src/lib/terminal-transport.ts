@@ -64,9 +64,9 @@ const ServerFrameSchema = z.union([
   z.tuple([z.literal('disconnect'), z.number()]),
 ]);
 
-// One tab, one shell. `sessionStorage` is the exact lifetime wanted: it
-// survives a reload and is discarded with the tab, so two tabs never fight
-// over one pty and a refresh does not orphan the one it had.
+// One tab, one shell. `sessionStorage` keeps two tabs from fighting over one
+// pty. An accepted refresh or close clears the key in `pagehide`; only an
+// unclean browser restore can present a remembered terminal to a new document.
 const TERMINAL_KEY = 'lab.terminal';
 
 const PROTOCOL_CLOSE_CODE = 1_002;
@@ -178,10 +178,9 @@ export const createTerminal = async (
     : { name: model.name, ok: true };
 };
 
-// Attach when this tab's own shell is still there, create otherwise. An attach
-// is a WebSocket and nothing else — no POST — because terminado replays a
-// pty's scrollback to every client that joins it, so a reload lands back in
-// the same shell with the same history rather than on a blank prompt.
+// Recover a pty only when an unclean browser unload left both its tab-local
+// name and server process behind; accepted refresh and close clear the name.
+// Attaching to a recovered pty is a WebSocket and nothing else — no POST.
 export const resolveTerminal = async (
   session: LabSession,
   signal?: AbortSignal,
@@ -235,16 +234,11 @@ export const releaseTerminal = (session: LabSession, name: string): void => {
   })();
 };
 
-// Closing a tab must not leave its pty behind: `LAB_MAX_TERMINALS` is a
-// per-container budget, and an abandoned shell holds a slot until the server's
-// 15-minute idle cull notices. `pagehide` is the last event a document
-// reliably gets and it cannot tell a close from a reload, so the delete is
-// unconditional — and the reattach in `resolveTerminal` is what makes that
-// safe rather than wasteful. Whenever the delete does not land (a crash, a
-// force-quit, an offline tab, a browser that drops the keepalive request) the
-// next load finds the terminal still listed and joins it, scrollback and all;
-// when it does land there is nothing to join and a fresh shell is created,
-// which is what a reload would have got in any case.
+// An accepted close or refresh ends this page's shell. `pagehide` cannot tell
+// those actions apart, so both clear the remembered name and issue the same
+// unconditional delete. If the browser drops the keepalive request, a new
+// document still creates a fresh terminal and the 15-minute server cull is the
+// backstop for the orphaned pty.
 const releaseOnPagehide =
   (session: LabSession): (() => void) =>
   (): void => {
