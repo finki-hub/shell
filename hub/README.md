@@ -4,11 +4,6 @@ The Hub is [Shell's](../README.md) JupyterHub-based control service. It manages 
 environment admission and lifecycle, persistent home directories, XFS project quotas, and the
 creation of isolated user containers. It has no standalone user interface.
 
-The source directory and Compose service are named `hub`; the Python distribution is
-`shell-hub`, its import package is `shell_hub`, and its container image is
-`ghcr.io/finki-hub/shell-hub`. These names belong to different technical namespaces and all
-refer to the Hub component.
-
 ## Responsibilities
 
 - Handles environment login and deletion requests from the web application

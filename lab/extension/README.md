@@ -5,10 +5,6 @@ The Lab Extension is an internal Jupyter Server extension installed in every
 and terminal safeguards for the web application. It is built into the user-environment image
 and is not deployed as a standalone service or image.
 
-The source directory is `lab/extension/`, the Python distribution is `shell-lab-extension`, and
-its import and Jupyter Server extension package is `shell_lab_extension`. The complete
-user-environment image remains `shell-lab`.
-
 ## Responsibilities
 
 - Reports home-directory byte and inode usage through the authenticated `lab/storage` endpoint
