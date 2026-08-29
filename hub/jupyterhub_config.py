@@ -7,13 +7,17 @@ it can serve a single request.
 """
 
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from traitlets.config import get_config
 
 from finki_hub.auth import EnvironmentTokenAuthenticator
 from finki_hub.quota import pre_spawn_hook
 from finki_hub.readiness import assert_pool
 from finki_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
 
-c = get_config()  # type: ignore[name-defined] # ruff: ignore[undefined-name] - traitlets injects get_config here
+c = get_config()
 
 # Boot invariants. Settings() raises on an invalid .env (memory headroom, root
 # uid, unpaired or dummy Turnstile keys); assert_pool raises unless /srv/pool is
@@ -62,6 +66,7 @@ c.DockerSpawner.name_template = "lab-{username}"
 c.DockerSpawner.port = 8888
 c.DockerSpawner.remove = True
 c.DockerSpawner.pull_policy = "ifnotpresent"
+c.DockerSpawner.cpu_limit = None
 c.DockerSpawner.volumes = {
     f"{settings.lab_pool_dir}/users/{{username}}": {"bind": lab_home, "mode": "rw"}
 }

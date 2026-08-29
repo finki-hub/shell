@@ -57,10 +57,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     network_mode: host
-    # quotactl; if xfs_quota fails with EPERM on your Docker version use
-    # privileged: true instead.
-    cap_add:
-      - SYS_ADMIN
+    privileged: true
     environment:
       CONFIGPROXY_AUTH_TOKEN: ${CONFIGPROXY_AUTH_TOKEN:?CONFIGPROXY_AUTH_TOKEN is required}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
