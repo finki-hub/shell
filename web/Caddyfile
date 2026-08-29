@@ -1,0 +1,57 @@
+{
+	auto_https off
+	admin off
+}
+
+:{$HOST_PORT:8080} {
+	bind 127.0.0.1
+
+	encode gzip
+
+	header {
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	# Render the site key from the environment on every request. An unset
+	# TURNSTILE_SITEKEY renders as "sitekey":""; readConfig() maps it to null.
+	handle /config.json {
+		header Content-Type application/json
+		header Cache-Control "no-store"
+		respond `{"sitekey":"{env.TURNSTILE_SITEKEY}"}` 200
+	}
+
+	# Allow-list only: no other /hub/* path is proxied, so /hub/home, /hub/spawn,
+	# /hub/token, /hub/admin and /hub/login (JupyterHub's own HTML/login surface)
+	# 404 at this edge rather than reaching the hub. /hub/lab/ready is deliberately
+	# absent too: the Compose healthcheck reaches it at 172.30.0.1:8081 directly,
+	# so it needs no public route.
+	@hub path /hub/api/* /hub/lab/login /hub/lab/discard /hub/health /hub/error* /hub/static/*
+	handle @hub {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# reverse_proxy forwards Host and the X-Forwarded-* / Upgrade / Connection
+	# headers unmodified by default, so the terminal WebSocket
+	# (wss://<origin>/user/<u>/terminals/websocket/<name>) upgrades transparently
+	# through this route.
+	handle /user/* {
+		log_skip
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# Everything else is the SPA: serve the built file if it exists, else fall
+	# back to index.html for client-side routing.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

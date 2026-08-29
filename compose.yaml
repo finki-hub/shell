@@ -1,0 +1,120 @@
+name: finki-hub-shell
+
+# Production stack. A single loopback port (web, Caddy) is published; everything
+# else binds 127.0.0.1 or the users-bridge gateway address. The outer reverse
+# proxy terminates TLS in front of this stack.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  web:
+    image: ghcr.io/finki-hub/shell-web:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HOST_PORT: ${HOST_PORT:-8080}
+      TURNSTILE_SITEKEY: ${TURNSTILE_SITEKEY:-}
+      TZ: ${TZ:-Europe/Skopje}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${HOST_PORT:-8080}/config.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  proxy:
+    image: quay.io/jupyterhub/configurable-http-proxy:5.3.0
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --ip
+      - "127.0.0.1"
+      - --port
+      - "8000"
+      - --api-ip
+      - "127.0.0.1"
+      - --api-port
+      - "8001"
+      - --error-target
+      - "http://172.30.0.1:8081/hub/error"
+    environment:
+      CONFIGPROXY_AUTH_TOKEN: ${CONFIGPROXY_AUTH_TOKEN:?CONFIGPROXY_AUTH_TOKEN is required}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/_chp_healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  hub:
+    image: ghcr.io/finki-hub/shell-hub:latest
+    restart: unless-stopped
+    stop_grace_period: 30s
+    network_mode: host
+    # quotactl; if xfs_quota fails with EPERM on your Docker version use
+    # privileged: true instead.
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      CONFIGPROXY_AUTH_TOKEN: ${CONFIGPROXY_AUTH_TOKEN:?CONFIGPROXY_AUTH_TOKEN is required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: ${TZ:-Europe/Skopje}
+      LAB_POOL_DIR: ${LAB_POOL_DIR:-/var/lib/finki-hub-shell/pool}
+      LAB_POOL_RESERVE_PCT: ${LAB_POOL_RESERVE_PCT:-2}
+      LAB_ENV_QUOTA_MB: ${LAB_ENV_QUOTA_MB:-100}
+      LAB_ENV_MAX_INODES: ${LAB_ENV_MAX_INODES:-20000}
+      LAB_IMAGE: ${LAB_IMAGE:-ghcr.io/finki-hub/shell-lab:latest}
+      LAB_USER: ${LAB_USER:-ubuntu}
+      LAB_UID: ${LAB_UID:-1000}
+      LAB_GID: ${LAB_GID:-1000}
+      LAB_MEMORY_MB: ${LAB_MEMORY_MB:-384}
+      LAB_CPUS: ${LAB_CPUS:-0.5}
+      LAB_PIDS: ${LAB_PIDS:-256}
+      LAB_TMP_MB: ${LAB_TMP_MB:-32}
+      LAB_VARTMP_MB: ${LAB_VARTMP_MB:-16}
+      LAB_RUN_MB: ${LAB_RUN_MB:-8}
+      LAB_SHM_MB: ${LAB_SHM_MB:-16}
+      LAB_MAX_SESSIONS: ${LAB_MAX_SESSIONS:-20}
+      LAB_MAX_TERMINALS: ${LAB_MAX_TERMINALS:-4}
+      LAB_IDLE_MIN: ${LAB_IDLE_MIN:-10}
+      LAB_CONTAINER_MAX_AGE_H: ${LAB_CONTAINER_MAX_AGE_H:-24}
+      LAB_RETENTION_H: ${LAB_RETENTION_H:-48}
+      LAB_MAX_AGE_H: ${LAB_MAX_AGE_H:-0}
+      LAB_MAX_CREATES_PER_MIN: ${LAB_MAX_CREATES_PER_MIN:-60}
+      LAB_LOG_MAX_SIZE: ${LAB_LOG_MAX_SIZE:-512k}
+      LAB_LOG_MAX_FILES: ${LAB_LOG_MAX_FILES:-2}
+      TURNSTILE_SITEKEY: ${TURNSTILE_SITEKEY:-}
+      TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/hub:/srv/hub
+      - ${LAB_POOL_DIR:-/var/lib/finki-hub-shell/pool}:/srv/pool
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://172.30.0.1:8081/hub/lab/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  # Never started: it exists so that `docker compose --profile images pull`
+  # fetches the user container image alongside the three real services. The hub
+  # spawns lab containers itself, through DockerSpawner.
+  lab:
+    image: ${LAB_IMAGE:-ghcr.io/finki-hub/shell-lab:latest}
+    profiles: ["images"]
+    command: ["true"]
+    restart: "no"
+
+# Created by scripts/pool-init.sh, not by Compose: the bridge and its gateway
+# address must outlive `docker compose down`, because the hub binds 172.30.0.1.
+networks:
+  users:
+    external: true
+    name: finki-hub-shell-users

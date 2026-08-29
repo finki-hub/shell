@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GHCR for new finki-hub-shell images every ten minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=finki-hub-shell-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+name: Docker (Hub)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    uses: finki-hub/.github/.github/workflows/docker.yaml@main
+    with:
+      dockerfile: ./hub/Dockerfile
+      context: ./hub
+      package-name: shell-hub
+      cache-backend: registry
+    secrets: inherit

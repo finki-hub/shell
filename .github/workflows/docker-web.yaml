@@ -1,0 +1,22 @@
+name: Docker (Web)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    uses: finki-hub/.github/.github/workflows/docker.yaml@main
+    with:
+      dockerfile: ./web/Dockerfile
+      context: .
+      package-name: shell-web
+      cache-backend: registry
+      build-args: |
+        VITE_POSTHOG_KEY=${{ vars.VITE_POSTHOG_KEY }}
+        VITE_POSTHOG_HOST=${{ vars.VITE_POSTHOG_HOST }}
+    secrets: inherit

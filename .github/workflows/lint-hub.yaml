@@ -1,0 +1,24 @@
+name: Linters (Hub)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    uses: finki-hub/.github/.github/workflows/ruff.yaml@main
+    with:
+      working-directory: ./hub
+    secrets: inherit
+
+  mypy:
+    uses: finki-hub/.github/.github/workflows/mypy.yaml@main
+    with:
+      working-directory: ./hub
+    secrets: inherit

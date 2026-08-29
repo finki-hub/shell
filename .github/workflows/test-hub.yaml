@@ -1,0 +1,19 @@
+name: Tests (Hub)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    uses: finki-hub/.github/.github/workflows/pytest.yaml@main
+    with:
+      working-directory: ./hub
+      sync-args: --frozen
+      pytest-args: -q

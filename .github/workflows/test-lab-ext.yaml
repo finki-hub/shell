@@ -1,0 +1,19 @@
+name: Tests (Lab ext)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    uses: finki-hub/.github/.github/workflows/pytest.yaml@main
+    with:
+      working-directory: ./lab/ext
+      sync-args: --frozen
+      pytest-args: -q

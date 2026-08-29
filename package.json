@@ -1,0 +1,23 @@
+{
+  "devDependencies": {
+    "eslint": "^10.8.1",
+    "eslint-config-imperium": "^4.1.4"
+  },
+  "license": "MIT",
+  "name": "finki-hub-shell",
+  "private": true,
+  "scripts": {
+    "build": "npm run build --workspace shell-web",
+    "check": "npm run check --workspace shell-web",
+    "dev": "npm run dev --workspace shell-web",
+    "format": "npm run format --workspace shell-web",
+    "lint": "npm run lint --workspace shell-web",
+    "test": "npm run test --workspace shell-web",
+    "test:coverage": "npm run test:coverage --workspace shell-web"
+  },
+  "type": "module",
+  "version": "0.0.0",
+  "workspaces": [
+    "web"
+  ]
+}
