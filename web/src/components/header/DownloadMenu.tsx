@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-controls';
 import { useDismissable } from '@/hooks/useDismissable';
 import { useLanguage } from '@/hooks/useLanguage';
-import { type ArchiveFormat } from '@/lib/protocol';
+import { type ArchiveFormat } from '@/lib/contents-api';
 
 type DownloadMenuProps = {
   readonly disabled: boolean;

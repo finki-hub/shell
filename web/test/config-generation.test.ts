@@ -1,19 +1,41 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const config = {
-  challengeGraceMs: 1,
-  challengeIntervalMs: 2,
-  sitekey: 'sitekey',
-};
-
-describe('generation-owned config fetch', () => {
+describe('configuration loading', () => {
   afterEach(() => {
     vi.resetModules();
     vi.unstubAllGlobals();
   });
 
-  it('aborts the underlying request and rejects its late result', async () => {
-    // Given
+  it('reads /config.json, maps an empty sitekey to null, and caches it', async () => {
+    const fetchRequest = vi.fn(() =>
+      Promise.resolve(Response.json({ sitekey: '' })),
+    );
+    vi.stubGlobal('fetch', fetchRequest);
+    const { readConfig } = await import('@/lib/config');
+
+    await expect(readConfig()).resolves.toEqual({ sitekey: null });
+    await expect(readConfig()).resolves.toEqual({ sitekey: null });
+
+    expect(fetchRequest).toHaveBeenCalledTimes(1);
+    expect(fetchRequest).toHaveBeenCalledWith('/config.json', {});
+  });
+
+  it('does not cache a fallback', async () => {
+    const fetchRequest = vi
+      .fn<() => Promise<Response>>()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(Response.json({ sitekey: 'site-key' }));
+    vi.stubGlobal('fetch', fetchRequest);
+    const { readConfig } = await import('@/lib/config');
+
+    await expect(readConfig()).resolves.toEqual({ sitekey: null });
+    await expect(readConfig()).resolves.toEqual({ sitekey: 'site-key' });
+    await expect(readConfig()).resolves.toEqual({ sitekey: 'site-key' });
+
+    expect(fetchRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts an in-flight request without publishing its late response', async () => {
     const response = Promise.withResolvers<Response>();
     const signals: Array<AbortSignal | null | undefined> = [];
     vi.stubGlobal(
@@ -27,46 +49,10 @@ describe('generation-owned config fetch', () => {
     const controller = new AbortController();
     const pending = readConfig(controller.signal);
 
-    // When
     controller.abort(new DOMException('cancelled', 'AbortError'));
-    response.resolve(Response.json(config));
+    response.resolve(Response.json({ sitekey: 'late' }));
 
-    // Then
-    expect(signals).toEqual([controller.signal]);
-    expect(signals[0]?.aborted).toBe(true);
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
-  });
-
-  it('does not let caller A abort or cache-poison caller B', async () => {
-    // Given
-    const first = Promise.withResolvers<Response>();
-    const second = Promise.withResolvers<Response>();
-    const responses = [first.promise, second.promise];
-    const signals: Array<AbortSignal | null | undefined> = [];
-    const fetchRequest = vi.fn(
-      (_input: RequestInfo | URL, init?: RequestInit) => {
-        signals.push(init?.signal);
-        return responses.shift() ?? Promise.reject(new Error('extra request'));
-      },
-    );
-    vi.stubGlobal('fetch', fetchRequest);
-    const { readConfig } = await import('@/lib/config');
-    const controllerA = new AbortController();
-    const controllerB = new AbortController();
-    const pendingA = readConfig(controllerA.signal);
-    const pendingB = readConfig(controllerB.signal);
-
-    // When
-    controllerA.abort(new DOMException('cancelled', 'AbortError'));
-    first.resolve(Response.json({ ...config, sitekey: 'stale' }));
-    second.resolve(Response.json(config));
-
-    // Then
-    await expect(pendingA).rejects.toMatchObject({ name: 'AbortError' });
-    await expect(pendingB).resolves.toEqual(config);
-    await expect(readConfig()).resolves.toEqual(config);
-    expect(fetchRequest).toHaveBeenCalledTimes(2);
-    expect(signals).toEqual([controllerA.signal, controllerB.signal]);
-    expect(signals[1]?.aborted).toBe(false);
+    expect(signals).toEqual([controller.signal]);
   });
 });

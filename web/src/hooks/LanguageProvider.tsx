@@ -1,6 +1,5 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react';
 
-import { setBaseTitle } from '@/lib/attention';
 import { type Language, translations } from '@/lib/i18n';
 
 import { LanguageContext } from './LanguageContext';
@@ -42,7 +41,7 @@ export const LanguageProvider = ({
   useEffect(() => {
     const copy = translations[language];
     document.documentElement.lang = language;
-    setBaseTitle(`${copy.brand} / ${copy.title}`);
+    document.title = `${copy.brand} / ${copy.title}`;
   }, [language]);
 
   const t = translations[language];

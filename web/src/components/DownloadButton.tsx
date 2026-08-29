@@ -3,7 +3,7 @@ import { useCallback, useRef, useState } from 'react';
 
 import { useDismissable } from '@/hooks/useDismissable';
 import { useLanguage } from '@/hooks/useLanguage';
-import { type ArchiveFormat } from '@/lib/protocol';
+import { type ArchiveFormat } from '@/lib/contents-api';
 import { cn } from '@/lib/utils';
 
 type DownloadButtonProps = {

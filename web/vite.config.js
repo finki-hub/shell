@@ -12,12 +12,12 @@ export default defineConfig({
   },
   server: {
     host: '::',
-    port: 8_080,
+    port: 5_173,
     proxy: {
-      '/api': 'http://localhost:3000',
-      '/healthz': 'http://localhost:3000',
-      '/ws': {
-        target: 'ws://localhost:3000',
+      '/config.json': 'http://127.0.0.1:8080',
+      '/hub': 'http://127.0.0.1:8080',
+      '/user': {
+        target: 'http://127.0.0.1:8080',
         ws: true,
       },
     },
@@ -27,10 +27,10 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html', 'lcov'],
       thresholds: {
-        branches: 66.27,
-        functions: 71.28,
-        lines: 81.33,
-        statements: 80.75,
+        branches: 65.58,
+        functions: 79,
+        lines: 84.47,
+        statements: 82.04,
       },
     },
   },

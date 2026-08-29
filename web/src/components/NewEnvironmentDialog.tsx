@@ -11,15 +11,13 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useLanguage } from '@/hooks/useLanguage';
-import { type ArchiveFormat } from '@/lib/protocol';
+import { type ArchiveFormat } from '@/lib/contents-api';
 
 type NewEnvironmentDialogProps = {
   readonly container: HTMLElement | null;
   readonly onCancel: () => void;
-  // See ChallengeModal: focus has to be handed back deliberately, or the
-  // terminal stops taking keystrokes until it is clicked.
   readonly onClosed: () => void;
-  readonly onConfirm: () => void;
+  readonly onConfirm: () => Promise<boolean>;
   readonly onDownload: (format: ArchiveFormat) => void;
 };
 
@@ -36,6 +34,7 @@ export const NewEnvironmentDialog = ({
 }: NewEnvironmentDialogProps) => {
   const { t } = useLanguage();
   const [downloaded, setDownloaded] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
 
   return (
     // The only one of these that is a question rather than a statement, so it
@@ -67,7 +66,8 @@ export const NewEnvironmentDialog = ({
           </div>
           <DownloadButton
             block
-            label={t.session.expiredDownload}
+            disabled={discarding}
+            label={t.actions.downloadAll}
             onDownload={(format) => {
               setDownloaded(true);
               onDownload(format);
@@ -83,6 +83,7 @@ export const NewEnvironmentDialog = ({
             </button>
             <button
               className="inline-flex h-10 flex-1 cursor-pointer items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+              disabled={discarding}
               onClick={() => {
                 if (!downloaded) {
                   // Said once, not enforced. It is their environment, and a
@@ -90,8 +91,11 @@ export const NewEnvironmentDialog = ({
                   // dismiss without reading.
                   toast.warning(t.session.newEnvironmentNotDownloaded);
                 }
-
-                onConfirm();
+                setDiscarding(true);
+                void (async () => {
+                  const discarded = await onConfirm();
+                  if (!discarded) setDiscarding(false);
+                })();
               }}
               type="button"
             >

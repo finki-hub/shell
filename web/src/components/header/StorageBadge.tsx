@@ -1,7 +1,11 @@
 import { useLanguage } from '@/hooks/useLanguage';
-import { type StorageUsage } from '@/lib/protocol';
-import { formatUsage, isStorageFull, storagePercent } from '@/lib/storage';
-import { formatBytes } from '@/lib/transfer';
+import {
+  formatBytes,
+  formatUsage,
+  isStorageFull,
+  storagePercent,
+} from '@/lib/storage';
+import { type StorageUsage } from '@/lib/storage-api';
 import { cn } from '@/lib/utils';
 
 // Both vendor pseudo-elements have to be painted: Firefox fills
