@@ -1,4 +1,4 @@
-import { TriangleAlert } from 'lucide-react';
+import { Folder, FolderX, TriangleAlert } from 'lucide-react';
 import { useState } from 'react';
 import { toast } from 'sonner';
 
@@ -10,14 +10,21 @@ import { PanelToolbar } from '@/components/file-panel/PanelToolbar';
 import { StorageSummary } from '@/components/file-panel/StorageSummary';
 import { UploadList } from '@/components/file-panel/UploadList';
 import { Banner } from '@/components/ui/banner';
+import {
+  Dialog,
+  DialogContent,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { type FilesModel } from '@/hooks/useFiles';
 import { useLanguage } from '@/hooks/useLanguage';
 import { type ContentsEntry, type ContentsErrorKind } from '@/lib/contents-api';
 
 type FilePanelProps = {
   /**
-   * Where the confirmation dialogs portal to — `Lab`'s `<main>`, so they dim
-   *  the work area and stop at the header, exactly like the session dialogs.
+   * Where the file browser and its confirmation dialogs portal to — `Lab`'s
+   * `<main>`, so they dim the work area and stop at the header.
    */
   readonly container: HTMLElement | null;
   readonly files: FilesModel;
@@ -35,9 +42,6 @@ type Prompt =
   | { readonly entry: ContentsEntry; readonly kind: 'rename' }
   | { readonly kind: 'create' };
 
-const formatChipClass =
-  'inline-flex h-7 cursor-pointer items-center rounded-md border border-input bg-background px-2 font-mono text-xs transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
-
 const PanelBody = ({
   files,
   onDelete,
@@ -48,6 +52,18 @@ const PanelBody = ({
 
   // A refused listing is the whole panel's state, so it replaces the list
   // rather than sitting above a stale one that is no longer true.
+  if (files.error === 'not-found') {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-3 py-8 text-center text-muted-foreground">
+        <FolderX
+          aria-hidden="true"
+          className="size-16 stroke-1"
+        />
+        <p className="text-sm">{t.files.errors['not-found']}</p>
+      </div>
+    );
+  }
+
   if (files.error !== null) {
     return (
       <div className="p-3">
@@ -62,10 +78,22 @@ const PanelBody = ({
   }
 
   if (files.entries.length === 0) {
+    if (files.loading && !files.initialized) {
+      return (
+        <p className="px-3 py-4 text-sm text-muted-foreground">
+          {t.files.loading}
+        </p>
+      );
+    }
+
     return (
-      <p className="px-3 py-4 text-sm text-muted-foreground">
-        {files.loading ? t.files.loading : t.files.empty}
-      </p>
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-3 py-8 text-center text-muted-foreground">
+        <Folder
+          aria-hidden="true"
+          className="size-16 stroke-1"
+        />
+        <p className="text-sm">{t.files.empty}</p>
+      </div>
     );
   }
 
@@ -81,10 +109,6 @@ const PanelBody = ({
   );
 };
 
-// The panel owns the wording and the two questions it has to ask; `useFiles`
-// owns everything that talks to the container. Nothing here takes focus on its
-// own: opening the panel leaves the caret in the terminal, and only a dialog
-// the user opened moves it.
 export const FilePanel = ({ container, files, onClose }: FilePanelProps) => {
   const { t } = useLanguage();
   const [deleting, setDeleting] = useState<ContentsEntry | null>(null);
@@ -100,119 +124,107 @@ export const FilePanel = ({ container, files, onClose }: FilePanelProps) => {
   };
 
   return (
-    <section
-      aria-label={t.files.title}
-      className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border bg-card"
+    <Dialog
+      modal={false}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      open
     >
-      <PanelToolbar
-        busy={files.busy}
-        onClose={onClose}
-        onNewFolder={() => {
-          setPrompt({ kind: 'create' });
-        }}
-        onRefresh={files.refresh}
-        onUpload={files.enqueue}
-      />
-      <Breadcrumbs
-        onNavigate={files.navigate}
-        path={files.path}
-      />
-      <div
-        aria-busy={files.loading}
-        className="min-h-0 flex-1 overflow-y-auto"
-      >
-        <PanelBody
-          files={files}
-          onDelete={setDeleting}
-          onDownload={(entry) => {
-            run(files.downloadFile(entry));
-          }}
-          onRename={(entry) => {
-            setPrompt({ entry, kind: 'rename' });
-          }}
-        />
-      </div>
-      <UploadList
-        onCancel={files.cancelUpload}
-        onClear={files.clearFinished}
-        uploads={files.uploads}
-      />
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t px-3 py-2">
-        {files.storage !== null && <StorageSummary usage={files.storage} />}
-        {/* Both formats as peers rather than a menu: there are two of them, a
-            menu would be a click and a decision for something that is one
-            click either way, and tar.gz is the only one that carries modes
-            and links back out intact. */}
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          <button
-            aria-label={`${t.files.downloadAll}: ${t.actions.downloadZip}`}
-            className={formatChipClass}
-            onClick={() => {
-              run(files.downloadAll('zip'));
-            }}
-            title={t.actions.downloadZip}
-            type="button"
-          >
-            .zip
-          </button>
-          <button
-            aria-label={`${t.files.downloadAll}: ${t.actions.downloadTgz}`}
-            className={formatChipClass}
-            onClick={() => {
-              run(files.downloadAll('tgz'));
-            }}
-            title={t.actions.downloadTgz}
-            type="button"
-          >
-            .tar.gz
-          </button>
-        </div>
-      </div>
-      {prompt?.kind === 'create' && (
-        <NameDialog
-          confirmLabel={t.files.create}
-          container={container}
-          initialName=""
-          onCancel={() => {
-            setPrompt(null);
-          }}
-          onSubmit={(name) => {
-            setPrompt(null);
-            run(files.createFolder(name));
-          }}
-          title={t.files.newFolder}
-        />
-      )}
-      {prompt?.kind === 'rename' && (
-        <NameDialog
-          confirmLabel={t.files.rename}
-          container={container}
-          initialName={prompt.entry.name}
-          onCancel={() => {
-            setPrompt(null);
-          }}
-          onSubmit={(name) => {
-            const { entry } = prompt;
-            setPrompt(null);
-            run(files.rename(entry, name));
-          }}
-          title={t.files.rename}
-        />
-      )}
-      {deleting !== null && (
-        <ConfirmDeleteDialog
-          container={container}
-          entry={deleting}
-          onCancel={() => {
-            setDeleting(null);
-          }}
-          onConfirm={() => {
-            const entry = deleting;
-            setDeleting(null);
-            run(files.remove(entry));
-          }}
-        />
-      )}
-    </section>
+      <DialogPortal container={container}>
+        <DialogOverlay />
+        <DialogContent className="h-[calc(100%-2rem)] max-h-[48rem] max-w-4xl items-stretch gap-0 overflow-hidden p-0 text-left">
+          <section className="flex h-full min-h-0 flex-col overflow-hidden">
+            <DialogTitle className="sr-only">{t.files.title}</DialogTitle>
+            <PanelToolbar
+              busy={files.busy}
+              onClose={onClose}
+              onDownload={(format) => {
+                run(files.downloadDirectory(files.path, format));
+              }}
+              onNewFolder={() => {
+                setPrompt({ kind: 'create' });
+              }}
+              onRefresh={files.refresh}
+              onUpload={files.enqueue}
+            />
+            <Breadcrumbs
+              onNavigate={files.navigate}
+              path={files.path}
+            />
+            <div
+              aria-busy={files.loading}
+              className="min-h-0 flex-1 overflow-y-auto"
+            >
+              <PanelBody
+                files={files}
+                onDelete={setDeleting}
+                onDownload={(entry) => {
+                  run(files.downloadFile(entry));
+                }}
+                onRename={(entry) => {
+                  setPrompt({ entry, kind: 'rename' });
+                }}
+              />
+            </div>
+            <UploadList
+              onCancel={files.cancelUpload}
+              onClear={files.clearFinished}
+              uploads={files.uploads}
+            />
+            {files.storage !== null && (
+              <div className="border-t px-3 py-2">
+                <StorageSummary usage={files.storage} />
+              </div>
+            )}
+            {prompt?.kind === 'create' && (
+              <NameDialog
+                confirmLabel={t.files.create}
+                container={container}
+                initialName=""
+                onCancel={() => {
+                  setPrompt(null);
+                }}
+                onSubmit={(name) => {
+                  setPrompt(null);
+                  run(files.createFolder(name));
+                }}
+                title={t.files.newFolder}
+              />
+            )}
+            {prompt?.kind === 'rename' && (
+              <NameDialog
+                confirmLabel={t.files.rename}
+                container={container}
+                initialName={prompt.entry.name}
+                onCancel={() => {
+                  setPrompt(null);
+                }}
+                onSubmit={(name) => {
+                  const { entry } = prompt;
+                  setPrompt(null);
+                  run(files.rename(entry, name));
+                }}
+                title={t.files.rename}
+              />
+            )}
+            {deleting !== null && (
+              <ConfirmDeleteDialog
+                container={container}
+                entry={deleting}
+                onCancel={() => {
+                  setDeleting(null);
+                }}
+                onConfirm={() => {
+                  const entry = deleting;
+                  setDeleting(null);
+                  run(files.remove(entry));
+                }}
+              />
+            )}
+          </section>
+        </DialogContent>
+      </DialogPortal>
+    </Dialog>
   );
 };

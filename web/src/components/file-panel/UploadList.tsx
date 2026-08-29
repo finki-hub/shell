@@ -24,7 +24,7 @@ const UploadStatus = ({ upload }: { readonly upload: FileUpload }) => {
 
     return (
       <span
-        className="truncate text-xs text-destructive"
+        className="block w-full min-w-0 text-right text-xs text-destructive"
         title={message}
       >
         {message}
@@ -34,11 +34,7 @@ const UploadStatus = ({ upload }: { readonly upload: FileUpload }) => {
 
   if (upload.state === 'done') {
     return (
-      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-        <Check
-          aria-hidden="true"
-          className="size-3.5 text-primary"
-        />
+      <span className="block w-full min-w-0 text-right text-xs text-muted-foreground">
         {t.files.uploaded}
       </span>
     );
@@ -69,11 +65,16 @@ export const UploadList = ({ onCancel, onClear, uploads }: UploadListProps) => {
         </h3>
         {uploads.some((upload) => !isPending(upload)) && (
           <button
-            className="cursor-pointer rounded-sm px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t.files.uploadClear}
+            className="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             onClick={onClear}
+            title={t.files.uploadClear}
             type="button"
           >
-            {t.files.uploadClear}
+            <X
+              aria-hidden="true"
+              className="size-3.5"
+            />
           </button>
         )}
       </div>
@@ -84,29 +85,41 @@ export const UploadList = ({ onCancel, onClear, uploads }: UploadListProps) => {
             key={upload.id}
           >
             <span
-              className="min-w-0 flex-1 truncate text-xs"
+              className="max-w-[40%] min-w-0 shrink truncate text-xs"
               title={upload.name}
             >
               {upload.name}
             </span>
-            <span className="flex w-32 shrink-0 justify-end">
+            <span className="flex min-w-0 flex-1 justify-end text-right">
               <UploadStatus upload={upload} />
             </span>
-            <button
-              aria-label={`${t.files.uploadCancel}: ${upload.name}`}
-              className="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:invisible"
-              disabled={!isPending(upload)}
-              onClick={() => {
-                onCancel(upload.id);
-              }}
-              title={t.files.uploadCancel}
-              type="button"
-            >
-              <X
+            {isPending(upload) ? (
+              <button
+                aria-label={`${t.files.uploadCancel}: ${upload.name}`}
+                className="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => {
+                  onCancel(upload.id);
+                }}
+                title={t.files.uploadCancel}
+                type="button"
+              >
+                <X
+                  aria-hidden="true"
+                  className="size-3.5"
+                />
+              </button>
+            ) : (
+              <span
                 aria-hidden="true"
-                className="size-3.5"
-              />
-            </button>
+                className="inline-flex size-6 shrink-0 items-center justify-center"
+              >
+                {upload.state === 'done' ? (
+                  <Check className="size-3.5 text-primary" />
+                ) : (
+                  <X className="size-3.5 text-destructive" />
+                )}
+              </span>
+            )}
           </li>
         ))}
       </ul>

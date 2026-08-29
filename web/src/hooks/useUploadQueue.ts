@@ -15,7 +15,7 @@ export type FileUpload = {
 export type UploadQueue = {
   readonly cancelUpload: (id: number) => void;
   readonly clearFinished: () => void;
-  readonly enqueue: (files: readonly File[]) => void;
+  readonly enqueue: (files: readonly File[]) => readonly number[];
   readonly uploading: boolean;
   readonly uploads: readonly FileUpload[];
 };
@@ -127,7 +127,7 @@ export const useUploadQueue = ({
 
   const enqueue = useCallback(
     (files: readonly File[]) => {
-      if (session === null || files.length === 0) return;
+      if (session === null || files.length === 0) return [];
       const target = directory();
       const added = files.map((file) => {
         idRef.current += 1;
@@ -153,6 +153,7 @@ export const useUploadQueue = ({
         })),
       ]);
       void drain();
+      return added.map((job) => job.id);
     },
     [directory, drain, session],
   );

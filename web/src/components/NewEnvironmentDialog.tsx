@@ -85,16 +85,16 @@ export const NewEnvironmentDialog = ({
               className="inline-flex h-10 flex-1 cursor-pointer items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
               disabled={discarding}
               onClick={() => {
-                if (!downloaded) {
-                  // Said once, not enforced. It is their environment, and a
-                  // dialog that refuses to proceed is a dialog people learn to
-                  // dismiss without reading.
-                  toast.warning(t.session.newEnvironmentNotDownloaded);
-                }
                 setDiscarding(true);
                 void (async () => {
                   const discarded = await onConfirm();
-                  if (!discarded) setDiscarding(false);
+                  if (!discarded) {
+                    setDiscarding(false);
+                    return;
+                  }
+                  if (!downloaded) {
+                    toast.warning(t.session.newEnvironmentNotDownloaded);
+                  }
                 })();
               }}
               type="button"

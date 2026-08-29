@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useLabSession } from '@/hooks/useLabSession';
 import { type LabSession } from '@/lib/hub-api';
+import { type StartTerminalInput } from '@/lib/terminal-transport';
 
 type Cleanup = () => void;
 type Effect = () => Cleanup | undefined;
@@ -42,6 +43,7 @@ const poller = vi.hoisted(() => ({
 }));
 
 const terminal = vi.hoisted(() => ({
+  clear: vi.fn(),
   fit: vi.fn(),
   focus: vi.fn(),
   lastActivityAt: vi.fn(() => 0),
@@ -278,6 +280,49 @@ describe('useLabSession bootstrap', () => {
       message: 'hub message',
       reason: 'start-failed',
     });
+  });
+
+  it('names preparation and terminal connection as separate phases', async () => {
+    expect(renderHook().status).toBe('preparing');
+    const terminalInput: { current: null | StartTerminalInput } = {
+      current: null,
+    };
+    services.startTerminal.mockImplementationOnce(
+      (input: StartTerminalInput) => {
+        terminalInput.current = input;
+        return terminal;
+      },
+    );
+    await startHook();
+    expect(renderHook().status).toBe('starting');
+    terminalInput.current?.callbacks.onStatus('connecting');
+    expect(renderHook().status).toBe('connecting-terminal');
+  });
+
+  it('clears the terminal and identifies deletion before awaiting it', async () => {
+    const terminalInput: { current: null | StartTerminalInput } = {
+      current: null,
+    };
+    services.startTerminal.mockImplementationOnce(
+      (input: StartTerminalInput) => {
+        terminalInput.current = input;
+        input.callbacks.onStatus('running');
+        return terminal;
+      },
+    );
+    const discard = Promise.withResolvers<boolean>();
+    services.discardEnvironment.mockReturnValueOnce(discard.promise);
+    await startHook();
+    const current = renderHook();
+    expect(current.status).toBe('running');
+    const replacement = current.startFresh();
+    expect(renderHook().status).toBe('deleting');
+    expect(terminal.clear).toHaveBeenCalledOnce();
+    terminalInput.current?.callbacks.onStatus('connecting');
+    expect(renderHook().status).toBe('deleting');
+    discard.resolve(true);
+    await expect(replacement).resolves.toBe(true);
+    expect(terminal.teardown).toHaveBeenCalledOnce();
   });
 
   it('starts again locally when no environment was created', async () => {

@@ -26,6 +26,7 @@ const services = vi.hoisted(() => ({
     (
       session: LabSession,
       input: {
+        readonly directory: string;
         readonly downloadToken: string;
         readonly format: ArchiveFormat;
       },
@@ -156,6 +157,17 @@ const resetRuntime = (): void => {
   runtime.states.length = 0;
 };
 
+const useRenderedFiles = (refreshStorage: () => void) => {
+  runtime.cursor = 0;
+  return useFiles({
+    markActive: vi.fn(),
+    refreshStorage,
+    session: SESSION,
+    setTransferring: vi.fn(),
+    storage: null,
+  });
+};
+
 describe('file panel model', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -206,6 +218,55 @@ describe('file panel model', () => {
     ]);
   });
 
+  it('returns queued IDs for main-screen upload progress', () => {
+    // Given: an active queue whose first upload remains in progress.
+    services.uploadFile.mockReturnValue(new Promise(() => {}));
+    const queue = useUploadQueue({
+      directory: () => '',
+      onSettled: vi.fn(),
+      session: SESSION,
+      setTransferring: vi.fn(),
+    });
+
+    // When: files are enqueued from the main screen.
+    const ids = queue.enqueue([
+      new File(['one'], 'one.txt'),
+      new File(['two'], 'two.txt'),
+    ]);
+
+    // Then: the caller can associate their progress rows with stable toasts.
+    expect(ids).toEqual([1, 2]);
+  });
+
+  it('keeps an empty directory settled while the next listing is pending', async () => {
+    // Given: an empty listing has already completed.
+    const first =
+      Promise.withResolvers<ContentsResult<readonly ContentsEntry[]>>();
+    const second =
+      Promise.withResolvers<ContentsResult<readonly ContentsEntry[]>>();
+    services.listDirectory
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const refreshStorage = vi.fn();
+    const initial = useRenderedFiles(refreshStorage);
+    initial.refresh();
+    first.resolve({ ok: true, value: [] });
+    await flush();
+    const settled = useRenderedFiles(refreshStorage);
+
+    // When: navigation starts another listing.
+    settled.refresh();
+    await flush();
+    const pending = useRenderedFiles(refreshStorage);
+
+    // Then: it remains initialized while reporting background loading.
+    expect({
+      entries: pending.entries,
+      initialized: pending.initialized,
+      loading: pending.loading,
+    }).toEqual({ entries: [], initialized: true, loading: true });
+  });
+
   it('aborts the previous listing and refreshes storage after a mutation', async () => {
     const requests: AbortSignal[] = [];
     services.listDirectory.mockImplementation(
@@ -215,17 +276,7 @@ describe('file panel model', () => {
       },
     );
     const refreshStorage = vi.fn();
-    const useRenderedFiles = () => {
-      runtime.cursor = 0;
-      return useFiles({
-        markActive: vi.fn(),
-        refreshStorage,
-        session: SESSION,
-        setTransferring: vi.fn(),
-        storage: null,
-      });
-    };
-    const files = useRenderedFiles();
+    const files = useRenderedFiles(refreshStorage);
     files.refresh();
     files.refresh();
     expect(requests[0]?.aborted).toBe(true);
@@ -236,7 +287,7 @@ describe('file panel model', () => {
     expect(services.listDirectory.mock.calls.length).toBeGreaterThan(2);
   });
 
-  it('mints before navigating for download all', async () => {
+  it('mints before navigating to download a named directory', async () => {
     const markActive = vi.fn();
     const files = useFiles({
       markActive,
@@ -246,10 +297,13 @@ describe('file panel model', () => {
       storage: null,
     });
 
-    await expect(files.downloadAll('zip')).resolves.toBeNull();
+    await expect(
+      files.downloadDirectory('work folder', 'zip'),
+    ).resolves.toBeNull();
 
     expect(services.mintUrlToken).toHaveBeenCalledWith(SESSION);
     expect(services.archiveDownloadUrl).toHaveBeenCalledWith(SESSION, {
+      directory: 'work folder',
       downloadToken: 'short',
       format: 'zip',
     });

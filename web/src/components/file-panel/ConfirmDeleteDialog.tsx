@@ -1,7 +1,6 @@
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogOverlay,
   DialogPortal,
   DialogTitle,
@@ -39,11 +38,13 @@ export const ConfirmDeleteDialog = ({
     >
       <DialogPortal container={container}>
         <DialogOverlay className="z-30" />
-        <DialogContent className="z-30 items-stretch">
+        <DialogContent
+          aria-describedby={undefined}
+          className="z-30 items-stretch"
+        >
           <div className="flex flex-col gap-2 text-center">
             <DialogTitle>{t.files.deleteTitle}</DialogTitle>
             <p className="truncate font-mono text-sm">{entry.name}</p>
-            <DialogDescription>{t.files.deleteBody}</DialogDescription>
           </div>
           <div className="flex gap-2">
             <button

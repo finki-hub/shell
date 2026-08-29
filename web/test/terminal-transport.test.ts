@@ -10,6 +10,7 @@ import {
 type TerminalDouble = {
   cols: number;
   data: ((value: string) => void) | null;
+  reset: () => void;
   resize: (() => void) | null;
   rows: number;
 };
@@ -36,6 +37,7 @@ vi.mock('@xterm/xterm', () => ({
     loadAddon = vi.fn();
 
     open = vi.fn();
+    reset = vi.fn();
     resize: (() => void) | null = null;
     rows = 900;
     write = vi.fn();
@@ -225,9 +227,11 @@ describe('terminal transport', () => {
     const onStatus = vi.fn();
     const handle = startTerminal({
       callbacks: { onEnd, onStatus },
-      container: {} as HTMLDivElement,
+      container: { replaceChildren: vi.fn() } as unknown as HTMLDivElement,
       session: SESSION,
     });
+    handle.clear();
+    expect(terminalRuntime.instances[0]?.reset).toHaveBeenCalledOnce();
     await flush();
     const socket = sockets[0];
     expect(socket?.url).toBe(
@@ -275,7 +279,7 @@ describe('terminal transport', () => {
     const onEnd = vi.fn();
     const handle = startTerminal({
       callbacks: { onEnd, onStatus: vi.fn() },
-      container: {} as HTMLDivElement,
+      container: { replaceChildren: vi.fn() } as unknown as HTMLDivElement,
       session: SESSION,
     });
     await flush();
@@ -304,7 +308,7 @@ describe('terminal transport', () => {
     vi.stubGlobal('fetch', fetchRequest);
     const handle = startTerminal({
       callbacks: { onEnd: vi.fn(), onStatus: vi.fn() },
-      container: {} as HTMLDivElement,
+      container: { replaceChildren: vi.fn() } as unknown as HTMLDivElement,
       session: SESSION,
     });
     await flush();

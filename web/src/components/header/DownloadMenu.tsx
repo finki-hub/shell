@@ -7,7 +7,8 @@ import { useLanguage } from '@/hooks/useLanguage';
 import { type ArchiveFormat } from '@/lib/contents-api';
 
 type DownloadMenuProps = {
-  readonly disabled: boolean;
+  readonly disabled?: boolean;
+  readonly label: string;
   readonly onDownload: (format: ArchiveFormat) => void;
 };
 
@@ -17,7 +18,11 @@ const itemClass =
 // ZIP is the default because Windows opens it without help, but tar.gz is a
 // peer rather than a fallback: it is the only one of the two that can carry
 // hard links, sparse files and modes back out intact.
-export const DownloadMenu = ({ disabled, onDownload }: DownloadMenuProps) => {
+export const DownloadMenu = ({
+  disabled = false,
+  label,
+  onDownload,
+}: DownloadMenuProps) => {
   const { t } = useLanguage();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -40,12 +45,12 @@ export const DownloadMenu = ({ disabled, onDownload }: DownloadMenuProps) => {
       <IconButton
         aria-expanded={open}
         aria-haspopup="menu"
-        aria-label={t.actions.download}
+        aria-label={label}
         disabled={disabled}
         onClick={() => {
           setOpen((current) => !current);
         }}
-        title={t.actions.download}
+        title={label}
       >
         <Download
           aria-hidden="true"

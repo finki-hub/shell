@@ -78,11 +78,17 @@ const ERROR_BY_STATUS: Readonly<Partial<Record<number, ContentsErrorKind>>> = {
 // the whole file.
 const CHUNK_BYTES = 1_024 * 1_024;
 
-const failure = (status: number, text: string): ContentsError => ({
-  kind: ERROR_BY_STATUS[status] ?? 'unavailable',
-  message: decodeJson(ErrorSchema, text)?.message ?? null,
-  status,
-});
+const failure = (status: number, text: string): ContentsError => {
+  const message = decodeJson(ErrorSchema, text)?.message ?? null;
+  return {
+    kind:
+      status === 400 && message?.startsWith('Not a directory:') === true
+        ? 'conflict'
+        : (ERROR_BY_STATUS[status] ?? 'unavailable'),
+    message,
+    status,
+  };
+};
 
 const transportError = (
   result: Extract<SendResult, { kind: 'aborted' | 'network' }>,
@@ -303,6 +309,14 @@ export const fileDownloadUrl = (
   `${userRoot(session)}/files/${encodePath(path)}` +
   `?download=1&token=${encodeURIComponent(downloadToken)}`;
 
+const randomUuid = (): string => {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = ((bytes.at(6) ?? 0) % 16) + 64;
+  bytes[8] = ((bytes.at(8) ?? 0) % 64) + 128;
+  const hex = bytes.toHex();
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
 // `archiveToken` is echoed back as a cookie by jupyter-archive so the page can
 // tell that the stream actually started; any value will do, so a fresh UUID
 // keeps two downloads from being confused for one another.
@@ -310,12 +324,13 @@ export const archiveDownloadUrl = (
   session: LabSession,
   input: {
     readonly archiveToken?: string;
+    readonly directory: string;
     readonly downloadToken: string;
     readonly format: ArchiveFormat;
   },
 ): string =>
-  `${userRoot(session)}/directories/?archiveFormat=${input.format}` +
-  `&archiveToken=${encodeURIComponent(input.archiveToken ?? crypto.randomUUID())}` +
+  `${userRoot(session)}/directories/${encodePath(input.directory)}?archiveFormat=${input.format}` +
+  `&archiveToken=${encodeURIComponent(input.archiveToken ?? randomUuid())}` +
   '&downloadHidden=true&followSymlinks=false' +
   `&token=${encodeURIComponent(input.downloadToken)}`;
 

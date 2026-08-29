@@ -94,7 +94,7 @@ const EntryRow = ({
       >
         {when}
       </span>
-      <span className="flex w-[5.25rem] shrink-0 items-center justify-end gap-0.5">
+      <span className="flex w-23 shrink-0 items-center justify-end gap-1">
         {!isDirectory && (
           <button
             aria-label={`${t.files.download}: ${entry.name}`}
@@ -163,18 +163,14 @@ export const FileList = ({
   return (
     <>
       <div className="flex items-center gap-2 border-b px-3 py-1 text-xs text-muted-foreground">
-        <span
-          aria-hidden="true"
-          className="size-4 shrink-0"
-        />
-        <span className="min-w-0 flex-1">{t.files.columnName}</span>
+        <span className="min-w-0 flex-1 text-left">{t.files.columnName}</span>
         <span className="w-14 shrink-0 text-right">{t.files.columnSize}</span>
         <span className="hidden w-28 shrink-0 text-right sm:block">
           {t.files.columnModified}
         </span>
         <span
           aria-hidden="true"
-          className="w-[5.25rem] shrink-0"
+          className="w-23 shrink-0"
         />
       </div>
       <ul aria-label={t.files.title}>

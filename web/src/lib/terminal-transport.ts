@@ -33,6 +33,7 @@ export type TerminalCallbacks = {
 };
 
 export type TerminalHandle = {
+  readonly clear: () => void;
   readonly fit: () => void;
   readonly focus: () => void;
   /** When the last frame arrived. No ping is ever sent to refresh it. */
@@ -431,6 +432,9 @@ export const startTerminal = ({
   void run();
 
   return {
+    clear: () => {
+      terminal.reset();
+    },
     fit: () => {
       fitAddon.fit();
     },
@@ -449,6 +453,7 @@ export const startTerminal = ({
       resizeListener.dispose();
       live.socket?.close();
       terminal.dispose();
+      container.replaceChildren();
     },
   };
 };

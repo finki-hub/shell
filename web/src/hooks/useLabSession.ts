@@ -39,12 +39,18 @@ import {
 } from '@/lib/terminal-transport';
 import { solveChallenge } from '@/lib/turnstile';
 
-export type SessionStatus = 'connecting' | 'ended' | 'running' | 'starting';
+export type SessionStatus =
+  | 'connecting-terminal'
+  | 'deleting'
+  | 'ended'
+  | 'preparing'
+  | 'running'
+  | 'starting';
 
 const SESSION_STATUS = {
-  connecting: 'connecting',
+  connecting: 'connecting-terminal',
   ended: 'ended',
-  reconnecting: 'connecting',
+  reconnecting: 'connecting-terminal',
   running: 'running',
 } as const satisfies Record<TerminalStatus, SessionStatus>;
 
@@ -62,6 +68,7 @@ export const useLabSession = () => {
     verifying: t.session.challengeVerifying,
   };
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const discardingRef = useRef(false);
   const handleRef = useRef<null | TerminalHandle>(null);
   const pollerRef = useRef<null | StoragePoller>(null);
   const activeGenerationRef = useRef<null | SessionGeneration>(null);
@@ -77,7 +84,7 @@ export const useLabSession = () => {
   const [end, setEnd] = useState<null | SessionEnd>(null);
   const [generation, setGeneration] = useState(0);
   const [session, setSession] = useState<LabSession | null>(null);
-  const [status, setStatus] = useState<SessionStatus>('connecting');
+  const [status, setStatus] = useState<SessionStatus>('preparing');
   const [storage, setStorage] = useState<null | StorageUsage>(null);
 
   const reset = useCallback(() => {
@@ -85,7 +92,7 @@ export const useLabSession = () => {
     setCreated(null);
     setEnd(null);
     setSession(null);
-    setStatus('connecting');
+    setStatus('preparing');
     setStorage(null);
     setGeneration((current) => current + 1);
   }, []);
@@ -99,12 +106,24 @@ export const useLabSession = () => {
     const active = sessionRef.current;
     const token = tokenRef.current;
     if (active === null || token === null) {
+      discardingRef.current = false;
       recoveryRef.current = null;
       reset();
       return true;
     }
+    const previousStatus = status;
+    handleRef.current?.clear();
+    discardingRef.current = true;
+    setStatus('deleting');
     const discarded = await discardEnvironment(active, token);
-    if (!discarded) return false;
+    if (!discarded) {
+      discardingRef.current = false;
+      setStatus(previousStatus);
+      return false;
+    }
+    handleRef.current?.teardown();
+    handleRef.current = null;
+    discardingRef.current = false;
     recoveryRef.current = null;
     // eslint-disable-next-line require-atomic-updates -- a successful discard invalidates the captured active session
     sessionRef.current = null;
@@ -113,7 +132,7 @@ export const useLabSession = () => {
     setSession(null);
     reset();
     return true;
-  }, [reset]);
+  }, [reset, status]);
 
   const refreshStorage = useCallback(() => {
     pollerRef.current?.refresh();
@@ -163,7 +182,9 @@ export const useLabSession = () => {
           onEnd: finish,
           onInput: ownedPoller.markActive,
           onStatus: (next) => {
-            if (owned.isCurrent()) setStatus(SESSION_STATUS[next]);
+            if (owned.isCurrent() && !discardingRef.current) {
+              setStatus(SESSION_STATUS[next]);
+            }
           },
         },
         container: target,

@@ -37,8 +37,10 @@ const GitHubIcon = () => (
 );
 
 const STATUS_DOT: Record<SessionStatus, string> = {
-  connecting: 'animate-pulse bg-amber-500',
+  'connecting-terminal': 'animate-pulse bg-amber-500',
+  deleting: 'animate-pulse bg-amber-500',
   ended: 'bg-destructive',
+  preparing: 'animate-pulse bg-amber-500',
   running: 'bg-primary',
   starting: 'animate-pulse bg-amber-500',
 };
@@ -126,6 +128,7 @@ export const Header = ({
           </IconButton>
           <DownloadMenu
             disabled={!running}
+            label={t.actions.downloadHome}
             onDownload={onDownload}
           />
           <IconButton

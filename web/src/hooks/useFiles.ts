@@ -26,7 +26,8 @@ import { type StorageUsage } from '@/lib/storage-api';
 export type FilesModel = UploadQueue & {
   readonly busy: boolean;
   readonly createFolder: (name: string) => Promise<ContentsErrorKind | null>;
-  readonly downloadAll: (
+  readonly downloadDirectory: (
+    directory: string,
     format: ArchiveFormat,
   ) => Promise<ContentsErrorKind | null>;
   readonly downloadFile: (
@@ -34,6 +35,7 @@ export type FilesModel = UploadQueue & {
   ) => Promise<ContentsErrorKind | null>;
   readonly entries: readonly ContentsEntry[];
   readonly error: ContentsErrorKind | null;
+  readonly initialized: boolean;
   readonly loading: boolean;
   readonly navigate: (path: string) => void;
   readonly open: (entry: ContentsEntry) => void;
@@ -83,14 +85,13 @@ export const useFiles = ({
   const [busy, setBusy] = useState(false);
   const [entries, setEntries] = useState<readonly ContentsEntry[]>([]);
   const [error, setError] = useState<ContentsErrorKind | null>(null);
+  const [initialized, setInitialized] = useState(false);
   const [loading, setLoading] = useState(false);
   const [path, setPath] = useState('');
 
   const listRef = useRef<AbortController | null>(null);
   const pathRef = useRef(path);
 
-  // Read by the upload queue, which outlives the render that started it and
-  // must not reload a directory the user has already navigated away from.
   useEffect(() => {
     pathRef.current = path;
   }, [path]);
@@ -98,8 +99,6 @@ export const useFiles = ({
   const load = useCallback(
     (target: string) => {
       if (session === null) return;
-      // One listing at a time: a fast second navigation must not be overwritten
-      // by the answer to the first one.
       listRef.current?.abort();
       const controller = new AbortController();
       listRef.current = controller;
@@ -108,6 +107,7 @@ export const useFiles = ({
         const result = await listDirectory(session, target, controller.signal);
         if (controller.signal.aborted) return;
         setLoading(false);
+        setInitialized(true);
         if (result.ok) {
           setEntries(result.value.toSorted(byKind));
           setError(null);
@@ -121,6 +121,7 @@ export const useFiles = ({
 
   // A new environment is a new tree, so the panel goes back to its root.
   useEffect(() => {
+    setInitialized(false);
     setPath('');
   }, [session]);
 
@@ -208,12 +209,8 @@ export const useFiles = ({
     [mutate],
   );
 
-  // Both downloads are browser navigations carrying a 60-second token, so the
-  // token is minted per click and never stored, and the SPA's own token never
-  // reaches a URL (contract §8.4). The browser owns the transfer from there,
-  // which is also why the badge cannot watch it end: `markActive` opens the
-  // same one-minute window a keystroke does, and that is close enough for a
-  // read that does not change the number anyway.
+  // Downloads mint a short token per click so the SPA token never reaches a URL.
+  // The browser owns the transfer, making activity the only observable signal.
   const download = useCallback(
     async (
       build: (active: LabSession, token: string) => string,
@@ -234,10 +231,17 @@ export const useFiles = ({
     [download],
   );
 
-  const downloadAll = useCallback(
-    async (format: ArchiveFormat): Promise<ContentsErrorKind | null> =>
+  const downloadDirectory = useCallback(
+    async (
+      archivePath: string,
+      format: ArchiveFormat,
+    ): Promise<ContentsErrorKind | null> =>
       download((active, token) =>
-        archiveDownloadUrl(active, { downloadToken: token, format }),
+        archiveDownloadUrl(active, {
+          directory: archivePath,
+          downloadToken: token,
+          format,
+        }),
       ),
     [download],
   );
@@ -256,10 +260,11 @@ export const useFiles = ({
     ...queue,
     busy,
     createFolder,
-    downloadAll,
+    downloadDirectory,
     downloadFile,
     entries,
     error,
+    initialized,
     loading,
     navigate,
     open,

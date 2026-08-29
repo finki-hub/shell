@@ -1,12 +1,15 @@
 import { FolderPlus, RefreshCw, Upload, X } from 'lucide-react';
 import { useRef } from 'react';
 
+import { DownloadMenu } from '@/components/header/DownloadMenu';
 import { IconButton } from '@/components/ui/icon-controls';
 import { useLanguage } from '@/hooks/useLanguage';
+import { type ArchiveFormat } from '@/lib/contents-api';
 
 type PanelToolbarProps = {
   readonly busy: boolean;
   readonly onClose: () => void;
+  readonly onDownload: (format: ArchiveFormat) => void;
   readonly onNewFolder: () => void;
   readonly onRefresh: () => void;
   readonly onUpload: (files: readonly File[]) => void;
@@ -18,6 +21,7 @@ type PanelToolbarProps = {
 export const PanelToolbar = ({
   busy,
   onClose,
+  onDownload,
   onNewFolder,
   onRefresh,
   onUpload,
@@ -53,6 +57,10 @@ export const PanelToolbar = ({
           className="size-4"
         />
       </IconButton>
+      <DownloadMenu
+        label={t.files.downloadCurrent}
+        onDownload={onDownload}
+      />
       <IconButton
         aria-label={t.files.newFolder}
         disabled={busy}
