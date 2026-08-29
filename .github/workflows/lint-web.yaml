@@ -10,10 +10,6 @@ on:
 permissions:
   contents: read
 
-# `web` is an npm workspace: the lockfile and node_modules live at the repository
-# root, so both jobs run from there and reach the workspace through the root
-# scripts (`lint` -> eslint, `check` -> tsc --noEmit), exactly as web/Dockerfile
-# reaches it with `npm run build --workspace web`.
 jobs:
   eslint:
     uses: finki-hub/.github/.github/workflows/eslint.yaml@main

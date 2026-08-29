@@ -10,10 +10,6 @@ on:
 permissions:
   contents: read
 
-# Run from the repository root for the same reason as lint-web.yaml: the npm
-# workspace's lockfile and node_modules are there. `test-args` is empty so the
-# job runs the root `test` script unchanged (`npm run test --workspace web`),
-# rather than appending reporter flags that npm would swallow before vitest.
 jobs:
   vitest:
     uses: finki-hub/.github/.github/workflows/vitest.yaml@main

@@ -1,22 +1,58 @@
-# finki-lab-ext
+# FINKI Hub / Shell / Lab Extension
 
-The `jupyter_server` extension baked into the `shell-lab` user container. It adds the three
-server-side limits the SPA cannot be trusted to keep: the person using the shell reaches the
-single-user server on `127.0.0.1:8888` from inside their own container.
+The Lab Extension is an internal Jupyter Server extension installed in every
+[Shell](../../README.md) user environment. It provides storage reporting and server-side file
+and terminal safeguards for the web application. It is built into the user-environment image
+and is not deployed as a standalone service or image.
 
-- `finki_lab.storage` — `GET <base_url>lab/storage` answers
-  `{bytesUsed, bytesLimit, inodesUsed, inodesLimit}` from `statvfs($HOME)`, which inside the
-  container reports the XFS *project* quota rather than the pool. `?no_track_activity=1` keeps
-  the storage badge's poll from resetting the idle culler.
-- `finki_lab.contents` — `QuotaAwareFileManager` refuses an upload whose declared size does not
-  fit the remaining quota (507) before the first chunk is written, and refuses a destination that
-  is an existing directory or a symlink (409). The declared size arrives as `X-Upload-Size`; a
-  contents manager cannot read headers, so a thin `/api/contents` handler binds it to the request.
-  It also makes the `.part` commit rename *replace* an existing file, which the base manager 409s.
-- `finki_lab.terminals` — `CappedTerminalManager` answers 429 once `LAB_MAX_TERMINALS` ptys are
-  open. `create` is the hook: terminado's `new_terminal` also runs on websocket reconnect.
+`ext` is short for “extension.” The source directory is `lab/ext/`, the Python distribution is
+`finki-lab-ext`, its import and Jupyter extension package is `finki_lab`, and the complete
+user-environment image is `shell-lab`.
 
-`jupyter-config/jupyter_server_config.d/finki_lab.json`, installed as hatchling shared data into
-the venv's `etc/jupyter`, enables it — `jupyter_server` discovers extensions from those files and
-has no entry-point mechanism. Develop with `uv sync --dev`; check with `uv run ruff check . &&
-uv run ruff format --check . && uv run mypy . && uv run pytest -q`.
+## Responsibilities
+
+- Reports home-directory byte and inode usage through the authenticated `lab/storage` endpoint
+- Checks declared upload sizes against available storage before the first chunk is written
+- Refuses upload destinations that are directories or symbolic links
+- Commits completed uploads atomically and replaces existing regular files
+- Removes interrupted root-level upload files when Jupyter Server starts
+- Enforces `LAB_MAX_TERMINALS` and returns `429` when the terminal limit is reached
+
+The upload-size check improves when quota failures are reported, but the XFS project quota is
+the authoritative storage limit.
+
+## Runtime Integration
+
+The [Lab Dockerfile](../Dockerfile) installs this Python project into the Jupyter environment
+while building the user-environment image. The extension configuration at
+[`jupyter-config/jupyter_server_config.d/finki_lab.json`](./jupyter-config/jupyter_server_config.d/finki_lab.json)
+enables `finki_lab`, and the parent
+[`jupyter_server_config.py`](../jupyter_server_config.py) selects its contents and terminal
+managers.
+
+Full-stack setup and configuration belong in the [root README](../../README.md). The
+[Hub](../../hub/README.md) is the complementary control service that creates the user containers
+and applies their project quotas.
+
+## Local Checks
+
+Requires Python 3.14 and [`uv`](https://docs.astral.sh/uv/).
+
+```sh
+cd lab/ext
+uv sync --frozen
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy .
+uv run pytest -q
+```
+
+## Test Scope
+
+The tests cover the extension directly and through an in-process Jupyter Server. They use
+temporary home directories and fake quota data; they do not start a container or require a real
+XFS pool.
+
+## License
+
+This project is licensed under the terms of the MIT license.
