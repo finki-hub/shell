@@ -13,7 +13,7 @@ A `uv` project on Python 3.14; `uv.lock` is committed and CI runs `--frozen`.
 ```sh
 cd hub
 uv sync --dev          # create .venv from the lockfile
-uv run ruff check .    # lint (select = ALL, chat-bot ignore list)
+uv run ruff check .    # lint (select = ALL)
 uv run ruff format .   # apply formatting (--check in CI)
 uv run mypy .          # strict overrides on finki_hub.* and jupyterhub_config
 uv run pytest -q       # unit tests; no Docker, no hub, no network

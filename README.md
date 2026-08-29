@@ -2,8 +2,8 @@
 
 FINKI Hub Shell gives each visitor a resource-limited Ubuntu shell in the browser. Each
 environment has one container and a quota-limited home directory. Containers are disposable;
-files remain until the environment reaches its retention limit or the user chooses **Start
-over**.
+files remain until the environment reaches its retention limit or the user chooses **Start a
+new one**.
 
 The production stack consists of a React SPA served by Caddy, JupyterHub with DockerSpawner,
 configurable-http-proxy, and isolated Jupyter Server containers. Only the Caddy loopback port
