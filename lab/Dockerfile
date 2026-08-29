@@ -33,25 +33,23 @@ RUN uv sync --frozen --no-dev --no-editable
 
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
     bash-completion \
     build-essential \
-    curl \
-    dnsutils \
     file \
     git \
     htop \
-    iproute2 \
-    iputils-ping \
     jq \
     less \
     libarchive-tools \
     lsof \
     man-db \
+    manpages \
+    manpages-dev \
     nano \
     ncdu \
-    netcat-openbsd \
-    openssh-client \
     procps \
     psmisc \
     python3 \
@@ -61,8 +59,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tree \
     unzip \
     vim \
-    wget \
     zip \
+    && apt-get install --reinstall -y --no-install-recommends \
+    bash \
+    coreutils \
+    findutils \
+    grep \
+    mawk \
+    sed \
+    tar \
+    && rm -f /usr/bin/man \
+    && dpkg-divert --quiet --remove --rename /usr/bin/man \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=jupyter /opt/uv /opt/uv
