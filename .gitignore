@@ -1,6 +1,8 @@
 node_modules/
 dist/
 coverage/
+.eslintcache
+*.tsbuildinfo
 .venv/
 __pycache__/
 .ruff_cache/
