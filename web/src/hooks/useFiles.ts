@@ -18,11 +18,6 @@ import {
 import { type LabSession, mintUrlToken } from '@/lib/hub-api';
 import { type StorageUsage } from '@/lib/storage-api';
 
-/**
- * Everything the panel needs, and nothing it has to assemble itself. Every
- * mutation answers with the `ContentsErrorKind` that stopped it, or `null`,
- * so the component owns the wording and the hook owns none of it.
- */
 export type FilesModel = UploadQueue & {
   readonly busy: boolean;
   readonly createFolder: (name: string) => Promise<ContentsErrorKind | null>;
@@ -50,23 +45,16 @@ export type FilesModel = UploadQueue & {
 };
 
 type UseFilesInput = {
-  /** `poller.markActive` — a download is a navigation with no visible end. */
   readonly markActive: () => void;
-  /** `poller.refresh` — the badge must not lag a delete by up to a minute. */
   readonly refreshStorage: () => void;
   readonly session: LabSession | null;
-  /** `poller.setTransferring`, forwarded to the queue. */
   readonly setTransferring: (transferring: boolean) => void;
   readonly storage: null | StorageUsage;
 };
 
-// Paths are relative to the home directory, so the root is the empty string.
 export const parentPath = (path: string): string =>
   path.split('/').slice(0, -1).join('/');
 
-// Folders first and then by name, which is the order every file manager uses
-// and the only one in which a tree is navigable by eye. `localeCompare` so
-// Macedonian names sort as Macedonian rather than by code point.
 const byKind = (left: ContentsEntry, right: ContentsEntry): number => {
   const leftIsDirectory = left.type === 'directory';
   if (leftIsDirectory !== (right.type === 'directory')) {
@@ -119,7 +107,6 @@ export const useFiles = ({
     [session],
   );
 
-  // A new environment is a new tree, so the panel goes back to its root.
   useEffect(() => {
     setInitialized(false);
     setPath('');
@@ -167,8 +154,6 @@ export const useFiles = ({
       try {
         const result = await run(session);
         if (!result.ok) return result.error.kind;
-        // Both, always: the listing because a name changed, the badge because
-        // the inode count did.
         refreshStorage();
         load(pathRef.current);
         return null;
@@ -187,8 +172,6 @@ export const useFiles = ({
     [mutate],
   );
 
-  // Rename in place only. Moving between folders is a second concept — a
-  // destination picker — and the terminal is right there for it.
   const rename = useCallback(
     async (
       entry: ContentsEntry,
@@ -209,8 +192,8 @@ export const useFiles = ({
     [mutate],
   );
 
-  // Downloads mint a short token per click so the SPA token never reaches a URL.
-  // The browser owns the transfer, making activity the only observable signal.
+  // Mint a per-click URL token so the session token never enters the URL.
+  // Browser-managed downloads expose no completion signal, so mark activity first.
   const download = useCallback(
     async (
       build: (active: LabSession, token: string) => string,

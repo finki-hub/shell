@@ -14,9 +14,6 @@ from shell_hub.handlers import (
 TOKEN = "AbC012_-" * 4
 
 
-# --- body parsing ------------------------------------------------------------
-
-
 def test_a_well_formed_body_parses() -> None:
     raw = json.dumps({"token": TOKEN, "intent": "create", "turnstile": "r"}).encode()
 

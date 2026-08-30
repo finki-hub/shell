@@ -1,10 +1,6 @@
 export type Language = 'en' | 'mk';
 
-// Vocabulary: a *folder* in the UI, because that is the word on every file
-// manager a user has already met; `directory` stays in the code and in the
-// contract. `reasons` carries exactly one entry per member of `END_REASONS` in
-// `lib/end-reasons.ts`, and `files.errors` exactly one per `ContentsErrorKind`
-// in `lib/contents-api.ts`, which is what `protocol-i18n.test.ts` checks.
+// Keep reasons and file errors in sync with their typed unions.
 
 const en = {
   actions: {
@@ -101,7 +97,6 @@ const en = {
     preparing: 'preparing…',
     running: 'running',
     starting: 'starting…',
-    // The end screen's second button, for the reasons no reconnect can fix.
     startNew: 'Start a new environment',
     tryAgain: 'Try again',
   },

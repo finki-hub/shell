@@ -1,10 +1,5 @@
-"""Contents manager that enforces the environment's storage quota.
-
-The upload flow is chunked (`chunk: 1..N | -1`), so the useful moment to refuse
-an oversized transfer is the first chunk, before any bytes reach the disk. The
-declared total arrives as the `X-Upload-Size` request header, which a contents
-manager cannot see on its own — `UploadSizeContentsHandler` stashes it in a
-context variable that stays bound for the rest of that request's coroutine.
+"""The handler stores the `X-Upload-Size` header in a request-bound context variable
+so the manager can reject oversized transfers before the first chunk reaches disk.
 """
 
 from __future__ import annotations
@@ -29,7 +24,6 @@ _declared_upload_size: ContextVar[int | None] = ContextVar(
 
 
 def set_declared_upload_size(raw: str | None) -> None:
-    """Bind the client's declared total upload size to the current request."""
     try:
         value = int(raw) if raw is not None else None
     except ValueError:
@@ -38,25 +32,17 @@ def set_declared_upload_size(raw: str | None) -> None:
 
 
 def declared_upload_size() -> int | None:
-    """The declared total upload size for the current request, if any."""
     return _declared_upload_size.get()
 
 
 class UploadSizeContentsHandler(ContentsHandler):
-    """`/api/contents` handler that exposes `X-Upload-Size` to the manager."""
-
     async def prepare(self) -> None:  # type: ignore[override]
         set_declared_upload_size(self.request.headers.get(UPLOAD_SIZE_HEADER))
         await super().prepare()
 
 
 class QuotaAwareFileManager(LargeFileManager):
-    """`LargeFileManager` with a quota preflight and two destination refusals.
-
-    `LargeFileManager._save_large_file` deliberately resolves a symlink before
-    appending, which would let an upload write through a link that points out of
-    the home directory; both refusals below run before any chunk is accepted.
-    """
+    """Reject symlink destinations before LargeFileManager resolves them."""
 
     def save(self, model: dict[str, Any], path: str = "") -> dict[str, Any]:
         os_path = Path(self._get_os_path(path.strip("/")))  # type: ignore[no-untyped-call]
@@ -88,13 +74,7 @@ class QuotaAwareFileManager(LargeFileManager):
             raise web.HTTPError(507, "insufficient-storage")
 
     def rename_file(self, old_path: str, new_path: str) -> None:
-        """Rename, replacing an existing regular file atomically.
-
-        The SPA uploads to `.<name>.part` and renames on completion, and that
-        rename is defined as replacing an existing file; `FileContentsManager`
-        answers 409 "File already exists" instead. Only a plain file is
-        replaced — a directory or a symlink is still refused.
-        """
+        """Atomically replace a regular file to complete a `.part` upload."""
         old_path = old_path.strip("/")
         new_path = new_path.strip("/")
         new_os_path = Path(self._get_os_path(new_path))  # type: ignore[no-untyped-call]
@@ -128,6 +108,5 @@ class QuotaAwareFileManager(LargeFileManager):
             ) from error
 
     def available_bytes(self) -> int:
-        """Bytes the environment may still write, from the project quota."""
         stats = os.statvfs(self.root_dir)
         return stats.f_bavail * stats.f_frsize

@@ -1,10 +1,4 @@
-"""Readiness checks shared by ``GET /hub/lab/ready`` and the Compose healthcheck.
-
-Two dependencies decide whether the hub can serve anything useful: the Docker
-daemon must answer, and the pool must be the XFS filesystem with project quotas
-that the quota machinery assumes. Both are expressed as reason lists so the
-endpoint can report *why* it is not ready.
-"""
+"""Docker and XFS-pool readiness checks with reason reporting."""
 
 from __future__ import annotations
 
@@ -21,7 +15,6 @@ if TYPE_CHECKING:
 
     from docker import DockerClient
 
-#: Mount options that prove XFS project quota accounting is on.
 PRJQUOTA_OPTIONS: Final[frozenset[str]] = frozenset({"prjquota", "pquota"})
 
 MOUNTINFO: Final[Path] = Path("/proc/self/mountinfo")
@@ -29,32 +22,22 @@ MOUNTINFO: Final[Path] = Path("/proc/self/mountinfo")
 
 @lru_cache(maxsize=1)
 def docker_client() -> DockerClient:
-    """Process-wide Docker client bound to the mounted host socket.
-
-    Building one performs a blocking ``GET /version`` against the daemon, so it
-    is created inside a worker thread and passed here as a *factory*.
-    """
+    """Cached client factory; construction performs a blocking daemon request."""
     return docker.from_env()
 
 
 class DockerPing(Protocol):
-    """The slice of ``docker.DockerClient`` readiness uses."""
-
     def ping(self) -> Any: ...  # ruff: ignore[any-type] - docker-py returns a bare truthy value
 
 
 @dataclass(frozen=True, slots=True)
 class MountFacts:
-    """What ``/proc/self/mountinfo`` says about one mount point."""
-
     fstype: str
     options: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
 class ReadinessReport:
-    """The body of ``/hub/lab/ready``."""
-
     ready: bool
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
@@ -65,7 +48,6 @@ class ReadinessReport:
 
 
 def read_mount_facts(target: Path, mountinfo: Path | None = None) -> MountFacts | None:
-    """Parse ``mountinfo`` for ``target``; ``None`` when it is not a mount point."""
     try:
         lines = (mountinfo or MOUNTINFO).read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -84,7 +66,7 @@ def read_mount_facts(target: Path, mountinfo: Path | None = None) -> MountFacts 
             continue
         options = set(head_fields[5].split(","))
         options.update(tail_fields[2].split(","))
-        # Later lines win: the last mount at a path is the visible one.
+        # The last matching mount is the visible one.
         found = MountFacts(fstype=tail_fields[0], options=frozenset(options))
     return found
 
@@ -95,7 +77,6 @@ def pool_reasons(
     expected_pool_id: str | None = None,
     mountinfo: Path | None = None,
 ) -> list[str]:
-    """Everything wrong with the pool, as human-readable reasons."""
     reasons: list[str] = []
     facts = read_mount_facts(pool_mount, mountinfo)
     if facts is None:
@@ -120,13 +101,7 @@ def pool_reasons(
 
 
 def docker_reasons(client_factory: Callable[[], DockerPing]) -> list[str]:
-    """Empty when a Docker client can be built and the daemon answers a ping.
-
-    The client is built *inside* the ``try``: ``docker.from_env()`` performs a
-    ``GET /version`` round trip in its constructor and raises when the daemon is
-    down -- exactly the condition this endpoint exists to report, so it must
-    become a reason rather than a 500.
-    """
+    """Return daemon failures as readiness reasons instead of raising."""
     try:
         client_factory().ping()
     except Exception as exc:  # ruff: ignore[blind-except] - any daemon failure is one reason
@@ -135,7 +110,6 @@ def docker_reasons(client_factory: Callable[[], DockerPing]) -> list[str]:
 
 
 def free_space_pct(pool_mount: Path) -> float:
-    """Percentage of the pool still available to unprivileged writers."""
     stats = os.statvfs(pool_mount)
     if stats.f_blocks == 0:
         return 0.0
@@ -143,7 +117,6 @@ def free_space_pct(pool_mount: Path) -> float:
 
 
 def has_free_space(pool_mount: Path, reserve_pct: float) -> bool:
-    """True when the pool is above the creation floor."""
     try:
         return free_space_pct(pool_mount) >= reserve_pct
     except OSError:
@@ -157,7 +130,6 @@ def readiness_report(
     expected_pool_id: str | None = None,
     mountinfo: Path | None = None,
 ) -> ReadinessReport:
-    """Combine the Docker ping and the pool assertion into one report."""
     reasons = docker_reasons(client_factory) + pool_reasons(
         pool_mount, expected_pool_id=expected_pool_id, mountinfo=mountinfo
     )
@@ -165,7 +137,7 @@ def readiness_report(
 
 
 class PoolAssertionError(RuntimeError):
-    """Raised when the pool is not usable and the caller must fail closed."""
+    pass
 
 
 def assert_pool(
@@ -174,7 +146,6 @@ def assert_pool(
     expected_pool_id: str | None = None,
     mountinfo: Path | None = None,
 ) -> None:
-    """Raise unless the pool is XFS with project quotas and carries its sentinel."""
     reasons = pool_reasons(
         pool_mount, expected_pool_id=expected_pool_id, mountinfo=mountinfo
     )

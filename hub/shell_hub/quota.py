@@ -1,16 +1,3 @@
-"""The pool: home directories, XFS project quotas and spawn admission.
-
-The hub is the only writer to the pool. Its bind mount of ``/srv/pool`` is
-read-write and the container runs as root, so creating a home directory, setting
-its XFS project quota and removing it again all happen in-process -- there is no
-helper container. Every mutation holds an exclusive ``flock`` on ``<pool>/.lock``
-for its whole duration, because project-id allocation (read-increment-write on
-the counter file) is not otherwise atomic against a concurrent spawn.
-
-The blocking work lives in plain functions; :func:`pre_spawn_hook` is the only
-coroutine and pushes them onto a worker thread.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -31,50 +18,40 @@ if TYPE_CHECKING:
 
     from shell_hub.settings import Settings
 
-#: Files ``scripts/pool-init.sh`` creates and this module maintains.
 LOCK_NAME: Final[str] = ".lock"
 PROJECTS_NAME: Final[str] = ".projects"
 COUNTER_NAME: Final[str] = ".projid-counter"
 
-#: The counter starts here; the first environment therefore gets 1001.
 FIRST_PROJID: Final[int] = 1000
 
-#: Copied into a home directory once, when it is created.
 SKEL_DIR: Final[Path] = Path("/opt/skel")
 
-#: Usernames are sha256 hex digests, but the pool paths are built from them.
 USERNAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]+$")
 
-#: How the command runner is injected; tests pass a fake instead of xfs_quota.
 type CommandRunner = Callable[[Sequence[str]], None]
 
 logger = logging.getLogger(__name__)
 
 
 class QuotaError(RuntimeError):
-    """A pool mutation did not finish successfully."""
+    pass
 
 
 class QuotaRefusalError(Exception):
-    """Raised to abort a spawn; JupyterHub surfaces the message to the SPA."""
+    pass
 
 
 class UserLike(Protocol):
-    """The slice of ``jupyterhub.user.User`` this module reads."""
-
     @property
     def name(self) -> str: ...
 
 
 class SpawnerLike(Protocol):
-    """The slice of ``dockerspawner.DockerSpawner`` the hook reads."""
-
     @property
     def user(self) -> UserLike: ...
 
 
 def run_command(args: Sequence[str]) -> None:
-    """Run one command, raising :class:`QuotaError` on any failure."""
     try:
         subprocess.run(list(args), check=True, capture_output=True, text=True)  # ruff: ignore[subprocess-without-shell-equals-true] - a fixed argument list, never a shell string
     except OSError as exc:
@@ -85,7 +62,7 @@ def run_command(args: Sequence[str]) -> None:
 
 
 def with_pool_lock[T](pool: Path, action: Callable[[], T]) -> T:
-    """Run ``action`` holding the exclusive pool lock. Blocking."""
+    """Run an action under the pool's exclusive lock."""
     fd = os.open(pool / LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -95,13 +72,12 @@ def with_pool_lock[T](pool: Path, action: Callable[[], T]) -> T:
 
 
 def check_username(username: str) -> None:
-    """Refuse anything that could escape ``<pool>/users`` or corrupt ``.projects``."""
+    """Reject names that could escape the pool path or corrupt the project map."""
     if not USERNAME_PATTERN.fullmatch(username):
         raise QuotaError(f"invalid username: {username!r}")
 
 
 def read_projid(pool: Path, username: str) -> int | None:
-    """The project id already allocated to ``username``, if any."""
     try:
         lines = (pool / PROJECTS_NAME).read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -114,7 +90,7 @@ def read_projid(pool: Path, username: str) -> int | None:
 
 
 def allocate_projid(pool: Path, username: str) -> int:
-    """Reuse or allocate the project id of ``username``. Call under the lock."""
+    """Reuse or allocate a project id; callers must hold the pool lock."""
     existing = read_projid(pool, username)
     if existing is not None:
         return existing
@@ -131,18 +107,14 @@ def allocate_projid(pool: Path, username: str) -> int:
 
 
 def chown_tree(root: Path, uid: int, gid: int) -> None:
-    """``chown -R uid:gid``, never following a symlink out of the home."""
+    """Chown recursively without following symlinks out of the home."""
     os.chown(root, uid, gid)
     for path in root.rglob("*"):
         os.chown(path, uid, gid, follow_symlinks=False)
 
 
 def create_home(home: Path, uid: int, gid: int) -> None:
-    """Make one home directory, seeded from ``/opt/skel`` (the lab image's skel). Call under the lock.
-
-    Seeding happens at creation only: re-provisioning an existing environment to
-    change its quota limits must never touch its contents again.
-    """
+    """Create and seed a home directory; callers must hold the pool lock."""
     home.mkdir(parents=True)
     if SKEL_DIR.is_dir():
         shutil.copytree(SKEL_DIR, home, dirs_exist_ok=True, symlinks=True)
@@ -153,7 +125,6 @@ def create_home(home: Path, uid: int, gid: int) -> None:
 def apply_quota(
     pool: Path, home: Path, projid: int, settings: Settings, run: CommandRunner
 ) -> None:
-    """Bind ``home`` to ``projid`` and set that project's block and inode limits."""
     run(["xfs_quota", "-x", "-c", f"project -s -p {home} {projid}", str(pool)])
     run(
         [
@@ -172,11 +143,7 @@ def apply_quota(
 def provision_home(
     settings: Settings, username: str, *, run: CommandRunner = run_command
 ) -> int:
-    """Create (idempotently) the home directory of ``username`` and quota it.
-
-    Blocking: call it from a worker thread, never from the hub's IO loop.
-    Returns the XFS project id in force for the environment.
-    """
+    """Create or update a home and apply its XFS quota (blocking)."""
     check_username(username)
     pool = settings.pool_mount
     home = settings.pool_users_dir / username
@@ -199,11 +166,7 @@ def provision_home(
 def remove_home(
     settings: Settings, username: str, *, run: CommandRunner = run_command
 ) -> None:
-    """Delete the home directory of ``username`` and release its quota.
-
-    Idempotent and blocking: an environment that was never provisioned, or one
-    already removed, both leave the pool exactly as they found it.
-    """
+    """Remove a home and release its XFS quota (blocking and idempotent)."""
     check_username(username)
     pool = settings.pool_mount
     home = settings.pool_users_dir / username
@@ -230,7 +193,7 @@ def remove_home(
 
 
 def assert_admission(*, home_exists: bool, free_pct: float, reserve_pct: float) -> None:
-    """Apply the free-space floor. Creations only -- resumes are never refused."""
+    """Apply the free-space floor only to new homes."""
     if home_exists:
         return
     if free_pct < reserve_pct:
@@ -247,7 +210,6 @@ def ensure_home(
     free_pct: Callable[[Path], float] = free_space_pct,
     run: CommandRunner = run_command,
 ) -> int:
-    """Assert the pool, admit the spawn and provision the home directory."""
     assert_pool(settings.pool_mount, expected_pool_id=settings.pool_id)
     home = settings.pool_users_dir / username
     assert_admission(
@@ -259,12 +221,7 @@ def ensure_home(
 
 
 async def pre_spawn_hook(spawner: SpawnerLike) -> None:
-    """``c.Spawner.pre_spawn_hook``: make the environment ready to be mounted.
-
-    The provisioning runs in a worker thread: ``xfs_quota`` is a subprocess and
-    the ``flock`` can wait on a concurrent spawn, neither of which may block
-    JupyterHub's IO loop.
-    """
+    """Provision the home off the Hub's IO loop before spawning."""
     settings = get_settings()
     username = spawner.user.name
     projid = await asyncio.to_thread(ensure_home, settings, username)

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# Read-only inspection of the storage pool and the environments living on it.
-# Never mounts, formats, or mutates anything.
+# Read-only storage-pool and environment inspection; never mounts, formats, or
+# mutates anything.
 #
 #   sudo scripts/pool-status.sh [pool-dir]
 #
-# <pool-dir> defaults to $LAB_POOL_DIR, falling back to the same default as
-# .env.example. The per-project quota report needs root and xfsprogs on the host.
+# <pool-dir> defaults to $LAB_POOL_DIR or the .env.example default. The
+# per-project quota report needs root and host xfsprogs.
 set -euo pipefail
 
 POOL_DIR="${1:-${LAB_POOL_DIR:-/var/lib/finki-hub-shell/pool}}"

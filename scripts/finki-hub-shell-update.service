@@ -5,6 +5,5 @@ After=docker.service
 
 [Service]
 Type=oneshot
-# Both paths point at the checkout that holds compose.yaml and .env; edit them
-# if it does not live at /opt/finki-hub-shell.
+# Update both paths when the checkout is installed outside /opt/finki-hub-shell.
 ExecStart=/opt/finki-hub-shell/scripts/update.sh /opt/finki-hub-shell

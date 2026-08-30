@@ -32,16 +32,13 @@
   --color-input: hsl(var(--input));
   --color-ring: hsl(var(--ring));
 
-  /* Border radius */
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
 
-  /* Font families */
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
 
-  /* Container */
   --container-2xl: 1280px;
 }
 
@@ -69,11 +66,6 @@
     --secondary-foreground: 0 0% 9%;
     --muted: 0 0% 94%;
     --muted-foreground: 0 0% 40%;
-    /* The hover surface for anything secondary, and deliberately not the brand
-       colour. It was set to --primary, so every quiet control — Cancel, the
-       header icons, the items in the download menus — turned solid green under
-       the pointer and read as the primary action for as long as it was hovered.
-       A hover is feedback, not a promotion. */
     --accent: 0 0% 92%;
     --accent-foreground: 0 0% 9%;
     --destructive: 0 84% 60%;
@@ -160,13 +152,11 @@
   }
 }
 
-/* The terminal keeps its own dark surface in both themes. */
 .terminal-surface .xterm {
   height: 100%;
 }
 
-/* The upload progress bar inside a toast. Native <progress> can only be
-   restyled through vendor pseudo-elements, which utilities cannot reach. */
+/* Native progress styling uses vendor pseudo-elements. */
 .upload-progress {
   appearance: none;
   block-size: 0.375rem;

@@ -54,12 +54,8 @@ const DirectorySchema = EntrySchema.extend({ content: z.array(EntrySchema) });
 
 const ErrorSchema = z.object({ message: z.string().optional() });
 
-// jupyter_server's own statuses plus the two `QuotaAwareFileManager` adds: 507
-// when the declared size does not fit the remaining quota, 409 when the
-// destination is a directory or a symlink. 424 is the hub's, not the
-// container's: it is what JupyterHub 5 answers for a single-user server that
-// is not running, which here means the container was culled while the panel
-// was open — temporary, and undone by the reconnect the end screen offers.
+// 507 means quota exhaustion, 409 a directory or symlink target, and 424 a
+// culled single-user server.
 const ERROR_BY_STATUS: Readonly<Partial<Record<number, ContentsErrorKind>>> = {
   400: 'bad-request',
   403: 'forbidden',
@@ -73,9 +69,7 @@ const ERROR_BY_STATUS: Readonly<Partial<Record<number, ContentsErrorKind>>> = {
   507: 'insufficient-storage',
 };
 
-// One chunk plus base64 overhead stays well inside the container's 8 MiB
-// `max_body_size`, and a failed chunk costs a megabyte of retry rather than
-// the whole file.
+// Keep base64 chunks below the 8 MiB body limit; retries resend at most 1 MiB.
 const CHUNK_BYTES = 1_024 * 1_024;
 
 const failure = (status: number, text: string): ContentsError => {
@@ -216,10 +210,8 @@ export type UploadInput = {
   readonly signal?: AbortSignal;
 };
 
-// Chunk numbering follows `LargeFileManager`: 1 creates the file (and is where
-// the quota preflight runs), 2..N-1 append, -1 marks the last one. A file that
-// fits in a single chunk is sent unchunked, because chunk 1 would create it and
-// there would be no last chunk left to close it.
+// LargeFileManager numbering: 1 creates, 2..N-1 appends, and -1 finalizes;
+// single-chunk files are unchunked.
 const chunkNumber = (index: number, total: number): null | number => {
   if (total === 1) return null;
   return index === total - 1 ? -1 : index + 1;
@@ -245,8 +237,7 @@ const putChunk = async (
         format: 'base64',
         type: 'file',
       },
-      // Read on the first chunk only, but sent on every one so a retry that
-      // restarts at chunk 1 still declares what it is about to write.
+      // Repeat the size header so retries can restart at chunk 1.
       headers: { 'X-Upload-Size': String(input.file.size) },
       method: 'PUT',
       session,
@@ -258,9 +249,7 @@ const putChunk = async (
   );
 };
 
-// Four random bytes, not a counter and not the file name alone: two tabs of the
-// same environment uploading the same name would otherwise write into one
-// `.part` and interleave each other's chunks into a file that is neither.
+// Random suffixes prevent concurrent same-name uploads sharing a .part file.
 const PART_SUFFIX_BYTES = 4;
 
 export const partName = (name: string): string => {
@@ -269,9 +258,8 @@ export const partName = (name: string): string => {
   return `.${name}.${suffix.toHex()}.part`;
 };
 
-// Written to `.<name>.<random>.part` and renamed on completion, so a failed or
-// abandoned upload never leaves a half-written file under the real name, and
-// the rename replaces an existing file atomically.
+// Upload to a random .part path, then atomically rename; failed uploads never
+// expose a partial file.
 export const uploadFile = async (
   session: LabSession,
   input: UploadInput,
@@ -282,8 +270,7 @@ export const uploadFile = async (
   for (let index = 0; index < total; index += 1) {
     const written = await putChunk(session, input, { index, partPath, total });
     if (!written.ok) {
-      // Best effort and deliberately unsignalled: the cleanup must still run
-      // when the upload was the thing that got aborted.
+      // Cleanup is best effort so aborts still return the original failure.
       void deleteEntry(session, partPath);
       return written;
     }
@@ -317,9 +304,7 @@ const randomUuid = (): string => {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
 
-// `archiveToken` is echoed back as a cookie by jupyter-archive so the page can
-// tell that the stream actually started; any value will do, so a fresh UUID
-// keeps two downloads from being confused for one another.
+// jupyter-archive echoes archiveToken when the stream starts.
 export const archiveDownloadUrl = (
   session: LabSession,
   input: {
@@ -334,9 +319,7 @@ export const archiveDownloadUrl = (
   '&downloadHidden=true&followSymlinks=false' +
   `&token=${encodeURIComponent(input.downloadToken)}`;
 
-// A plain anchor navigation, so the browser's own download manager owns the
-// transfer: it survives a busy tab, shows real progress, and never buffers the
-// archive in the page.
+// Let the browser own the archive transfer instead of buffering it in the page.
 export const startDownload = (url: string): void => {
   const link = document.createElement('a');
   link.href = url;

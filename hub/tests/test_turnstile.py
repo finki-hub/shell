@@ -23,8 +23,6 @@ class _Response:
 
 
 class FakeHttp:
-    """A siteverify client that records every call it is asked to make."""
-
     def __init__(self, payload: Any = None, raises: Exception | None = None) -> None:
         self._payload = payload if payload is not None else {"success": True}
         self._raises = raises
@@ -51,7 +49,7 @@ def test_a_pass_calls_siteverify_exactly_once_without_the_remote_address() -> No
     assert len(http.calls) == 1
     assert http.calls[0]["url"] == SITEVERIFY_URL
     assert http.calls[0]["timeout"] == SITEVERIFY_TIMEOUT_S
-    # Every request arrives through two reverse proxies, so no remoteip is sent.
+    # Reverse proxies hide the client address, so no remoteip is sent.
     assert http.calls[0]["data"] == {
         "secret": LIVE_SECRET,
         "response": "response-token",
@@ -108,8 +106,7 @@ def test_a_malformed_body_fails_closed() -> None:
 
 
 def test_the_hostname_is_not_checked_here() -> None:
-    # Cloudflare already binds a sitekey to its allowed hostnames; the hub does
-    # not keep a second list.
+    # Cloudflare binds the sitekey to allowed hostnames; the Hub has no duplicate list.
     verdict = run_check(FakeHttp({"success": True, "hostname": "anything"}), "r")
 
     assert verdict.outcome == "passed"

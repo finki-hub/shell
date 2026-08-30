@@ -13,9 +13,6 @@ type BreadcrumbsProps = {
 const crumbClass =
   'shrink-0 cursor-pointer rounded-sm px-1.5 py-0.5 transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
-// The whole trail rather than just the current folder, because the trail is
-// also the way back out: every ancestor is one click, and the last crumb is
-// the only one that is a label rather than a control.
 export const Breadcrumbs = ({ onNavigate, path }: BreadcrumbsProps) => {
   const { t } = useLanguage();
   const segments = path.split('/').filter((segment) => segment !== '');

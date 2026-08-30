@@ -12,9 +12,7 @@ const usage = (partial: Partial<Parameters<typeof storagePercent>[0]>) => ({
 
 describe('reading storage', () => {
   it('reports whichever limit is closer', () => {
-    // Coursework runs out of inodes long before bytes — a source tree is
-    // thousands of tiny files — so a reading that only watched bytes would
-    // show plenty of room right up to the moment writing stopped working.
+    // Inode exhaustion can stop writes while byte usage still appears low.
     expect(storagePercent(usage({ inodesUsed: 900, usedBytes: 100 }))).toBe(90);
     expect(storagePercent(usage({ inodesUsed: 100, usedBytes: 900 }))).toBe(90);
   });
@@ -36,10 +34,7 @@ describe('reading storage', () => {
   });
 
   it('calls it full while the counter still shows room', () => {
-    // [measured] The kernel refuses the write before the counter reaches the
-    // limit: a 50MB quota filled until dd failed reported 98.4%. An exact test
-    // therefore never fired, and the one banner explaining what to do never
-    // appeared while the shell was already refusing to save anything.
+    // [measured] A 50MB quota refused writes at 98.4%, before reaching 100%.
     expect(
       isStorageFull({
         inodesTotal: 20_000,

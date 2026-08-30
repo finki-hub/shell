@@ -13,10 +13,8 @@ if TYPE_CHECKING:
 
 
 def test_defaults_match_the_contract(make_settings: Callable[..., Settings]) -> None:
-    # Given/When: nothing but the required token is supplied.
     settings = make_settings()
 
-    # Then: every documented default is in force.
     assert settings.log_level == "INFO"
     assert settings.tz == "Europe/Skopje"
     assert settings.lab_pool_reserve_pct == 2
@@ -46,11 +44,9 @@ def test_defaults_match_the_contract(make_settings: Callable[..., Settings]) -> 
 def test_memory_must_clear_the_tmpfs_total_plus_headroom(
     make_settings: Callable[..., Settings],
 ) -> None:
-    # Given: tmpfs mounts totalling 72 MiB, which needs > 168 MiB of memory.
     with pytest.raises(ValidationError, match="must exceed the tmpfs total"):
         make_settings(lab_memory_mb=168)
 
-    # When: one more MiB is granted, the invariant holds.
     assert make_settings(lab_memory_mb=169).lab_memory_mb == 169
 
 
@@ -86,7 +82,6 @@ def test_both_turnstile_keys_turn_enforcement_on(
 def test_blank_optional_values_read_as_unset(
     make_settings: Callable[..., Settings],
 ) -> None:
-    # Given: an .env that declares the keys but leaves them empty.
     settings = make_settings(turnstile_sitekey="  ", turnstile_secret="")
 
     assert settings.turnstile_sitekey is None
@@ -104,18 +99,14 @@ def test_derived_paths(make_settings: Callable[..., Settings], pool: Path) -> No
 def test_bind_pool_id_seeds_from_the_sentinel_and_then_sticks(
     make_settings: Callable[..., Settings], pool: Path
 ) -> None:
-    # Given: a fresh hub whose data directory holds no pool id yet.
     settings = make_settings()
     assert settings.pool_id is None
 
-    # When: the hub binds itself to the pool at first start.
     bound = settings.bind_pool_id()
 
-    # Then: it adopts the pool's sentinel and remembers it.
     assert bound == "pool-under-test"
     assert settings.pool_id == "pool-under-test"
 
-    # And: a later start against a re-created pool keeps the original binding.
     (pool / ".pool-id").write_text("a-different-pool\n", encoding="utf-8")
     assert settings.bind_pool_id() == "pool-under-test"
 
@@ -123,17 +114,14 @@ def test_bind_pool_id_seeds_from_the_sentinel_and_then_sticks(
 def test_bind_pool_id_invents_nothing_when_the_pool_is_not_mounted(
     make_settings: Callable[..., Settings], pool: Path, tmp_path: Path
 ) -> None:
-    # Given: a hub started before the pool sentinel exists.
     (pool / ".pool-id").unlink()
     settings = make_settings()
 
-    # When/Then: nothing is bound and nothing is written -- a random id would
-    # make every later start fail with pool-id-mismatch, forever.
+    # Do not invent an ID: a random value would make later starts fail forever.
     assert settings.bind_pool_id() is None
     assert settings.pool_id is None
     assert not (tmp_path / "hub" / "pool-id").exists()
 
-    # And: once the pool is there, the real sentinel is adopted.
     (pool / ".pool-id").write_text("pool-under-test\n", encoding="utf-8")
     assert settings.bind_pool_id() == "pool-under-test"
 

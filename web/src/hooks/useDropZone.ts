@@ -1,8 +1,5 @@
 import { useEffect, useState } from 'react';
 
-// Document-level listeners rather than JSX handlers, so a file can be dropped
-// anywhere on the page — including onto the terminal, which is where a user
-// is already looking.
 export const useDropZone = (
   enabled: boolean,
   onFiles: (files: readonly File[]) => void,
@@ -10,16 +7,7 @@ export const useDropZone = (
   const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
-    if (!enabled) {
-      setDragging(false);
-
-      return () => {
-        // Nothing was attached.
-      };
-    }
-
-    // dragleave fires when the pointer crosses into a child element, so the
-    // state is driven by a depth counter rather than by the last event seen.
+    // Track drag depth because dragleave fires for child elements.
     let depth = 0;
 
     const handleDragEnter = (event: DragEvent) => {
@@ -44,11 +32,14 @@ export const useDropZone = (
       setDragging(false);
       onFiles([...(event.dataTransfer?.files ?? [])]);
     };
-
-    document.addEventListener('dragenter', handleDragEnter);
-    document.addEventListener('dragover', handleDragOver);
-    document.addEventListener('dragleave', handleDragLeave);
-    document.addEventListener('drop', handleDrop);
+    if (enabled) {
+      document.addEventListener('dragenter', handleDragEnter);
+      document.addEventListener('dragover', handleDragOver);
+      document.addEventListener('dragleave', handleDragLeave);
+      document.addEventListener('drop', handleDrop);
+    } else {
+      setDragging(false);
+    }
 
     return () => {
       document.removeEventListener('dragenter', handleDragEnter);

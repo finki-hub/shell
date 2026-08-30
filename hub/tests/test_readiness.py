@@ -123,8 +123,6 @@ def test_a_live_docker_daemon_has_no_reasons() -> None:
 
 
 def test_a_client_that_cannot_be_built_is_a_reason_not_a_crash() -> None:
-    # Given: docker.from_env() talks to the daemon in its constructor, so with
-    # the daemon down the *factory* raises before any ping can be attempted.
     def factory() -> Any:
         raise DockerException("Error while fetching server API version")
 

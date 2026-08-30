@@ -13,7 +13,6 @@ type AnalyticsCall = {
 
 describe('browser analytics privacy boundary', () => {
   it('does nothing for missing or whitespace-only build keys', async () => {
-    // Given
     let loads = 0;
     const controller = createAnalyticsController({
       host: ' '.repeat(3),
@@ -27,16 +26,13 @@ describe('browser analytics privacy boundary', () => {
       },
     });
 
-    // When
     await controller.initialize();
     controller.captureProtocolFailure();
 
-    // Then
     expect(loads).toBe(0);
   });
 
   it('loads once after an intentional key and emits only the stable protocol marker', async () => {
-    // Given
     const load = Promise.withResolvers<BrowserAnalyticsClient>();
     const calls: AnalyticsCall[] = [];
     let loads = 0;
@@ -55,7 +51,6 @@ describe('browser analytics privacy boundary', () => {
       },
     });
 
-    // When
     const firstInitialization = controller.initialize();
     const repeatedInitialization = controller.initialize();
     controller.captureProtocolFailure();
@@ -70,7 +65,6 @@ describe('browser analytics privacy boundary', () => {
     await Promise.all([firstInitialization, repeatedInitialization]);
     controller.captureProtocolFailure();
 
-    // Then
     expect(loads).toBe(1);
     expect(initialization.value?.key).toBe('configured');
     expect(initialization.value?.options.api_host).toBe(
@@ -109,7 +103,6 @@ describe('browser analytics privacy boundary', () => {
   });
 
   it('contains loader failure without retrying or blocking the caller', async () => {
-    // Given
     let loads = 0;
     const controller = createAnalyticsController({
       host: '',
@@ -120,12 +113,10 @@ describe('browser analytics privacy boundary', () => {
       },
     });
 
-    // When
     await controller.initialize();
     await controller.initialize();
     controller.captureProtocolFailure();
 
-    // Then
     expect(loads).toBe(1);
   });
 });

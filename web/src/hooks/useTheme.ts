@@ -28,9 +28,7 @@ const systemTheme = (): Theme => {
   }
 };
 
-// Guarded because this runs at import time, and localStorage throws in a
-// browser that blocks site data. Unguarded, the throw happens before React
-// renders anything: a blank white page instead of an unremembered preference.
+// Storage can be unavailable at import time; retain the fallback.
 const getInitialTheme = (): Theme => {
   if (typeof document !== 'undefined') {
     const prepainted = document.documentElement.dataset['kbTheme'];
@@ -57,12 +55,10 @@ const persistTheme = (theme: Theme): void => {
   try {
     localStorage.setItem(storageKey, theme);
   } catch {
-    // The theme holds for this page and is simply not remembered.
+    // Ignore unavailable storage; keep the in-memory theme.
   }
 };
 
-// The theme lives outside the toggle because more than the toggle reads it —
-// the toaster picks its own palette from it.
 const store: { listeners: Set<() => void>; theme: Theme } = {
   listeners: new Set(),
   theme: getInitialTheme(),

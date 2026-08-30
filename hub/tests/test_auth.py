@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     from shell_hub.settings import Settings
 
-VALID_TOKEN = "AbC012_-" * 4  # 32 characters, the shortest accepted form
+VALID_TOKEN = "AbC012_-" * 4
 
 
 @pytest.mark.parametrize(
@@ -47,10 +47,8 @@ def test_token_format_gate(token: str, accepted: bool) -> None:
 
 
 def test_username_is_the_truncated_sha256_of_the_token() -> None:
-    # Given: the documented derivation.
     expected = hashlib.sha256(VALID_TOKEN.encode()).hexdigest()[:32]
 
-    # When/Then: the authenticator agrees, and the raw token is nowhere in it.
     derived = username_for_token(VALID_TOKEN)
     assert derived == expected
     assert len(derived) == USERNAME_LENGTH
@@ -71,12 +69,10 @@ def test_username_is_a_safe_url_path_segment() -> None:
 
 
 def test_get_handlers_exposes_only_the_three_lab_routes() -> None:
-    # Given: an authenticator instance (the app argument is unused).
     authenticator = EnvironmentTokenAuthenticator()
 
     routes = authenticator.get_handlers(app=None)
 
-    # Then: exactly the SPA's endpoints, and no /login entry at all.
     assert [path for path, _ in routes] == [
         "/lab/login",
         "/lab/discard",
@@ -86,14 +82,11 @@ def test_get_handlers_exposes_only_the_three_lab_routes() -> None:
 
 
 def test_delete_user_is_a_coroutine_function() -> None:
-    # The only caller awaits maybe_future(...), and the helper run must not
-    # block the hub's IO loop, so the override has to be async.
+    # The override must stay async so removal cannot block Hub I/O.
     assert inspect.iscoroutinefunction(EnvironmentTokenAuthenticator.delete_user)
 
 
 class FakeUser:
-    """The slice of jupyterhub.user.User the authenticator reads."""
-
     def __init__(self, name: str) -> None:
         self.name = name
 
@@ -107,7 +100,6 @@ def test_delete_user_removes_the_home_directory_and_releases_the_quota(
     make_settings: Callable[..., Settings],
     pool: Path,
 ) -> None:
-    # Given: a provisioned environment with an XFS project id on record.
     (pool / "users" / "abcdef").mkdir()
     (pool / ".projects").write_text("1001:abcdef\n", encoding="utf-8")
     commands: list[list[str]] = []
@@ -135,8 +127,6 @@ def test_delete_user_survives_a_failing_removal(
     make_settings: Callable[..., Settings],
     failure: Exception,
 ) -> None:
-    # Given: DELETE /hub/api/users/<u> must not 500, or the user culler wedges
-    # on this user forever.
     def boom(_settings: Settings, _username: str) -> None:
         raise failure
 
@@ -149,8 +139,7 @@ def test_delete_user_survives_a_failing_removal(
 def test_delete_user_removes_the_home_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, make_settings: Callable[..., Settings]
 ) -> None:
-    # Given: the removal takes the pool lock and runs xfs_quota, neither of
-    # which may block JupyterHub's IO loop.
+    # The removal runs off the Hub event loop because the lock and xfs_quota can block.
     loop_thread = threading.current_thread()
     ran_on: list[threading.Thread] = []
 

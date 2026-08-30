@@ -33,13 +33,10 @@ PASSED = TurnstileVerdict(outcome="passed")
 
 @pytest.fixture(autouse=True)
 def _fresh_creation_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Given: the creation counter is process-wide, each test starts it empty.
     monkeypatch.setattr(handlers, "creations", CreationWindow())
 
 
 class FakeBackend:
-    """A hub whose answers the decision table can dictate."""
-
     def __init__(
         self,
         settings: Settings,
@@ -92,9 +89,6 @@ class FakeBackend:
 def login(backend: FakeBackend, intent: str = "resume") -> LoginResponse:
     request = LoginRequest(token=TOKEN, intent=intent, turnstile="response")  # type: ignore[arg-type]
     return asyncio.run(perform_login(backend, request))
-
-
-# --- the decision table ------------------------------------------------------
 
 
 @pytest.mark.parametrize("intent", ["resume", "create"])
@@ -177,8 +171,6 @@ def test_the_global_creation_limit_is_429(
 def test_resuming_is_never_rate_limited(
     make_settings: Callable[..., Settings],
 ) -> None:
-    # Given: only creations are counted, so a busy campus never locks itself out
-    # of the environments it already has.
     settings = make_settings(lab_max_creates_per_min=1)
     backend = FakeBackend(settings, hub_user=True)
 
@@ -191,10 +183,8 @@ def test_the_free_space_floor_refuses_creations_only(
 ) -> None:
     settings = make_settings()
 
-    # Given: a pool below the floor, an existing environment still resumes.
     assert login(FakeBackend(settings, hub_user=True, space=False)).created is False
 
-    # But: a creation is refused before Turnstile is ever consulted.
     backend = FakeBackend(settings, space=False)
     with pytest.raises(LoginError) as refusal:
         login(backend, "create")
@@ -202,9 +192,6 @@ def test_the_free_space_floor_refuses_creations_only(
     assert refusal.value.status == 429
     assert refusal.value.reason == "insufficient-storage"
     assert backend.turnstile_calls == 0
-
-
-# --- the creation counter ----------------------------------------------------
 
 
 def test_the_creation_window_admits_exactly_the_limit() -> None:
@@ -222,9 +209,6 @@ def test_the_creation_window_starts_fresh_after_sixty_seconds() -> None:
 
     assert window.allow(3, 159.9) is False
     assert window.allow(3, 160.0) is True
-
-
-# --- request headers ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -264,9 +248,6 @@ def test_a_cross_origin_fetch_is_403(fetch_site: str) -> None:
     assert refusal.value.to_json() == {"error": "forbidden"}
 
 
-# --- response and token shapes ----------------------------------------------
-
-
 def test_the_success_body_uses_the_spa_field_names(
     make_settings: Callable[..., Settings],
 ) -> None:
@@ -296,31 +277,22 @@ def test_the_token_scopes_are_filtered_to_the_user() -> None:
 
 
 def test_the_spa_token_lives_for_one_day() -> None:
-    # The SPA re-logs in with the environment token it keeps in localStorage.
     assert handlers.SPA_TOKEN_TTL_S == 24 * 3600
 
 
 def test_the_login_route_skips_the_xsrf_check() -> None:
-    # Given: /hub/lab/login takes no credential but the one in its body, and the
-    # SPA served from / cannot read a /hub/-scoped _xsrf cookie.
     handler = handlers.LabLoginHandler
 
-    # Then: the override is present and does nothing.
     assert "check_xsrf_cookie" in vars(handler)
     handler.check_xsrf_cookie(handler)  # type: ignore[arg-type]
 
 
 def test_the_discard_route_keeps_the_inherited_xsrf_check() -> None:
-    # Given: APIHandler already returns early for the Authorization: token path
-    # the SPA uses, so overriding the check here would only strip the guard from
-    # the cookie-authenticated path of an endpoint that deletes an environment.
     assert "check_xsrf_cookie" not in vars(handlers.LabDiscardHandler)
     assert handlers.LabDiscardHandler.check_xsrf_cookie is APIHandler.check_xsrf_cookie
 
 
 class FakeResponse:
-    """The slice of tornado.web.RequestHandler that ``_write_json`` touches."""
-
     def __init__(self) -> None:
         self.status: int | None = None
         self.headers: dict[str, str] = {}
@@ -339,8 +311,6 @@ class FakeResponse:
 def test_the_ready_route_reports_an_unbuildable_client_as_503(
     monkeypatch: pytest.MonkeyPatch, make_settings: Callable[..., Settings]
 ) -> None:
-    # Given: docker.from_env() raises -- it round-trips to the daemon in its
-    # constructor -- which is the very condition /hub/lab/ready exists to report.
     def factory() -> Any:
         raise DockerException("Error while fetching server API version")
 
@@ -348,10 +318,8 @@ def test_the_ready_route_reports_an_unbuildable_client_as_503(
     monkeypatch.setattr(handlers, "get_settings", make_settings)
     response = FakeResponse()
 
-    # When: the endpoint is asked
     asyncio.run(handlers.LabReadyHandler.get(cast("Any", response)))
 
-    # Then: the contracted 503 body, not a 500 HTML error page.
     assert response.status == 503
     body = json.loads(response.body)
     assert body["ready"] is False

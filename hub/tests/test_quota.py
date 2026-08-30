@@ -40,8 +40,6 @@ def owners() -> list[tuple[str, int, int]]:
 def _hermetic_pool(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owners: list[tuple[str, int, int]]
 ) -> None:
-    # Given: the suite does not run as root and must not read the host's
-    # /etc/skel, ownership is recorded and skel starts out empty.
     monkeypatch.setattr(
         quota,
         "chown_tree",
@@ -64,15 +62,10 @@ def mounted_pool(
 
 @pytest.fixture
 def record(commands: list[list[str]]) -> Callable[[Sequence[str]], None]:
-    """A command runner that records instead of invoking xfs_quota."""
-
     def _run(args: Sequence[str]) -> None:
         commands.append(list(args))
 
     return _run
-
-
-# --- home directories --------------------------------------------------------
 
 
 def test_provisioning_creates_and_quotas_a_home(
@@ -123,7 +116,6 @@ def test_reprovisioning_reuses_the_project_id_and_keeps_the_contents(
     work.write_text("mine", encoding="utf-8")
     commands.clear()
 
-    # When: the same environment is provisioned again, as every spawn does.
     projid = provision_home(settings, "abcdef", run=record)
 
     assert projid == 1001
@@ -149,7 +141,6 @@ def test_skel_is_copied_into_a_new_home_only(
     bashrc = pool / "users" / "abcdef" / ".bashrc"
     bashrc.write_text("mine\n", encoding="utf-8")
 
-    # When: the environment is provisioned again, skel must not overwrite it.
     provision_home(settings, "abcdef", run=record)
 
     assert bashrc.read_text(encoding="utf-8") == "mine\n"
@@ -196,7 +187,7 @@ def test_removal_is_idempotent(
 
     remove_home(settings, "abcdef", run=record)
 
-    # The project id survives in .projects, so the limit is simply re-zeroed.
+    # The project ID remains in .projects, so removal only re-zeroes its limit.
     assert commands == [
         ["xfs_quota", "-x", "-c", "limit -p bhard=0 ihard=0 1001", str(pool)]
     ]
@@ -230,8 +221,6 @@ def test_every_mutation_holds_the_pool_lock(
     make_settings: Callable[..., Settings],
     record: Callable[[Sequence[str]], None],
 ) -> None:
-    # Given: projid allocation is a read-increment-write, so a concurrent spawn
-    # must be serialized by the flock rather than by luck.
     held: list[str] = []
     real_lock = quota.with_pool_lock
 
@@ -274,7 +263,6 @@ def test_the_pool_lock_is_exclusive(tmp_path: Path) -> None:
     follower.start()
     entered.wait(timeout=5)
 
-    # Then: the second mutation is still blocked on the flock.
     assert order == []
 
     release.set()
@@ -283,9 +271,6 @@ def test_the_pool_lock_is_exclusive(tmp_path: Path) -> None:
 
     assert order == ["first", "second"]
     assert (tmp_path / ".lock").exists()
-
-
-# --- the command runner ------------------------------------------------------
 
 
 def test_the_runner_reports_a_failing_command(tmp_path: Path) -> None:
@@ -323,9 +308,6 @@ def test_the_runner_captures_output_and_never_uses_a_shell(
             "text": True,
         }
     ]
-
-
-# --- admission ---------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -373,7 +355,6 @@ def test_ensure_home_refuses_a_creation_below_the_floor(
     with pytest.raises(QuotaRefusalError):
         ensure_home(settings, "abcdef", free_pct=lambda _: 1.0, run=record)
 
-    # And: nothing was written to the pool.
     assert commands == []
     assert not (mounted_pool / "users" / "abcdef").exists()
 
@@ -414,7 +395,6 @@ def test_ensure_home_refuses_a_pool_bound_to_another_hub(
     tmp_path: Path,
     record: Callable[[Sequence[str]], None],
 ) -> None:
-    # Given: this hub was bound to a different pool at first start.
     hub_dir = tmp_path / "hub"
     hub_dir.mkdir()
     (hub_dir / "pool-id").write_text("another-pool\n", encoding="utf-8")
@@ -422,9 +402,6 @@ def test_ensure_home_refuses_a_pool_bound_to_another_hub(
 
     with pytest.raises(PoolAssertionError, match="pool-id-mismatch"):
         ensure_home(settings, "abcdef", run=record)
-
-
-# --- the pre-spawn hook ------------------------------------------------------
 
 
 class FakeSpawnerUser:
@@ -452,7 +429,6 @@ def test_the_pre_spawn_hook_provisions_the_home_directory(
     make_settings: Callable[..., Settings],
     mounted_pool: Path,
 ) -> None:
-    # Given: the hook reaches xfs_quota through the module's own default runner.
     calls: list[tuple[list[str], threading.Thread]] = []
     _record_subprocess(monkeypatch, calls)
     monkeypatch.setattr(
@@ -470,8 +446,7 @@ def test_the_pre_spawn_hook_provisions_off_the_event_loop(
     make_settings: Callable[..., Settings],
     mounted_pool: Path,
 ) -> None:
-    # Given: xfs_quota is a subprocess and the flock can wait on a concurrent
-    # spawn, neither of which may run on JupyterHub's IO loop.
+    # The hook must keep xfs_quota and flock waits off the Hub event loop.
     loop_thread = threading.current_thread()
     calls: list[tuple[list[str], threading.Thread]] = []
     _record_subprocess(monkeypatch, calls)

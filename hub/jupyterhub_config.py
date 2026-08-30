@@ -1,10 +1,4 @@
-"""JupyterHub configuration for Shell's Hub image, ``shell-hub``.
-
-Deliberately thin: every value comes from :class:`shell_hub.settings.Settings`,
-and the boot invariants are asserted here at import time. JupyterHub runs with
-``raise_config_file_errors=True``, so anything raised below stops the hub before
-it can serve a single request.
-"""
+"""JupyterHub configuration with import-time validation before serving requests."""
 
 import sys
 from typing import TYPE_CHECKING
@@ -19,9 +13,6 @@ from shell_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
 
 c = get_config()
 
-# Boot invariants. Settings() raises on an invalid .env (memory headroom, root
-# uid, unpaired or dummy Turnstile keys); assert_pool raises unless /srv/pool is
-# the XFS filesystem with project quotas that the quota machinery assumes.
 settings = get_settings()
 pool_id = settings.bind_pool_id()
 assert_pool(settings.pool_mount, expected_pool_id=pool_id)
@@ -29,7 +20,6 @@ assert_pool(settings.pool_mount, expected_pool_id=pool_id)
 lab_home = f"/home/{settings.lab_user}"
 quota_bytes = settings.lab_env_quota_mb * 1024 * 1024
 
-# --- Hub process, proxy and persistence (contract section 4) -----------------
 c.JupyterHub.bind_url = "http://127.0.0.1:8000"
 c.JupyterHub.hub_bind_url = "http://172.30.0.1:8081"
 c.JupyterHub.hub_connect_url = "http://172.30.0.1:8081"
@@ -42,11 +32,9 @@ c.ConfigurableHTTPProxy.should_start = False
 c.ConfigurableHTTPProxy.api_url = "http://127.0.0.1:8001"
 c.ConfigurableHTTPProxy.auth_token = settings.configproxy_auth_token.get_secret_value()
 
-# A hub restart never stops a running environment.
 c.JupyterHub.cleanup_servers = False
 c.JupyterHub.cleanup_proxy = False
 
-# --- Identity (contract section 7) -------------------------------------------
 c.JupyterHub.authenticator_class = EnvironmentTokenAuthenticator
 c.JupyterHub.cookie_max_age_days = COOKIE_MAX_AGE_DAYS
 c.JupyterHub.active_server_limit = settings.lab_max_sessions
@@ -56,7 +44,6 @@ c.Spawner.http_timeout = 60
 c.Spawner.server_token_scopes = ["users:activity!user", "access:servers!server"]
 c.Spawner.pre_spawn_hook = pre_spawn_hook
 
-# --- User containers (contract section 8) ------------------------------------
 c.JupyterHub.spawner_class = "dockerspawner.DockerSpawner"
 c.DockerSpawner.image = settings.lab_image
 c.DockerSpawner.network_name = "finki-hub-shell-users"
@@ -111,10 +98,8 @@ c.DockerSpawner.extra_host_config = {
     "oom_score_adj": 500,
 }
 
-# --- Managed services and their roles (contract section 9) -------------------
 c.JupyterHub.services = [
-    # --max-age recreates a container that has run for LAB_CONTAINER_MAX_AGE_H
-    # hours however busy it is; the home directory it mounts is untouched.
+    # max-age recreates busy containers; mounted homes remain intact.
     {
         "name": "idle-culler-servers",
         "command": [

@@ -15,9 +15,7 @@ type DownloadMenuProps = {
 const itemClass =
   'flex w-full cursor-pointer items-center rounded-sm px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground';
 
-// ZIP is the default because Windows opens it without help, but tar.gz is a
-// peer rather than a fallback: it is the only one of the two that can carry
-// hard links, sparse files and modes back out intact.
+// tar.gz preserves file modes, hard links, and sparse files.
 export const DownloadMenu = ({
   disabled = false,
   label,

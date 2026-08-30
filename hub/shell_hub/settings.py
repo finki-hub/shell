@@ -1,12 +1,3 @@
-"""Runtime settings for the hub image, read from the process environment.
-
-Every key of the rebuild contract section 5 is represented here. The boot-time
-invariants that can be decided from configuration alone are model validators, so
-an invalid ``.env`` makes ``Settings()`` raise and JupyterHub refuses to start
-(``raise_config_file_errors`` is on by default). The invariants that need the
-filesystem or the Docker daemon live in :mod:`shell_hub.readiness`.
-"""
-
 from __future__ import annotations
 
 from functools import lru_cache
@@ -16,28 +7,22 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-#: Bind mount of the XFS pool inside the hub container (read-write).
 POOL_MOUNT: Final[Path] = Path("/srv/pool")
 
-#: Bind mount of the hub's own persistent state inside the hub container.
 HUB_DATA_DIR: Final[Path] = Path("/srv/hub")
 
-#: Headroom the user container needs on top of its tmpfs mounts, in MiB.
 MEMORY_HEADROOM_MB: Final[int] = 96
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
 def _blank_to_none(value: object) -> object:
-    """Treat a blank environment variable as unset, per the contract."""
     if isinstance(value, str) and not value.strip():
         return None
     return value
 
 
 class Settings(BaseSettings):
-    """Everything the hub reads from ``.env``."""
-
     model_config = SettingsConfigDict(
         case_sensitive=False,
         extra="ignore",
@@ -121,22 +106,18 @@ class Settings(BaseSettings):
 
     @property
     def turnstile_configured(self) -> bool:
-        """True when both keys are set, which is what turns enforcement on."""
         return self.turnstile_secret is not None
 
     @property
     def pool_users_dir(self) -> Path:
-        """Where per-environment home directories live, as seen by the hub."""
         return self.pool_mount / "users"
 
     @property
     def pool_id_file(self) -> Path:
-        """The sentinel written into the pool by ``scripts/pool-init.sh``."""
         return self.pool_mount / ".pool-id"
 
     @property
     def pool_id(self) -> str | None:
-        """The pool id this hub is bound to, or ``None`` before first start."""
         path = self.hub_data_dir / "pool-id"
         try:
             return path.read_text(encoding="utf-8").strip() or None
@@ -144,15 +125,7 @@ class Settings(BaseSettings):
             return None
 
     def bind_pool_id(self) -> str | None:
-        """Read ``data/hub/pool-id``, seeding it from the pool sentinel at first start.
-
-        Returns ``None`` -- and persists nothing -- when the pool sentinel is
-        absent, unreadable or blank. A hub that starts before the pool is mounted
-        must not invent an id: it would write a value no pool can ever match and
-        every later start would fail with ``pool-id-mismatch`` until someone
-        deleted the file by hand. With ``None`` the caller's ``assert_pool``
-        reports the real reason (``pool-not-mounted`` / ``pool-id-missing``).
-        """
+        """Seed pool identity only from a non-empty sentinel to avoid mismatches."""
         existing = self.pool_id
         if existing is not None:
             return existing
@@ -167,15 +140,9 @@ class Settings(BaseSettings):
         return seed
 
 
-#: `c.JupyterHub.cookie_max_age_days` from the contract, section 7.
 COOKIE_MAX_AGE_DAYS: Final[int] = 14
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Process-wide settings singleton.
-
-    JupyterHub instantiates the authenticator, the handlers, the spawner hooks and
-    the managed services itself, so they all reach configuration through here.
-    """
     return Settings()  # pyright: ignore[reportCallIssue]

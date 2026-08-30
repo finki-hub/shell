@@ -8,7 +8,6 @@ pytest_plugins = ["pytest_jupyter.jupyter_server"]
 
 @pytest.fixture
 def jp_server_config():
-    # Given a server configured the way the lab image's config file does it.
     return Config(
         {
             "ServerApp": {
@@ -23,7 +22,6 @@ def jp_server_config():
 
 @pytest.fixture
 def manager(tmp_path):
-    # Given a contents manager rooted at a throwaway home directory.
     return QuotaAwareFileManager(root_dir=str(tmp_path), allow_hidden=True)
 
 

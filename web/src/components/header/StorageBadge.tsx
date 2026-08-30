@@ -8,9 +8,7 @@ import {
 import { type StorageUsage } from '@/lib/storage-api';
 import { cn } from '@/lib/utils';
 
-// Both vendor pseudo-elements have to be painted: Firefox fills
-// ::-moz-progress-bar, WebKit fills ::-webkit-progress-value, and neither
-// inherits from the other.
+// Firefox and WebKit use separate progress-fill pseudo-elements.
 const fillClass = (percent: number) => {
   if (percent >= 90) {
     return '[&::-moz-progress-bar]:bg-destructive [&::-webkit-progress-value]:bg-destructive';
@@ -21,10 +19,6 @@ const fillClass = (percent: number) => {
     : '[&::-moz-progress-bar]:bg-primary [&::-webkit-progress-value]:bg-primary';
 };
 
-// A bar for "how close am I", which a length answers at a glance, and the two
-// numbers beside it for "how much", which is what somebody deciding what to
-// delete actually needs. The inode count stays on the tooltip: it is the limit
-// that bites second, and only for people unpacking a source tree.
 export const StorageBadge = ({ usage }: { readonly usage: StorageUsage }) => {
   const { t } = useLanguage();
   const percent = storagePercent(usage);
@@ -40,10 +34,7 @@ export const StorageBadge = ({ usage }: { readonly usage: StorageUsage }) => {
       )}
       title={`${t.storage.title}: ${formatBytes(usage.usedBytes)} / ${formatBytes(usage.totalBytes)} · ${usage.inodesUsed} / ${usage.inodesTotal} ${t.storage.files}`}
     >
-      {/* A real <progress>, so assistive technology reads it as one rather
-          than as a div wearing a role. The floor keeps a nearly-empty bar
-          visible: one that renders as nothing reads as broken rather than as
-          almost empty. */}
+      {/* Native progress exposes storage usage to assistive technology. */}
       <progress
         aria-label={t.storage.title}
         className={cn(

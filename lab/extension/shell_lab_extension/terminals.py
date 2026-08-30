@@ -1,5 +1,3 @@
-"""Terminal manager with a per-container cap."""
-
 from __future__ import annotations
 
 import os
@@ -13,7 +11,6 @@ DEFAULT_MAX_TERMINALS: Final = 4
 
 
 def max_terminals() -> int:
-    """The cap from `LAB_MAX_TERMINALS`, falling back to the contract default."""
     try:
         value = int(os.environ.get(MAX_TERMINALS_ENV, ""))
     except ValueError:
@@ -22,11 +19,8 @@ def max_terminals() -> int:
 
 
 class CappedTerminalManager(TerminalManager):
-    """Refuses to open more than `LAB_MAX_TERMINALS` ptys.
-
-    `create` is the only HTTP-facing hook: `TerminalRootHandler.post` calls it,
-    while terminado's `new_terminal` is also reached from `get_terminal` on a
-    websocket reconnect and would refuse a reconnect to a live terminal.
+    """Terminado reaches `new_terminal` from `get_terminal` during reconnect, so
+    the cap belongs on the HTTP-facing `create` hook.
     """
 
     def create(self, **kwargs: Any) -> dict[str, Any]:  # ruff: ignore[ANN401]

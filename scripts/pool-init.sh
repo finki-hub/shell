@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 #
-# One-time operator setup of the XFS storage pool that backs every environment's
-# home directory. Run once, as root, before the first `docker compose up`.
+# Initializes the XFS pool backing environment home directories. Run once as
+# root before the first `docker compose up`.
 #
 #   sudo scripts/pool-init.sh <pool-dir> <size>
 #
 # Example:
 #   sudo scripts/pool-init.sh /var/lib/finki-hub-shell/pool 150G
 #
-# Creates a preallocated image file at <pool-dir>/pool.img, formats it XFS,
-# adds an /etc/fstab entry mounting it at <pool-dir> with prjquota,nosuid,nodev,
-# noatime, mounts it, writes the .pool-id sentinel the hub checks at startup,
-# creates the users/ directory, and creates the isolated `finki-hub-shell-users`
-# Docker network that compose.yaml declares as external. Refuses to run if
-# <pool-dir> is non-empty, already has an fstab entry, or is already mounted.
+# Creates and mounts <pool-dir>/pool.img as XFS with prjquota,nosuid,nodev,
+# and noatime, writes the startup .pool-id sentinel, creates users/, and creates
+# the external `finki-hub-shell-users` network. Refuses non-empty, configured,
+# or already-mounted pool directories.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -102,10 +100,9 @@ mkdir -p "$POOL_DIR/users"
 chown root:root "$POOL_DIR/users"
 chmod 0755 "$POOL_DIR/users"
 
-# The users network is external to Compose: the hub binds the bridge's gateway
-# address (172.30.0.1), so it must outlive `docker compose down`. `internal: true`
-# plus disabled ICC is what isolates user containers from each other, from the
-# internet, and from every host address except the gateway.
+# The external network must outlive `docker compose down` because the hub binds
+# its gateway (172.30.0.1). `internal: true` and disabled ICC isolate user
+# containers from each other, the internet, and host addresses except the gateway.
 NETWORK=finki-hub-shell-users
 
 if docker network inspect "$NETWORK" > /dev/null 2>&1; then

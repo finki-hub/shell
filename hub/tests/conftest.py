@@ -17,8 +17,6 @@ _MANAGED_KEYS = frozenset({"HUB_DATA_DIR", "LOG_LEVEL", "POOL_MOUNT", "TZ"})
 
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Given: a developer shell that may export TZ, LAB_* or TURNSTILE_* already,
-    # settings under test must depend only on what each test passes explicitly.
     for key in list(os.environ):
         if key.startswith(_MANAGED_PREFIXES) or key in _MANAGED_KEYS:
             monkeypatch.delenv(key, raising=False)
@@ -62,5 +60,4 @@ def mountinfo(tmp_path: Path) -> Callable[[str, str], Path]:
 
 @pytest.fixture
 def commands() -> list[list[str]]:
-    """Records every command the quota code would have run."""
     return []

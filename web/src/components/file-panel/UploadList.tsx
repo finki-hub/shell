@@ -43,10 +43,6 @@ const UploadStatus = ({ upload }: { readonly upload: FileUpload }) => {
   return <UploadProgress value={upload.progress} />;
 };
 
-// Beside the list rather than in a toast stack: a queue of eight files is
-// eight toasts covering the terminal, and the one thing somebody wants from a
-// queue — which file is stuck, and can I stop it — is exactly what a stack of
-// disappearing notifications cannot answer.
 export const UploadList = ({ onCancel, onClear, uploads }: UploadListProps) => {
   const { t } = useLanguage();
 

@@ -15,9 +15,6 @@ type PanelToolbarProps = {
   readonly onUpload: (files: readonly File[]) => void;
 };
 
-// The same `IconButton` the header uses, in the same order the header uses it,
-// because the panel's toolbar and the header's controls are one vocabulary
-// seen twice — a second button shape here would read as a second product.
 export const PanelToolbar = ({
   busy,
   onClose,

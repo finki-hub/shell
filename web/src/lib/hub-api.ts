@@ -14,11 +14,6 @@ export type HubFailure =
   | { readonly kind: 'malformed' }
   | { readonly kind: 'network' };
 
-// Everything the page does after login is a token-authenticated call, to the
-// hub and to the user's own container alike, so the request primitive lives
-// here and `contents-api`/`storage-api`/`terminal-transport` reuse it rather
-// than each growing their own copy of the header, the abort handling and the
-// error-body shape.
 export type LabSession = {
   readonly apiToken: string;
   readonly maxTerminals: number;
@@ -43,9 +38,7 @@ type SendInput = {
   readonly url: string;
 };
 
-// `{error, reason}` is what the three `/hub/lab/*` routes answer with;
-// `{status, message}` is JupyterHub's own API error body. Both are read here
-// so a caller never has to guess which layer refused it.
+// Accept both lab and JupyterHub error bodies.
 const ErrorBodySchema = z.object({
   error: z.string().optional(),
   message: z.string().optional(),
@@ -71,12 +64,9 @@ const UserSchema = z.object({
 const TokenSchema = z.object({ token: z.string() });
 
 const POLL_INTERVAL_MS = 1_000;
-// `Spawner.start_timeout` is 120 s and `http_timeout` 60 s, so a spawn that is
-// still pending after both has already been abandoned by the hub.
+// Deadline exceeds Spawner.start_timeout and http_timeout.
 const SPAWN_DEADLINE_MS = 190_000;
-// `Spawner.stop_timeout` plus the container removal DockerSpawner does after
-// it; far longer than either, because waiting here is cheaper than spawning
-// into a stop that has not finished.
+// Covers Spawner.stop_timeout and DockerSpawner removal.
 const STOP_DEADLINE_MS = 60_000;
 const URL_TOKEN_TTL_S = 60;
 
@@ -158,8 +148,6 @@ type ModelResult<T> =
   | { readonly failure: HubFailure; readonly kind: 'failed' }
   | { readonly kind: 'model'; readonly model: T };
 
-// Send, insist on one of the accepted statuses, and validate the body — the
-// shape every call below wants, so none of them re-spells it.
 const fetchModel = async <T>(
   input: SendInput,
   accepted: readonly number[],
@@ -193,9 +181,7 @@ export type LoginResult =
       readonly session: LabSession;
     }
   | { readonly failure: HubFailure; readonly kind: 'refused' }
-  // Split out of `refused` because it is the one failure the page acts on by
-  // itself: the environment named by the stored token no longer exists, so the
-  // token is forgotten and a fresh one is minted (contract §10).
+  // 410 is handled separately so callers can replace the stored token.
   | { readonly kind: 'gone' };
 
 export const login = async ({
@@ -267,8 +253,6 @@ const pollUntilReady = async (
     if (polled.model.servers?.['']?.ready === true) {
       return { kind: 'ready' };
     }
-    // Nothing pending and nothing ready: the spawn was given up on rather than
-    // still running, so waiting out the deadline would only stall the page.
     if ((polled.model.pending ?? null) === null) {
       return { kind: 'start-failed', message: null };
     }
@@ -292,8 +276,7 @@ export const spawnServer = async (
   if (started.status === 201) {
     return { kind: 'ready' };
   }
-  // 400 is what the hub answers when the container is already up — a resume
-  // rather than an error, so it joins 202 on the polling path.
+  // 400 means already running; poll it like 202.
   if (started.status === 202 || started.status === 400) {
     return pollUntilReady(session, signal);
   }
@@ -333,9 +316,7 @@ export const stopServer = async (
     [202, 204],
   );
 
-// A stop is 202 as often as it is 204, and spawning into a stop that has not
-// finished is answered with a 400 that looks exactly like "already running" —
-// so the restart waits for the server to actually be gone first.
+// Poll after an asynchronous stop; a pending stop makes spawn return 400.
 const pollUntilStopped = async (
   session: LabSession,
   signal?: AbortSignal,
@@ -365,18 +346,15 @@ const pollUntilStopped = async (
   return { failure: { kind: 'network' }, kind: 'failed' };
 };
 
-// Non-destructive recovery, and the only one the end screen's "try again"
-// offers: the container is replaced, the home directory is not touched. The
-// destructive path is `discardEnvironmentServerSide`, which is a different
-// button with a different question in front of it.
+// Restart replaces the container without deleting its home; discard is separate
+// and destructive.
 export const restartServer = async (
   session: LabSession,
   signal?: AbortSignal,
 ): Promise<SpawnResult> => {
   const stopped = await stopServer(session, signal);
   if (stopped.kind === 'failed') {
-    // 400 is "not running" and 404 is "no such server": both mean there was
-    // nothing to stop, which is exactly where a restart wants to begin.
+    // 400 and 404 both mean there is nothing to stop.
     if (!isStatus(stopped.failure, 400) && !isStatus(stopped.failure, 404)) {
       return { failure: stopped.failure, kind: 'failed' };
     }
@@ -402,12 +380,8 @@ export type UrlTokenResult =
   | { readonly failure: HubFailure; readonly kind: 'failed' }
   | { readonly kind: 'token'; readonly token: string };
 
-// The one credential the page is allowed to put in a URL. Three places need
-// one — the two download navigations and the terminal WebSocket handshake —
-// and none of them can carry an Authorization header, so each mints its own:
-// 60 seconds long, `access:servers!user=<u>` and nothing else. The SPA's own
-// day-long API token stays in the header where it cannot be logged, bookmarked
-// or referred onward.
+// URLs carry only a 60-second, servers-only token; the SPA token stays in the
+// Authorization header.
 export const mintUrlToken = async (
   session: LabSession,
   signal?: AbortSignal,

@@ -18,10 +18,6 @@ type NameDialogProps = {
   readonly title: string;
 };
 
-// One dialog for both "new folder" and "rename", because they are the same
-// question with a different starting value. A slash is refused here rather
-// than sent: the contents API would answer 404 for a directory that does not
-// exist yet, which explains nothing.
 export const NameDialog = ({
   confirmLabel,
   container,
@@ -66,9 +62,7 @@ export const NameDialog = ({
               >
                 {t.files.name}
               </label>
-              {/* Radix moves focus to the first control in the dialog, which
-                  is this one — so there is no autoFocus here and no focus
-                  moved anywhere the user did not ask for. */}
+              {/* Radix handles initial focus; avoid competing autoFocus. */}
               <input
                 aria-label={t.files.name}
                 className="h-10 rounded-md border border-input bg-background px-3 text-sm ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"

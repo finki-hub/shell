@@ -2,18 +2,11 @@ import { z } from 'zod';
 
 import { waitForAbortSignal } from '@/lib/session-generation';
 
-// Caddy renders this from `{env.TURNSTILE_SITEKEY}` with a `respond`
-// directive, so an unset key arrives as an empty string rather than as a null
-// or a missing field (contract §10). Empty means "no widget", which is the
-// same thing the fallback says.
+// Caddy emits an empty string when TURNSTILE_SITEKEY is unset.
 const ConfigSchema = z.object({ sitekey: z.string() });
 
 export type LabConfig = { readonly sitekey: null | string };
 
-// What the page assumes if the server cannot be asked. No sitekey means no
-// widget: a page that cannot reach its own origin is not going to reach
-// Cloudflare either, and rendering a challenge nobody can solve would turn a
-// transient failure into a locked door.
 const FALLBACK: LabConfig = { sitekey: null };
 
 const cache: { value: LabConfig | null } = { value: null };
@@ -51,8 +44,6 @@ const load = async (signal?: AbortSignal): Promise<ConfigLoad> => {
   return { kind: 'fallback', value: FALLBACK };
 };
 
-// Only a real answer is cached. A fallback is a statement about this moment,
-// not about the deployment, so the next caller asks again.
 const publish = (loaded: ConfigLoad): LabConfig => {
   if (loaded.kind === 'resolved') cache.value = loaded.value;
   return loaded.value;

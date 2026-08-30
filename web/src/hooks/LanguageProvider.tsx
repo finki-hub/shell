@@ -12,9 +12,7 @@ export const LanguageProvider = ({
   readonly children: ReactNode;
 }) => {
   const [language, setLanguage] = useState<Language>(() => {
-    // Guarded because localStorage throws in a browser that blocks site data,
-    // and a thrown initialiser here takes the whole page down rather than one
-    // unremembered preference.
+    // Storage can be unavailable during initialization; use the default.
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
 
@@ -22,7 +20,7 @@ export const LanguageProvider = ({
         return saved;
       }
     } catch {
-      // Falls through to the default.
+      return 'mk';
     }
 
     return 'mk';
@@ -34,7 +32,7 @@ export const LanguageProvider = ({
     try {
       localStorage.setItem(STORAGE_KEY, lang);
     } catch {
-      // The choice holds for this page and is simply not remembered.
+      // Ignore unavailable storage; keep the in-memory choice.
     }
   };
 

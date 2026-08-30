@@ -92,7 +92,7 @@ export const createTurnstileAttempt = (
           try {
             input.api.remove(widget);
           } catch {
-            // Third-party removal is best-effort; owned settlement must continue.
+            // Widget removal is best effort; settle the attempt regardless.
             widget = null;
           }
         };

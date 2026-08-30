@@ -21,10 +21,6 @@ type NewEnvironmentDialogProps = {
   readonly onDownload: (format: ArchiveFormat) => void;
 };
 
-// Asked before, not explained after. Starting a new environment deletes the
-// current one outright, so the download sits in the same dialog as the warning
-// rather than somewhere the user has to go and find — it is the only
-// safeguard, and the only one there is meant to be.
 export const NewEnvironmentDialog = ({
   container,
   onCancel,
@@ -37,9 +33,6 @@ export const NewEnvironmentDialog = ({
   const [discarding, setDiscarding] = useState(false);
 
   return (
-    // The only one of these that is a question rather than a statement, so it
-    // is the only one Escape and a click outside are allowed to answer — both
-    // mean "no", which is the safe answer to "shall I delete this".
     <Dialog
       modal={false}
       onOpenChange={(open) => {

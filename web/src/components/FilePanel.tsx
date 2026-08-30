@@ -22,10 +22,7 @@ import { useLanguage } from '@/hooks/useLanguage';
 import { type ContentsEntry, type ContentsErrorKind } from '@/lib/contents-api';
 
 type FilePanelProps = {
-  /**
-   * Where the file browser and its confirmation dialogs portal to — `Lab`'s
-   * `<main>`, so they dim the work area and stop at the header.
-   */
+  /** Portal target for overlays. */
   readonly container: HTMLElement | null;
   readonly files: FilesModel;
   readonly onClose: () => void;
@@ -50,8 +47,6 @@ const PanelBody = ({
 }: PanelBodyProps) => {
   const { t } = useLanguage();
 
-  // A refused listing is the whole panel's state, so it replaces the list
-  // rather than sitting above a stale one that is no longer true.
   if (files.error === 'not-found') {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 px-3 py-8 text-center text-muted-foreground">

@@ -219,7 +219,6 @@ describe('file panel model', () => {
   });
 
   it('returns queued IDs for main-screen upload progress', () => {
-    // Given: an active queue whose first upload remains in progress.
     services.uploadFile.mockReturnValue(new Promise(() => {}));
     const queue = useUploadQueue({
       directory: () => '',
@@ -228,18 +227,15 @@ describe('file panel model', () => {
       setTransferring: vi.fn(),
     });
 
-    // When: files are enqueued from the main screen.
     const ids = queue.enqueue([
       new File(['one'], 'one.txt'),
       new File(['two'], 'two.txt'),
     ]);
 
-    // Then: the caller can associate their progress rows with stable toasts.
     expect(ids).toEqual([1, 2]);
   });
 
   it('keeps an empty directory settled while the next listing is pending', async () => {
-    // Given: an empty listing has already completed.
     const first =
       Promise.withResolvers<ContentsResult<readonly ContentsEntry[]>>();
     const second =
@@ -254,12 +250,10 @@ describe('file panel model', () => {
     await flush();
     const settled = useRenderedFiles(refreshStorage);
 
-    // When: navigation starts another listing.
     settled.refresh();
     await flush();
     const pending = useRenderedFiles(refreshStorage);
 
-    // Then: it remains initialized while reporting background loading.
     expect({
       entries: pending.entries,
       initialized: pending.initialized,

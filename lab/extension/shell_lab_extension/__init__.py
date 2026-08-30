@@ -1,9 +1,5 @@
-"""Jupyter Server extension for Shell user environments.
-
-Discovery is the `jupyter_server_config.d/shell_lab_extension.json` data file installed
-into the venv's `etc/jupyter` (jupyter_server has no entry-point mechanism for
-server extensions: `ServerApp.init_server_extension_config` merges
-`jupyter_server_config.d/*.json` from every config path and nothing else).
+"""Jupyter Server has no Python entry point for server extensions; it merges
+`jupyter_server_config.d/*.json` from configured paths.
 """
 
 from __future__ import annotations
@@ -42,15 +38,13 @@ def _jupyter_server_extension_points() -> list[dict[str, str]]:
     return [{"module": "shell_lab_extension"}]
 
 
-#: `(?P<checkpoint_id>...)` exactly as jupyter_server's own route spells it.
+# Match Jupyter Server's checkpoint route parameter.
 CHECKPOINT_ID_REGEX = r"(?P<checkpoint_id>[\w-]+)"
 
-#: The temporary name a chunked upload writes to, `.<name>.part`.
 PART_PATTERN: Final = re.compile(r"^\..*\.part$")
 
 
 def _drop_upload_leftovers(root_dir: str) -> None:
-    """Delete `.<name>.part` files an interrupted upload left in the home root."""
     try:
         for entry in Path(root_dir).iterdir():
             if PART_PATTERN.fullmatch(entry.name) and entry.is_file(
@@ -66,12 +60,8 @@ def _load_jupyter_server_extension(server_app: ServerApp) -> None:
     web_app = server_app.web_app
     base_url: str = web_app.settings["base_url"]
     contents = url_path_join(base_url, "api", "contents") + path_regex
-    # `path_regex` is greedy, so a bare `/api/contents<path>` override would also
-    # swallow `/api/contents/<path>/checkpoints`, `.../checkpoints/<id>` and
-    # `.../trust` -- jupyter_server registers those *before* its own contents
-    # route for exactly that reason. `add_handlers` inserts ahead of the wildcard
-    # router holding them, so the same three have to be re-declared here, ahead
-    # of the override, pointing back at jupyter_server's own handlers.
+    # path_regex is greedy; preserve Jupyter's checkpoint/trust routes before the
+    # contents override because add_handlers prepends this handler set.
     handlers: list[tuple[str, Any]] = [
         (url_path_join(base_url, "lab", "storage"), StorageHandler),
         (contents + "/checkpoints", CheckpointsHandler),

@@ -15,9 +15,7 @@ type ConfirmDeleteDialogProps = {
   readonly onConfirm: () => void;
 };
 
-// Asked, not undone. `delete_to_trash` is off in the container (contract §8),
-// so there is no bin to fish anything out of — the confirmation is the whole
-// safeguard, and it names the thing it is about to remove.
+// `delete_to_trash` is disabled; confirmation is the only recovery safeguard.
 export const ConfirmDeleteDialog = ({
   container,
   entry,

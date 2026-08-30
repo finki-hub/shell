@@ -1,12 +1,3 @@
-"""The three ``/hub/lab/*`` endpoints the SPA talks to.
-
-The decision logic lives in :func:`perform_login`, a pure orchestration over the
-:class:`LoginBackend` protocol, so the whole table -- resume, create, 410, 403,
-429 -- is exercised without a running hub. The Tornado handlers below are thin
-adapters that bound the request body, translate refusals into status codes and
-mint the scoped API token.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -31,17 +22,12 @@ from shell_hub.turnstile import TurnstileVerdict, check
 if TYPE_CHECKING:
     from shell_hub.settings import Settings
 
-#: Ceiling on a ``/hub/lab/*`` request body, enforced per handler.
 MAX_BODY_BYTES: Final[int] = 16 * 1024
 
-#: How long ``/hub/lab/discard`` waits for a user container to stop.
 STOP_TIMEOUT_S: Final[float] = 30.0
 
-#: Lifetime of the SPA's API token. One day: the SPA re-logs in with the
-#: environment token it keeps in localStorage.
 SPA_TOKEN_TTL_S: Final[int] = 86_400
 
-#: Scopes granted to the SPA's API token (contract section 7).
 SPA_TOKEN_SCOPES: Final[tuple[str, ...]] = (
     "access:servers!user={username}",
     "servers!user={username}",
@@ -50,7 +36,6 @@ SPA_TOKEN_SCOPES: Final[tuple[str, ...]] = (
     "tokens!user={username}",
 )
 
-#: Width of the creation counter's window, in seconds.
 CREATE_WINDOW_S: Final[float] = 60.0
 
 Intent = Literal["resume", "create"]
@@ -60,26 +45,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CreationWindow:
-    """Counts environment creations inside a fixed 60-second window."""
-
     started_at: float = 0.0
     count: int = 0
 
     def allow(self, limit: int, now: float) -> bool:
-        """Record one creation attempt and report whether it stays within ``limit``."""
         if now - self.started_at >= CREATE_WINDOW_S:
             self.started_at, self.count = now, 0
         self.count += 1
         return self.count <= limit
 
 
-#: The one global creation counter, shared process-wide.
 creations = CreationWindow()
 
 
 class LoginError(Exception):
-    """A login refusal carrying the exact status and body the contract fixes."""
-
     def __init__(self, status: int, error: str, reason: str | None = None) -> None:
         super().__init__(f"{status} {error}")
         self.status = status
@@ -94,8 +73,6 @@ class LoginError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class LoginRequest:
-    """A validated ``POST /hub/lab/login`` body."""
-
     token: str
     intent: Intent
     turnstile: str | None = None
@@ -103,8 +80,6 @@ class LoginRequest:
 
 @dataclass(frozen=True, slots=True)
 class LoginResponse:
-    """The ``200`` body of ``POST /hub/lab/login``."""
-
     username: str
     api_token: str
     token_expires_at: str
@@ -122,8 +97,6 @@ class LoginResponse:
 
 
 class LoginBackend(Protocol):
-    """Everything :func:`perform_login` needs from the running hub."""
-
     @property
     def settings(self) -> Settings: ...
     def hub_user_exists(self, username: str) -> bool: ...
@@ -135,7 +108,6 @@ class LoginBackend(Protocol):
 
 
 def parse_login_body(raw: bytes) -> LoginRequest:
-    """Validate a login body; raise :class:`LoginError` with 400 or 413."""
     if len(raw) > MAX_BODY_BYTES:
         raise LoginError(413, "payload-too-large")
     try:
@@ -161,7 +133,6 @@ def parse_login_body(raw: bytes) -> LoginRequest:
 
 
 async def perform_login(backend: LoginBackend, request: LoginRequest) -> LoginResponse:
-    """The login decision table of contract section 7."""
     settings = backend.settings
     username = username_for_token(request.token)
     if backend.hub_user_exists(username) or backend.home_exists(username):
@@ -202,13 +173,7 @@ def _bounded_body(handler: web.RequestHandler) -> bytes:
 
 
 def check_login_headers(content_type: str | None, fetch_site: str | None) -> None:
-    """Refuse anything that is not the SPA's own ``fetch`` of this endpoint.
-
-    A form post cannot set ``Content-Type: application/json``, and a browser
-    labels a cross-site request as such in ``Sec-Fetch-Site`` -- together they
-    keep an unauthenticated POST that mints an API token off-limits to other
-    origins. Requests without the header (curl, older browsers) are unaffected.
-    """
+    """Require JSON and same-origin fetch metadata to limit token-minting CSRF."""
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
     if media_type != "application/json":
         raise LoginError(415, "unsupported-media-type")
@@ -217,10 +182,8 @@ def check_login_headers(content_type: str | None, fetch_site: str | None) -> Non
 
 
 class LabLoginHandler(BaseHandler):  # type: ignore[misc] # jupyterhub ships no type information
-    """``POST /hub/lab/login`` -- resume or create an environment."""
-
     def check_xsrf_cookie(self) -> None:
-        """No-op: the request body carries the credential, not a cookie."""
+        """The credential is in the body, so cookie XSRF checks do not apply."""
         return
 
     async def post(self) -> None:
@@ -239,13 +202,7 @@ class LabLoginHandler(BaseHandler):  # type: ignore[misc] # jupyterhub ships no 
 
 
 class LabDiscardHandler(APIHandler):  # type: ignore[misc] # jupyterhub ships no type information
-    """``POST /hub/lab/discard`` -- stop the container and delete the environment.
-
-    ``check_xsrf_cookie`` is deliberately *not* overridden: ``APIHandler``
-    already returns early for the ``Authorization: token`` path the SPA uses, so
-    an override would only strip the guard from the cookie-authenticated path of
-    an endpoint that deletes a user, its home directory and its XFS project.
-    """
+    """Keep API-token auth while retaining cookie-authenticated XSRF protection."""
 
     async def post(self) -> None:
         user = self.current_user
@@ -267,12 +224,9 @@ class LabDiscardHandler(APIHandler):  # type: ignore[misc] # jupyterhub ships no
 
 
 class LabReadyHandler(BaseHandler):  # type: ignore[misc] # jupyterhub ships no type information
-    """``GET /hub/lab/ready`` -- Docker answers and the pool is usable."""
-
     async def get(self) -> None:
         settings = get_settings()
-        # The factory, not a client: building one talks to the daemon, so a dead
-        # daemon must be reported as a reason instead of raising a 500 here.
+        # Pass the factory so daemon-construction failures become readiness reasons.
         report = await asyncio.to_thread(
             readiness_report,
             docker_client,
@@ -283,8 +237,6 @@ class LabReadyHandler(BaseHandler):  # type: ignore[misc] # jupyterhub ships no 
 
 
 class _HubLoginBackend:
-    """The running hub, seen through :class:`LoginBackend`."""
-
     def __init__(self, handler: Any) -> None:  # ruff: ignore[any-type] - an untyped jupyterhub BaseHandler
         self._handler = handler
         self._settings = get_settings()

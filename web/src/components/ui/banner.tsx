@@ -12,10 +12,6 @@ type BannerProps = {
   readonly tone: 'urgent' | 'warning';
 };
 
-// Both banners in one place, because they had already drifted apart twice: one
-// carried an icon and the other did not, and both were set two steps smaller
-// than every other sentence in the product — the size used for the header
-// chips, which are labels beside a number rather than something to read.
 const TONES = {
   urgent: {
     icon: 'text-destructive',

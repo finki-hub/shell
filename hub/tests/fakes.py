@@ -1,11 +1,7 @@
-"""Fakes shared by the readiness and handler tests."""
-
 from __future__ import annotations
 
 
 class FakeDocker:
-    """The slice of ``docker.DockerClient`` the hub actually calls."""
-
     def __init__(self, *, ping_error: Exception | None = None) -> None:
         self._ping_error = ping_error
 

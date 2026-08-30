@@ -27,10 +27,6 @@ type RowActions = {
   readonly onRename: (entry: ContentsEntry) => void;
 };
 
-// Quieter than `IconButton`: a row is three of these next to a name, and the
-// bordered header control at that density reads as a toolbar rather than as a
-// list. The focus ring is the same one, because that is the part that has to
-// stay loud.
 const rowButtonClass =
   'inline-flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40';
 
@@ -146,10 +142,6 @@ const EntryRow = ({
   );
 };
 
-// A real list of real buttons in document order, so Tab walks it and a screen
-// reader counts it. No roving tabindex and no grid role: the rows are three
-// controls wide, which arrow-key navigation would have to model and would then
-// get wrong for the one row that has two.
 export const FileList = ({
   busy,
   entries,

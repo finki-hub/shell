@@ -69,15 +69,12 @@ describe('lab file browser', () => {
   });
 
   it('refreshes the current directory when the closed panel opens', () => {
-    // Given: the running lab has rendered its closed file-panel control.
     renderToStaticMarkup(<Lab />);
     const toggle = header.read();
     expect(toggle).toBeDefined();
 
-    // When: the user opens the file panel.
     toggle?.();
 
-    // Then: the retained current directory is refreshed exactly once.
     expect(files.refresh).toHaveBeenCalledOnce();
   });
 });

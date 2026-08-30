@@ -26,7 +26,6 @@ export type StartTerminalInput = {
 
 export type TerminalCallbacks = {
   readonly onEnd: (end: SessionEnd) => void;
-  /** A keystroke. The storage poller uses it as its only activity signal. */
   readonly onInput?: () => void;
   readonly onOutput?: () => void;
   readonly onStatus: (status: TerminalStatus) => void;
@@ -36,7 +35,6 @@ export type TerminalHandle = {
   readonly clear: () => void;
   readonly fit: () => void;
   readonly focus: () => void;
-  /** When the last frame arrived. No ping is ever sent to refresh it. */
   readonly lastActivityAt: () => number;
   readonly teardown: () => void;
 };
@@ -56,31 +54,24 @@ const TerminalSchema = z.object({ name: z.string() });
 
 const TerminalListSchema = z.array(TerminalSchema);
 
-// terminado's entire server vocabulary: `["setup", {}]` once on open,
-// `["stdout", s]` for pty output, `["disconnect", code]` when the pty dies.
-// Anything else arriving on this socket is not terminado, and is treated so.
+// Accept only terminado's setup, stdout, and disconnect frames.
 const ServerFrameSchema = z.union([
   z.tuple([z.literal('setup'), z.object({})]),
   z.tuple([z.literal('stdout'), z.string()]),
   z.tuple([z.literal('disconnect'), z.number()]),
 ]);
 
-// One tab, one shell. `sessionStorage` keeps two tabs from fighting over one
-// pty. An accepted refresh or close clears the key in `pagehide`; only an
-// unclean browser restore can present a remembered terminal to a new document.
+// Keep one terminal per tab; pagehide clears accepted refresh/close, while
+// unclean restores may retain the remembered pty.
 const TERMINAL_KEY = 'lab.terminal';
 
 const PROTOCOL_CLOSE_CODE = 1_002;
-// A pty is not a canvas: nothing sane asks for a terminal this large, and
-// `set_size` reaches an ioctl, so the numbers are bounded here rather than
-// trusted from a resize observer that happened to see a transient layout.
+// Bound dimensions before passing them to the pty ioctl.
 const MAX_ROWS = 512;
 const MAX_COLS = 1_024;
-// Well under the container's 1 MiB frame cap, so a large paste never arrives
-// as one message the server refuses.
+// Keep stdin frames below the 1 MiB server cap.
 const STDIN_WINDOW = 64 * 1_024;
-// Five attempts over half a minute. A hub restart or a proxy reload is back
-// inside that; anything longer is not a blip and the page should say so.
+// Five retries span about 30 seconds; longer outages are terminal.
 const RECONNECT_DELAYS_MS: readonly number[] = [
   1_000, 2_000, 4_000, 8_000, 15_000,
 ];
@@ -95,9 +86,6 @@ const TERMINAL_THEME = {
 const userRoot = (session: LabSession): string =>
   `/user/${encodeURIComponent(session.username)}`;
 
-// Storage can be unavailable (private browsing, a blocked third-party frame).
-// Losing the name costs a shell, never the page, so every access degrades to
-// "this tab does not remember one".
 const recallTerminal = (): null | string => {
   try {
     return sessionStorage.getItem(TERMINAL_KEY);
@@ -154,8 +142,7 @@ export const listTerminals = async (
     : { names: model.map((entry) => entry.name), ok: true };
 };
 
-// The body must be an empty JSON object: terminado's root handler reads it as
-// the keyword arguments for `TerminalManager.create`.
+// terminado expects an empty object for TerminalManager.create.
 export const createTerminal = async (
   session: LabSession,
   signal?: AbortSignal,
@@ -179,9 +166,7 @@ export const createTerminal = async (
     : { name: model.name, ok: true };
 };
 
-// Recover a pty only when an unclean browser unload left both its tab-local
-// name and server process behind; accepted refresh and close clear the name.
-// Attaching to a recovered pty is a WebSocket and nothing else — no POST.
+// Recovered ptys attach over WebSocket; otherwise create one.
 export const resolveTerminal = async (
   session: LabSession,
   signal?: AbortSignal,
@@ -195,7 +180,7 @@ export const resolveTerminal = async (
     if (listed.names.includes(remembered)) {
       return { name: remembered, ok: true };
     }
-    // Culled after 15 idle minutes, or exited while the tab was away.
+    // Forget ptys culled after 15 idle minutes or exited while hidden.
     forgetTerminal();
   }
   const created = await createTerminal(session, signal);
@@ -216,8 +201,7 @@ export const deleteTerminal = async (
   });
 };
 
-// `keepalive` because this runs from `pagehide`, after the page has stopped
-// being able to wait for anything. `sendJson` is bypassed for that one flag.
+// pagehide requires fetch keepalive; sendJson cannot carry that option.
 export const releaseTerminal = (session: LabSession, name: string): void => {
   const url = `${userRoot(session)}/api/terminals/${encodeURIComponent(name)}`;
   void (async () => {
@@ -228,18 +212,13 @@ export const releaseTerminal = (session: LabSession, name: string): void => {
         method: 'DELETE',
       });
     } catch {
-      // Fire-and-forget: the document that asked is already going away, and
-      // the server's 15-minute idle cull is the backstop for whatever the
-      // browser refused to send.
+      // Browser shutdown may drop the request; server idle culling cleans up.
     }
   })();
 };
 
-// An accepted close or refresh ends this page's shell. `pagehide` cannot tell
-// those actions apart, so both clear the remembered name and issue the same
-// unconditional delete. If the browser drops the keepalive request, a new
-// document still creates a fresh terminal and the 15-minute server cull is the
-// backstop for the orphaned pty.
+// Clear remembered state and unconditionally delete on close or refresh; idle
+// culling handles a dropped keepalive request.
 const releaseOnPagehide =
   (session: LabSession): (() => void) =>
   (): void => {
@@ -249,11 +228,8 @@ const releaseOnPagehide =
     releaseTerminal(session, name);
   };
 
-// The credential rides in the query string because a WebSocket handshake
-// cannot carry an Authorization header. It is never the SPA's own day-long
-// token: `urlToken` is a 60-second, `access:servers!user=<u>`-only token minted
-// for this handshake alone, so a URL that leaks into a log or a history entry
-// is worthless a minute later.
+// WebSocket handshakes cannot carry Authorization; use the 60-second,
+// servers-only token and never the SPA token in the URL.
 export const terminalSocketUrl = (
   session: LabSession,
   name: string,
@@ -285,16 +261,12 @@ export const startTerminal = ({
   terminal.open(container);
   fitAddon.fit();
 
-  // Liveness is observed, never provoked: the page sends no heartbeat, because
-  // terminado stamps `last_activity` on every frame it writes and a keepalive
-  // from here would keep an abandoned container alive forever. Tornado's own
-  // `ws_ping_interval` on the server side holds the socket open.
+  // Do not send heartbeats: frames update activity and heartbeats prevent
+  // culling; the server's ws_ping_interval keeps the socket alive.
   const live = {
     activityAt: Date.now(),
     disposed: false,
-    // Bumped by teardown. Compared rather than reading `disposed` after an
-    // await, because a number is the one thing the compiler cannot narrow away
-    // across one.
+    // Teardown increments the epoch to invalidate late async work.
     epoch: 0,
     ready: false,
     socket: null as null | WebSocket,
@@ -333,8 +305,7 @@ export const startTerminal = ({
       live.timer = setTimeout(resolve, ms);
     });
 
-  // Resolves when the socket closes, saying which kind of close it was: a pty
-  // that exited, or a connection that dropped.
+  // Resolve whether close followed pty exit or connection loss.
   const runSocket = (
     name: string,
     urlToken: string,
@@ -357,7 +328,7 @@ export const startTerminal = ({
         }
         switch (frame[0]) {
           case 'disconnect':
-            // The pty is gone, so the name this tab remembers names nothing.
+            // An exited pty cannot be recovered.
             forgetTerminal();
             closing.exited = true;
             opened.close();
@@ -382,10 +353,6 @@ export const startTerminal = ({
       });
     });
 
-  // One attempt at a live shell: find or make one, mint the handshake token,
-  // run its socket, and say whether the page should try again. `finish` is a
-  // no-op once torn down, so a late answer to an abandoned attempt reports
-  // nothing.
   const attemptOnce = async (epoch: number): Promise<'ended' | 'retry'> => {
     const resolved = await resolveTerminal(session);
     if (!resolved.ok) {
@@ -405,9 +372,7 @@ export const startTerminal = ({
     return live.epoch === epoch ? 'retry' : 'ended';
   };
 
-  // A bare close is a lost connection, not a finished shell, and the container
-  // is still there: the next attempt reattaches to the very same pty, which is
-  // why nothing deletes the terminal between retries.
+  // Reconnect on a connection close; the pty remains and is not deleted.
   const run = async (): Promise<void> => {
     const epoch = live.epoch;
     callbacks.onStatus('connecting');

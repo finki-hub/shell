@@ -16,10 +16,7 @@ type DownloadButtonProps = {
 const itemClass =
   'flex w-full cursor-pointer items-center rounded-sm px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground';
 
-// The header's icon-only menu is right for a toolbar and wrong everywhere the
-// download is the point of the screen. Same two formats, same behaviour, but
-// labelled — tar.gz was otherwise unreachable in exactly the places where
-// carrying modes, hard links and sparse files back out intact matters most.
+// tar.gz preserves file modes, hard links, and sparse files.
 export const DownloadButton = ({
   block = false,
   disabled = false,

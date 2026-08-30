@@ -1,20 +1,11 @@
 import { type RefObject, useEffect } from 'react';
 
-// Closes a popup on a click outside it or on Escape. Shared, because two
-// menus needing the same behaviour is exactly how one of them ends up without
-// the Escape handler.
 export const useDismissable = (
   open: boolean,
   ref: RefObject<HTMLElement | null>,
   close: () => void,
 ) => {
   useEffect(() => {
-    if (!open) {
-      return () => {
-        // Nothing was attached.
-      };
-    }
-
     const handlePointerDown = (event: PointerEvent) => {
       if (
         ref.current !== null &&
@@ -29,8 +20,10 @@ export const useDismissable = (
         close();
       }
     };
-    document.addEventListener('pointerdown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
+    if (open) {
+      document.addEventListener('pointerdown', handlePointerDown);
+      document.addEventListener('keydown', handleKeyDown);
+    }
 
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown);

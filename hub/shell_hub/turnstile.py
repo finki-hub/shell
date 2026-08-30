@@ -1,11 +1,4 @@
-"""Cloudflare Turnstile verification for the environment-creation path.
-
-Enforcement is on whenever both ``TURNSTILE_SITEKEY`` and ``TURNSTILE_SECRET``
-are set, and off when neither is. There is no third state: with the keys in
-place a missing, rejected or unverifiable response refuses the creation. The
-siteverify endpoint is called **exactly once** per attempt, and only on the
-creation path -- resuming an existing environment never issues a challenge.
-"""
+"""Fail-closed Cloudflare Turnstile checks for environment creation."""
 
 from __future__ import annotations
 
@@ -23,8 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 class SiteverifyClient(Protocol):
-    """The slice of ``httpx.AsyncClient`` this module uses."""
-
     async def post(
         self,
         url: str,
@@ -36,8 +27,6 @@ class SiteverifyClient(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class TurnstileVerdict:
-    """The outcome of one login's challenge evaluation."""
-
     outcome: Outcome
     reason: str | None = None
     error: Literal["challenge-required", "challenge-failed"] | None = None
@@ -49,8 +38,6 @@ class TurnstileVerdict:
 
 @dataclass(frozen=True, slots=True)
 class SiteverifyResult:
-    """The parsed siteverify response, or a transport failure."""
-
     success: bool
     error_codes: tuple[str, ...] = field(default_factory=tuple)
     transport_error: str | None = None
@@ -67,11 +54,7 @@ def _reason(result: SiteverifyResult) -> str:
 async def siteverify(
     client: SiteverifyClient, secret: str, token: str
 ) -> SiteverifyResult:
-    """Call Cloudflare siteverify once; never raise.
-
-    ``remoteip`` is deliberately not sent: every request reaches the hub through
-    two reverse proxies, so the address available here is not the user's.
-    """
+    """Verify once without ``remoteip``; reverse proxies hide the user's address."""
     try:
         response = await client.post(
             SITEVERIFY_URL,
@@ -93,7 +76,7 @@ async def siteverify(
 async def check(
     secret: str, client: SiteverifyClient, token: str | None
 ) -> TurnstileVerdict:
-    """Evaluate one creation attempt. Any failure refuses the creation."""
+    """Evaluate one creation attempt; any verification failure refuses it."""
     if not token or not token.strip():
         logger.warning("turnstile refused: missing-token")
         return TurnstileVerdict(

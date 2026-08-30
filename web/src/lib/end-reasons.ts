@@ -1,7 +1,6 @@
 import type { HubFailure } from '@/lib/hub-api';
 
-// The classification table of contract §10, in one place, so the hook does not
-// re-derive it and the i18n catalogue has exactly one list to cover.
+// Contract §10 end reasons; i18n covers each value.
 export const END_REASONS = [
   'capacity',
   'challenge-blocked',
@@ -29,13 +28,7 @@ const end = (reason: EndReason, message: null | string = null): SessionEnd => ({
   reason,
 });
 
-// A culled container answers on the very next call to `/user/<u>/...`, and
-// which status it answers with depends on how far the request got: 424 is
-// JupyterHub 5's own answer for "this single-user server is not running", 404
-// means the hub has forgotten the server entirely, and 503 means the proxy
-// route is gone. All three are the same event — idleness reclaimed the
-// container — and all three are recoverable: the page offers a reconnect,
-// which re-spawns onto the same home directory.
+// 404, 424, and 503 all indicate idle culling and are recoverable by reconnecting.
 const CULLED_STATUSES: ReadonlySet<number> = new Set([404, 424, 503]);
 
 const CHALLENGE_ERRORS: ReadonlySet<string> = new Set([
@@ -46,9 +39,7 @@ const CHALLENGE_ERRORS: ReadonlySet<string> = new Set([
 const isChallengeError = (value: null | string): value is EndReason =>
   value !== null && CHALLENGE_ERRORS.has(value);
 
-// Shared by every call that is not a login: nothing here can be a challenge
-// verdict, so 403 means the token stopped being accepted rather than that
-// Cloudflare refused.
+// Non-login 403 means token rejection, not a challenge verdict.
 export const classifyHubFailure = (failure: HubFailure): SessionEnd => {
   if (failure.kind !== 'http') {
     return end(failure.kind === 'aborted' ? 'connection-lost' : 'unreachable');
@@ -62,9 +53,7 @@ export const classifyHubFailure = (failure: HubFailure): SessionEnd => {
   return end('unreachable', failure.message ?? failure.reason);
 };
 
-// 403 is the only status the login route uses for a challenge verdict, and it
-// names which one in `error`; anything else there is a refusal the user cannot
-// act on, reported as unreachable rather than as a puzzle they failed.
+// Login 403 carries a challenge verdict in error; other failures are unreachable.
 export const classifyLoginFailure = (failure: HubFailure): SessionEnd => {
   if (failure.kind === 'http' && failure.status === 403) {
     return isChallengeError(failure.error)
@@ -74,10 +63,8 @@ export const classifyLoginFailure = (failure: HubFailure): SessionEnd => {
   return classifyHubFailure(failure);
 };
 
-// Distinguished from a hub refusal on purpose: a challenge that is configured
-// and could not be completed locally is its own answer. "Blocked" means the
-// widget never loaded — something on this network is in the way; "unanswered"
-// means a puzzle was shown and nobody solved it.
+// Blocked means widget load failure; unanswered means a displayed challenge was
+// not solved.
 export type ChallengeOutcome = 'blocked' | 'unanswered';
 
 export const challengeEnd = (outcome: ChallengeOutcome): SessionEnd =>
@@ -88,22 +75,17 @@ export const spawnStartFailed = (message: null | string): SessionEnd =>
 
 export const environmentExpired = (): SessionEnd => end('environment-expired');
 
-// `CappedTerminalManager` answers 429 when the container already holds
-// `LAB_MAX_TERMINALS` ptys, which is a different thing from the hub being at
-// its session ceiling.
+// Terminal-manager 429 means the per-container pty limit, not hub capacity.
 export const classifyTerminalFailure = (failure: HubFailure): SessionEnd =>
   failure.kind === 'http' && failure.status === 429
     ? end('terminal-limit')
     : classifyHubFailure(failure);
 
-// terminado sends `["disconnect", code]` when the pty dies, which is the shell
-// exiting rather than anything going wrong. A socket that just closes is a
-// connection lost, and the transport reconnects onto a new terminal.
+// A terminado disconnect means shell exit; a bare socket close means connection loss.
 export const classifySocketClose = (disconnected: boolean): SessionEnd =>
   end(disconnected ? 'shell-exited' : 'connection-lost');
 
-// Whether the page should offer "try again" on the same environment. A gone
-// environment and a failed challenge both need a different starting point.
+// These reasons cannot reconnect on the same environment.
 const TERMINAL_REASONS: ReadonlySet<EndReason> = new Set<EndReason>([
   'challenge-blocked',
   'challenge-failed',

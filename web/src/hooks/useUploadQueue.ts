@@ -7,7 +7,7 @@ export type FileUpload = {
   readonly error: ContentsErrorKind | null;
   readonly id: number;
   readonly name: string;
-  /** 0..1, one step per 1 MiB chunk — `fetch` cannot report finer than that. */
+  /** Progress advances once per 1 MiB chunk. */
   readonly progress: number;
   readonly state: UploadState;
 };
@@ -30,24 +30,16 @@ type Job = {
 };
 
 type UseUploadQueueInput = {
-  /** Where a file dropped right now belongs; read once, at enqueue time. */
   readonly directory: () => string;
   readonly onSettled: (directory: string, ok: boolean) => void;
   readonly session: LabSession | null;
-  /**
-   * `poller.setTransferring` — held true for the whole drain, so the badge
-   * keeps up with a long upload rather than expiring in the middle of it.
-   */
   readonly setTransferring: (transferring: boolean) => void;
 };
 
 const isPending = (upload: FileUpload): boolean =>
   upload.state === 'running' || upload.state === 'waiting';
 
-// A serial upload queue with per-file progress and per-file cancellation. It
-// is separate from `useFiles` because it is the one part of the panel with a
-// life of its own: a queue outlives the folder it was started from, and a
-// cancelled job has to clean up after itself.
+// Keep uploads serial: the container has a 384 MB memory limit and 8 MiB body cap.
 export const useUploadQueue = ({
   directory,
   onSettled,
@@ -61,9 +53,7 @@ export const useUploadQueue = ({
   const pendingRef = useRef<Job[]>([]);
   const runningRef = useRef(false);
 
-  // A new environment is a new tree: nothing queued against the old container
-  // can still be delivered, and the transfers in flight belong to a socket
-  // that is already gone.
+  // Cancel queued and in-flight work when the session changes.
   useEffect(() => {
     setUploads([]);
     for (const job of jobsRef.current.values()) {
@@ -81,8 +71,7 @@ export const useUploadQueue = ({
 
   const runJob = useCallback(
     async (job: Job) => {
-      // Cancelling drops the job from the map, which is also how a job that
-      // was cancelled while still queued never starts.
+      // Map membership prevents canceled queued jobs from starting.
       if (session === null || !jobsRef.current.has(job.id)) return;
       patch(job.id, { state: 'running' });
       const result = await uploadFile(session, {
@@ -105,9 +94,6 @@ export const useUploadQueue = ({
     [onSettled, patch, session],
   );
 
-  // One at a time. The container has a 384 MB memory limit and an 8 MiB body
-  // cap; parallel uploads would buy nothing and cost the terminal its
-  // headroom.
   const drain = useCallback(async () => {
     if (runningRef.current) return;
     runningRef.current = true;
@@ -120,7 +106,6 @@ export const useUploadQueue = ({
       }
     } finally {
       runningRef.current = false;
-      // Also the poller's cue for its one read after the queue empties.
       setTransferring(false);
     }
   }, [runJob, setTransferring]);
@@ -163,8 +148,7 @@ export const useUploadQueue = ({
       const job = jobsRef.current.get(id);
       if (job === undefined) return;
       jobsRef.current.delete(id);
-      // `uploadFile` deletes its own `.part` when the signal fires, so a
-      // cancelled upload leaves nothing behind in the home directory.
+      // Aborting removes the temporary .part file.
       job.controller.abort();
       pendingRef.current = pendingRef.current.filter(
         (queued) => queued.id !== id,
