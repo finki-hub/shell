@@ -1,10 +1,10 @@
 """Identity for the shell: an opaque environment token minted by the SPA.
 
-There is no login page. ``get_handlers`` returns only the three ``/lab/*`` routes
-and no ``('/login', ...)`` entry, so ``/hub/login`` is never routed and answers
-404 -- the SPA is the only entry point. The hub stores nothing but the username
-derived from the token; the raw token never reaches a URL, a log line or the
-database.
+JupyterHub still registers its default ``/hub/login`` route internally, but Caddy
+does not expose it. ``get_handlers`` adds only the three custom ``/lab/*`` routes,
+so the SPA remains the only public entry point. The hub stores nothing but the
+username derived from the token; the raw token never reaches a URL, a log line or
+the database.
 """
 
 from __future__ import annotations
@@ -55,21 +55,21 @@ def username_for_token(token: str) -> str:
 
 
 class EnvironmentTokenAuthenticator(Authenticator):  # type: ignore[misc] # jupyterhub ships no type information
-    """Authenticator whose only routes are the SPA's three ``/lab/*`` endpoints."""
+    """Authenticator adding the SPA's three custom ``/lab/*`` endpoints."""
 
     async def authenticate(
         self,
         handler: RequestHandler,  # ruff: ignore[unused-method-argument] - the base signature is fixed
         data: dict[str, Any] | None,  # ruff: ignore[unused-method-argument]
     ) -> None:
-        """Never reached: no login form is routed. Always refuses."""
+        """Refuse JupyterHub's internal default login flow."""
         logger.warning("authenticate() reached unexpectedly; refusing")
 
     def get_handlers(
         self,
         app: Any,  # ruff: ignore[any-type, unused-method-argument] - JupyterHub hands over its application object
     ) -> list[tuple[str, type[RequestHandler]]]:
-        """The routes JupyterHub mounts under ``/hub``; deliberately no login page."""
+        """The custom routes JupyterHub mounts under ``/hub``."""
         # Imported here because shell_hub.handlers imports this module.
         from shell_hub import handlers  # ruff: ignore[import-outside-top-level]
 
