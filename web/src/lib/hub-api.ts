@@ -31,6 +31,7 @@ export type SendResult =
 
 type SendInput = {
   readonly body?: unknown;
+  readonly cache?: RequestCache;
   readonly headers?: Readonly<Record<string, string>>;
   readonly method: string;
   readonly session?: LabSession;
@@ -77,6 +78,7 @@ const delay = (ms: number): Promise<void> =>
 
 export const sendJson = async ({
   body,
+  cache,
   headers,
   method,
   session,
@@ -86,6 +88,7 @@ export const sendJson = async ({
   try {
     const response = await fetch(url, {
       ...(body !== undefined && { body: JSON.stringify(body) }),
+      ...(cache !== undefined && { cache }),
       headers: {
         ...(body !== undefined && { 'Content-Type': 'application/json' }),
         ...(session !== undefined && {

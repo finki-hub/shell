@@ -6,6 +6,7 @@ import {
   createDirectory,
   deleteEntry,
   fileDownloadUrl,
+  listDirectory,
   partName,
   uploadFile,
 } from '@/lib/contents-api';
@@ -51,6 +52,17 @@ describe('contents API', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('bypasses the browser cache when listing a directory', async () => {
+    const fetchRequest = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(response(200, '{}'));
+    vi.stubGlobal('fetch', fetchRequest);
+
+    await listDirectory(SESSION, '');
+
+    expect(fetchRequest.mock.calls[0]?.[1]?.cache).toBe('no-store');
   });
 
   it('uploads numbered chunks to a unique part and renames it', async () => {

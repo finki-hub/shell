@@ -143,6 +143,7 @@ export const listDirectory = async (
 ): Promise<ContentsResult<readonly ContentsEntry[]>> =>
   call(
     {
+      cache: 'no-store',
       method: 'GET',
       session,
       signal,
