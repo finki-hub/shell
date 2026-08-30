@@ -12,7 +12,10 @@ export const LanguageToggle = ({
   language,
   setLanguage,
 }: LanguageToggleProps) => (
-  <div className="flex items-center gap-1 rounded-lg bg-secondary/50 px-2 py-1">
+  <div
+    className="flex items-center gap-1 rounded-lg bg-secondary/50 px-2 py-1"
+    data-dialog-persistent=""
+  >
     {languages.map((option) => (
       <button
         aria-pressed={language === option}

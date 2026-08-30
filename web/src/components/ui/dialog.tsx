@@ -27,6 +27,7 @@ export const DialogOverlay = ({
 export const DialogContent = ({
   children,
   className,
+  onInteractOutside,
   ...props
 }: ComponentProps<typeof DialogPrimitive.Content>) => (
   <DialogPrimitive.Content
@@ -38,6 +39,16 @@ export const DialogContent = ({
       className,
     )}
     {...props}
+    onInteractOutside={(event) => {
+      const persistent =
+        event.target instanceof Element &&
+        event.target.closest('[data-dialog-persistent]') !== null;
+
+      onInteractOutside?.(event);
+      if (persistent) {
+        event.preventDefault();
+      }
+    }}
   >
     {children}
   </DialogPrimitive.Content>

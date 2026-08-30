@@ -38,6 +38,7 @@ export const DownloadMenu = ({
   return (
     <div
       className="relative"
+      data-dialog-persistent=""
       ref={rootRef}
     >
       <IconButton

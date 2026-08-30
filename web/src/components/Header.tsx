@@ -115,6 +115,7 @@ export const Header = ({
           </IconButton>
           <IconButton
             aria-label={t.actions.upload}
+            data-dialog-persistent=""
             disabled={!running}
             onClick={() => {
               fileInputRef.current?.click();
@@ -146,7 +147,10 @@ export const Header = ({
             language={language}
             setLanguage={setLanguage}
           />
-          <span className="hidden sm:inline-flex">
+          <span
+            className="hidden sm:inline-flex"
+            data-dialog-persistent=""
+          >
             <IconLink
               href={GITHUB_URL}
               rel="noopener noreferrer"

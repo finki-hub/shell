@@ -16,6 +16,7 @@ const ThemeToggle = () => {
   return (
     <IconButton
       aria-label={t.actions.theme}
+      data-dialog-persistent=""
       onClick={() => {
         setTheme(theme === 'dark' ? 'light' : 'dark');
       }}
@@ -25,11 +26,13 @@ const ThemeToggle = () => {
         <SunIcon
           aria-hidden="true"
           className="h-4 w-4"
+          data-dialog-persistent=""
         />
       ) : (
         <MoonIcon
           aria-hidden="true"
           className="h-4 w-4"
+          data-dialog-persistent=""
         />
       )}
     </IconButton>
