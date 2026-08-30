@@ -1,5 +1,5 @@
 [Unit]
-Description=Check GHCR for new finki-hub-shell images every ten minutes
+Description=Periodically check GHCR for new Shell images
 
 [Timer]
 OnCalendar=*:0/10

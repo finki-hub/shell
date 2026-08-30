@@ -113,11 +113,82 @@ Inspect pool usage, quotas, environments, and running user containers:
 sudo bash scripts/pool-status.sh /var/lib/finki-hub-shell/pool
 ```
 
-Pull current images and recreate changed services:
+### Manual Image Updates
+
+Run a one-time image update from the repository checkout:
 
 ```sh
 ./scripts/update.sh
 ```
+
+The updater pulls every Compose image, including the user-environment image, recreates only
+Compose services whose image changed, and removes dangling images. Running user environments
+are not Compose services and remain running. The updater does not modify the repository checkout
+or `.env`.
+
+### Automatic Image Updates
+
+The supplied systemd units can run the updater automatically. The service runs as root and
+expects the checkout at `/opt/finki-hub-shell` by default:
+
+```sh
+sudo install -m 0644 scripts/finki-hub-shell-update.service /etc/systemd/system/
+sudo install -m 0644 scripts/finki-hub-shell-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+For a checkout in another directory, override the service command before enabling the timer:
+
+```sh
+sudo systemctl edit finki-hub-shell-update.service
+```
+
+Enter the following, replacing both paths with the absolute path to the checkout:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/absolute/path/to/shell/scripts/update.sh /absolute/path/to/shell
+```
+
+The default schedule runs every ten minutes at wall-clock minutes `00`, `10`, `20`, and so on.
+To use another systemd calendar interval, create a timer override:
+
+```sh
+sudo systemctl edit finki-hub-shell-update.timer
+```
+
+For example, the following changes the schedule to hourly. The empty assignment clears the
+original ten-minute schedule before adding the replacement:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+```
+
+Once the path and schedule are correct, enable and start the timer:
+
+```sh
+sudo systemctl enable --now finki-hub-shell-update.timer
+```
+
+After changing either override, reload systemd and restart the timer:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart finki-hub-shell-update.timer
+```
+
+Inspect the next scheduled run or invoke and inspect an update immediately:
+
+```sh
+systemctl list-timers finki-hub-shell-update.timer
+sudo systemctl start finki-hub-shell-update.service
+sudo journalctl -u finki-hub-shell-update.service -n 50 --no-pager
+```
+
+`Persistent=true` causes one missed update to run after the host starts again.
 
 Stop the Compose-managed services:
 
