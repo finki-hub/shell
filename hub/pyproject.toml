@@ -27,7 +27,7 @@ dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
-    "types-docker>=7.1.0",
+    "types-docker>=7.2.0.20260923",
 ]
 
 [tool.mypy]
