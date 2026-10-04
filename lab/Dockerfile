@@ -1,5 +1,5 @@
 # Keep /opt/jupyter/bin off PATH to separate server Python from shell Python.
-FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 AS jupyter
+FROM ubuntu:25.10@sha256:7cc5e35f6567ee8c66d2abb4aab0fd866669e6207c237c3a8f0947a5c7f17092 AS jupyter
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /usr/local/bin/
 
@@ -22,7 +22,7 @@ COPY extension/ ./
 # the extension config installs under /opt/jupyter/etc/jupyter for startup.
 RUN uv sync --frozen --no-dev --no-editable
 
-FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+FROM ubuntu:25.10@sha256:7cc5e35f6567ee8c66d2abb4aab0fd866669e6207c237c3a8f0947a5c7f17092
 
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \
