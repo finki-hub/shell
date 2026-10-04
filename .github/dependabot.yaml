@@ -11,11 +11,6 @@ updates:
       - /lab/extension
     schedule:
       interval: daily
-    groups:
-      uv-security-updates:
-        applies-to: security-updates
-        patterns:
-          - "*"
 
   - package-ecosystem: docker
     directories:
