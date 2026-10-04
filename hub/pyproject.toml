@@ -26,7 +26,7 @@ packages = ["shell_hub"]
 dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
-    "ruff>=0.16.4",
+    "ruff>=0.16.10",
     "types-docker>=7.1.0",
 ]
 
