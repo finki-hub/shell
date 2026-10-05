@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
 VERSION_LABEL = "org.finki-hub.jupyterhub-version"
@@ -166,6 +166,7 @@ class Suite:
         self.results: dict[str, Any] = {"cases": {}, "runtime": "not-run"}
         self.active_stage = "initialization"
         self.active_case = ""
+        self.failure_context: dict[str, str | int] | None = None
         self.started = time.monotonic()
         self.stage_deadline = self.started + OVERALL_TEST_TIMEOUT
         self.project_dir: Path | None = None
@@ -210,6 +211,102 @@ class Suite:
     def require_time(self, seconds: int = 1) -> None:
         if time.monotonic() + seconds > self.stage_deadline:
             raise HarnessFailure("bounded integration-suite deadline exceeded")
+
+    @staticmethod
+    def setup_stderr_classification(stderr: bytes) -> str:
+        message = stderr.lower()
+        if any(
+            phrase in message
+            for phrase in (
+                b"no free loop device",
+                b"cannot find an unused loop device",
+                b"no loop device available",
+            )
+        ):
+            return "no-free-loop-device"
+        if b"operation not permitted" in message or b"permission denied" in message:
+            return "permission-denied"
+        if b"device or resource busy" in message or b"already mounted" in message:
+            return "device-busy"
+        if b"unknown filesystem type" in message or b"bad fs type" in message:
+            return "unsupported-filesystem"
+        if b"no such file or directory" in message:
+            return "missing-path-or-device"
+        if b"invalid argument" in message:
+            return "invalid-argument"
+        return "unclassified-command-failure"
+
+    def setup_command(
+        self,
+        operation: Literal["loop-attach", "loop-mount", "loop-mount-validation"],
+        argv: list[str],
+        *,
+        timeout: int,
+    ) -> bytes:
+        self.active_stage = operation
+        self.failure_context = None
+        try:
+            result = safe_call(argv, timeout=timeout, capture=True)
+        except HarnessFailure as exc:
+            cause = exc.__cause__
+            context: dict[str, str | int] = {"operation": operation}
+            if isinstance(cause, subprocess.TimeoutExpired):
+                context["classification"] = "timeout"
+            elif isinstance(cause, OSError):
+                if cause.errno in (errno.EACCES, errno.EPERM):
+                    classification = "permission-denied"
+                elif cause.errno == errno.ENOENT:
+                    classification = "missing-command-or-path"
+                else:
+                    classification = "operating-system-error"
+                context["classification"] = classification
+                if isinstance(cause.errno, int):
+                    context["errno"] = cause.errno
+            else:
+                context["classification"] = "command-launch-failure"
+            self.failure_context = context
+            raise HarnessFailure("bounded filesystem setup command failed") from None
+        if result.returncode:
+            self.failure_context = {
+                "operation": operation,
+                "classification": self.setup_stderr_classification(
+                    result.stderr or b""
+                ),
+                "returncode": result.returncode,
+            }
+            raise HarnessFailure("bounded filesystem setup command failed")
+        self.failure_context = None
+        return result.stdout or b""
+
+    def record_xfs_setup_stage(
+        self,
+        name: str,
+        phase: Literal[
+            "loop-intent-record", "loop-attachment-record", "loop-mount-record"
+        ],
+        **details: Any,
+    ) -> None:
+        self.manifest["stages"].append(
+            {
+                "name": name,
+                "at_monotonic": round(time.monotonic() - self.started, 3),
+                **details,
+            }
+        )
+        self.active_stage = phase
+        self.failure_context = {
+            "operation": "manifest-write",
+            "phase": phase,
+            "classification": "write-failed",
+        }
+        try:
+            self.save_manifest()
+        except Exception:
+            raise HarnessFailure(
+                "could not persist XFS setup ownership state"
+            ) from None
+        self.failure_context = None
+        self.active_stage = name
 
     def docker(self, *args: str, timeout: int = 30, capture: bool = False) -> bytes:
         result = self.docker_result(*args, timeout=timeout, capture=capture)
@@ -728,20 +825,32 @@ class Suite:
         require_call(["fallocate", "-l", str(POOL_SIZE), str(image)], timeout=30)
         require_call(["mkfs.xfs", "-f", "-q", str(image)], timeout=90)
         self.manifest["loop_backing_intent"] = str(image.resolve())
-        self.record_stage("loop-attach-intent", backing=str(image.resolve()))
-        loop = (
-            require_call(
-                ["losetup", "--find", "--show", str(image)], timeout=20, capture=True
-            )
-            .decode()
-            .strip()
+        self.record_xfs_setup_stage(
+            "loop-attach-intent",
+            "loop-intent-record",
+            backing=str(image.resolve()),
         )
-        if not loop.startswith("/dev/loop"):
+        loop_output = self.setup_command(
+            "loop-attach",
+            ["losetup", "--find", "--show", str(image)],
+            timeout=20,
+        )
+        try:
+            loop = loop_output.decode("ascii").strip()
+        except UnicodeDecodeError:
+            loop = ""
+        if not re.fullmatch(r"/dev/loop\d+", loop):
+            self.active_stage = "loop-device-validation"
+            self.failure_context = {
+                "operation": "loop-device-validation",
+                "classification": "unexpected-device-identifier",
+            }
             raise HarnessFailure("loop setup returned an unexpected device")
         self.loop_device = loop
         self.manifest["loop_device"] = loop
-        self.save_manifest()
-        require_call(
+        self.record_xfs_setup_stage("loop-device-attached", "loop-attachment-record")
+        self.setup_command(
+            "loop-mount",
             [
                 "mount",
                 "-t",
@@ -753,6 +862,7 @@ class Suite:
             ],
             timeout=30,
         )
+        self.active_stage = "xfs-pool-initialize"
         pool_id = str(uuid.uuid4())
         (self.pool / ".pool-id").write_text(pool_id, encoding="ascii")
         (self.pool / ".pool-id").chmod(0o400)
@@ -762,23 +872,22 @@ class Suite:
         for name in (".projects", ".projid-counter", ".lock"):
             (self.pool / name).chmod(0o600)
         (self.pool / "users").mkdir(mode=0o755)
-        findmnt = (
-            require_call(
-                [
-                    "findmnt",
-                    "-n",
-                    "-o",
-                    "FSTYPE,OPTIONS,SOURCE,TARGET",
-                    "--target",
-                    str(self.pool),
-                ],
-                timeout=15,
-                capture=True,
-            )
-            .decode()
-            .strip()
-            .split()
+        findmnt_output = self.setup_command(
+            "loop-mount-validation",
+            [
+                "findmnt",
+                "-n",
+                "-o",
+                "FSTYPE,OPTIONS,SOURCE,TARGET",
+                "--target",
+                str(self.pool),
+            ],
+            timeout=15,
         )
+        try:
+            findmnt = findmnt_output.decode("utf-8").strip().split()
+        except UnicodeDecodeError:
+            findmnt = []
         if (
             len(findmnt) < 4
             or findmnt[0] != "xfs"
@@ -786,9 +895,21 @@ class Suite:
             or findmnt[2] != loop
             or Path(findmnt[3]).resolve() != self.pool.resolve()
         ):
+            self.active_stage = "loop-mount-validation"
+            self.failure_context = {
+                "operation": "loop-mount-validation",
+                "classification": "mount-state-mismatch",
+            }
             raise HarnessFailure(
                 "mounted fixture is not the expected XFS project-quota filesystem"
             )
+        self.record_xfs_setup_stage(
+            "loop-mount-verified",
+            "loop-mount-record",
+            filesystem="xfs",
+            project_quota="prjquota",
+        )
+        self.active_stage = "xfs-quota-verification"
         self.verify_quota_enforcement()
         self.record_stage(
             "xfs-project-quota-verified",
@@ -3034,6 +3155,8 @@ class Suite:
             self.results["runtime"] = "fail"
             self.results["failure"] = "bounded-integration-stage-failed"
             self.results["failed_stage"] = self.active_stage
+            if self.failure_context is not None:
+                self.results["failure_context"] = self.failure_context.copy()
             if self.active_case:
                 self.results["failed_case"] = self.active_case
             self.stage_deadline = time.monotonic() + 300

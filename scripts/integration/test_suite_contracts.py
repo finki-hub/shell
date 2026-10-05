@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -64,7 +65,167 @@ def configured_suite(root: Path) -> run_suite.Suite:
     return suite
 
 
+def run_xfs_setup_case(root: Path, safe_call, *, fail_save_at: int | None = None):
+    suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+    root.mkdir(parents=True, exist_ok=True)
+    run_root = root / "run"
+    pool = run_root / "pool"
+    run_root.mkdir()
+    pool.mkdir()
+    suite.run_root = run_root
+    suite.pool = pool
+    suite.marker = run_root / "owner.json"
+    suite.created_run_root = True
+    suite.preflight = lambda: None
+    suite.create_run_root = lambda: None
+    suite.cleanup = lambda: []
+
+    def fake_require_call(argv, **_kwargs):
+        if argv[0] == "fallocate":
+            Path(argv[-1]).write_bytes(b"synthetic-xfs-image")
+        return b""
+
+    original_save = suite.save_manifest
+    save_calls = 0
+
+    def save_manifest():
+        nonlocal save_calls
+        save_calls += 1
+        if fail_save_at == save_calls:
+            raise OSError(errno.ENOSPC, "synthetic-secret-save-failure", "hidden-path")
+        original_save()
+
+    suite.save_manifest = save_manifest
+    stdout = io.StringIO()
+    with (
+        patch.object(run_suite, "require_call", side_effect=fake_require_call),
+        patch.object(run_suite, "safe_call", side_effect=safe_call),
+        patch("sys.stdout", stdout),
+    ):
+        exit_code = suite.run()
+    return exit_code, json.loads(stdout.getvalue()), suite
+
+
 class SuiteContractTests(unittest.TestCase):
+    def test_loop_attach_failure_emits_only_safe_static_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = b"CONFIGPROXY_AUTH_TOKEN=fixture-secret no free loop device"
+
+            def fake_safe_call(argv, **_kwargs):
+                self.assertEqual(argv[0], "losetup")
+                return subprocess.CompletedProcess(argv, 1, b"", secret)
+
+            code, result, _suite = run_xfs_setup_case(Path(directory), fake_safe_call)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["failed_stage"], "loop-attach")
+        self.assertEqual(
+            result["failure_context"],
+            {
+                "operation": "loop-attach",
+                "classification": "no-free-loop-device",
+                "returncode": 1,
+            },
+        )
+        self.assertNotIn("fixture-secret", json.dumps(result))
+        self.assertNotIn("CONFIGPROXY_AUTH_TOKEN", json.dumps(result))
+
+    def test_attachment_manifest_write_failure_is_distinct_and_scrubbed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            calls: list[str] = []
+
+            def fake_safe_call(argv, **_kwargs):
+                calls.append(argv[0])
+                return subprocess.CompletedProcess(argv, 0, b"/dev/loop42\n", b"")
+
+            code, result, suite = run_xfs_setup_case(
+                Path(directory), fake_safe_call, fail_save_at=2
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["losetup"])
+        self.assertEqual(result["failed_stage"], "loop-attachment-record")
+        self.assertEqual(
+            result["failure_context"],
+            {
+                "operation": "manifest-write",
+                "phase": "loop-attachment-record",
+                "classification": "write-failed",
+            },
+        )
+        self.assertEqual(suite.loop_device, "/dev/loop42")
+        self.assertNotIn("hidden-path", json.dumps(result))
+        self.assertNotIn("synthetic-secret-save-failure", json.dumps(result))
+
+    def test_mount_failure_is_distinguished_from_attachment_and_scrubbed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            calls: list[str] = []
+
+            def fake_safe_call(argv, **_kwargs):
+                calls.append(argv[0])
+                if argv[0] == "losetup":
+                    return subprocess.CompletedProcess(argv, 0, b"/dev/loop8\n", b"")
+                return subprocess.CompletedProcess(
+                    argv,
+                    32,
+                    b"",
+                    b"permission denied CONFIGPROXY_AUTH_TOKEN=mount-secret",
+                )
+
+            code, result, _suite = run_xfs_setup_case(Path(directory), fake_safe_call)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["losetup", "mount"])
+        self.assertEqual(result["failed_stage"], "loop-mount")
+        self.assertEqual(
+            result["failure_context"],
+            {
+                "operation": "loop-mount",
+                "classification": "permission-denied",
+                "returncode": 32,
+            },
+        )
+        self.assertNotIn("mount-secret", json.dumps(result))
+
+    def test_loop_setup_timeout_and_malformed_device_are_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+
+            def timeout_safe_call(argv, **_kwargs):
+                raise run_suite.HarnessFailure("opaque child output") from (
+                    subprocess.TimeoutExpired(["secret-argv"], 20)
+                )
+
+            code, timeout_result, _suite = run_xfs_setup_case(
+                Path(directory) / "timeout", timeout_safe_call
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(timeout_result["failed_stage"], "loop-attach")
+            self.assertEqual(
+                timeout_result["failure_context"],
+                {"operation": "loop-attach", "classification": "timeout"},
+            )
+            self.assertNotIn("secret-argv", json.dumps(timeout_result))
+
+            def malformed_safe_call(argv, **_kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0, b"/dev/very-secret-token", b""
+                )
+
+            code, malformed_result, _suite = run_xfs_setup_case(
+                Path(directory) / "malformed", malformed_safe_call
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(malformed_result["failed_stage"], "loop-device-validation")
+        self.assertEqual(
+            malformed_result["failure_context"],
+            {
+                "operation": "loop-device-validation",
+                "classification": "unexpected-device-identifier",
+            },
+        )
+        self.assertNotIn("very-secret-token", json.dumps(malformed_result))
+
     def test_full_suite_uses_pinned_baseline_and_bounded_xfs_fixture(self) -> None:
         self.assertEqual(
             run_suite.BASELINE_SHA,
