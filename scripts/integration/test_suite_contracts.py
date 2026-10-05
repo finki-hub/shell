@@ -348,6 +348,82 @@ class SuiteContractTests(unittest.TestCase):
                 with self.assertRaises(run_suite.HarnessFailure):
                     run_suite.Suite.parse_quota_report(report, 9999)
 
+    def test_post_denial_block_usage_may_equal_hard_limit_only(self) -> None:
+        scenarios = (
+            ("post-equal", (2048, 16_384, 16_384), True, None),
+            ("post-over", (2048, 16_385), False, "quota-usage-unsafe"),
+            ("initial-equal", (16_384,), False, "quota-usage-unsafe"),
+            ("initial-over", (16_385,), False, "quota-usage-unsafe"),
+        )
+        for name, block_usages, should_pass, expected_failure in scenarios:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+                report_index = 0
+                successful_bytes = 0
+                denial_sent = False
+
+                def quota(command, operation, block_usages=block_usages, **_kwargs):
+                    nonlocal block_limit, report_index
+                    if operation == "quota-limit":
+                        if "bhard=32m" in command:
+                            block_limit = run_suite.QUOTA_RELIEF_BLOCK_LIMIT_KIB
+                        elif "bhard=16m" in command:
+                            block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+                    if operation == "quota-report":
+                        if "-i" in command:
+                            return (
+                                "Project ID Used Soft Hard Warn/Grace\n"
+                                "#9999 1 0 1000 00 [--------]\n"
+                            )
+                        usage = block_usages[min(report_index, len(block_usages) - 1)]
+                        report_index += 1
+                        return (
+                            "Project ID Used Soft Hard Warn/Grace\n"
+                            f"#9999 {usage} 0 {block_limit} 00 [--------]\n"
+                        )
+                    if operation in {"quota-state", "quota-post-state"}:
+                        return XFS_PROJECT_QUOTA_ON
+                    return ""
+
+                def write(_fd, payload):
+                    nonlocal successful_bytes, denial_sent
+                    if not denial_sent and successful_bytes >= 16 * 1024 * 1024:
+                        denial_sent = True
+                        raise OSError(errno.ENOSPC, "synthetic project quota denial")
+                    successful_bytes += len(payload)
+                    return len(payload)
+
+                with (
+                    patch.object(suite, "quota_command", side_effect=quota),
+                    patch_quota_guards(suite),
+                    patch_quota_probe_io(write, lambda _fd: None),
+                ):
+                    if should_pass:
+                        suite.verify_quota_enforcement()
+                    else:
+                        with self.assertRaises(run_suite.HarnessFailure):
+                            suite.verify_quota_enforcement()
+
+                if should_pass:
+                    self.assertIsNone(suite.failure_context)
+                    self.assertEqual(
+                        suite.quota_evidence["block_used_kib_before_relief"], 16_384
+                    )
+                    self.assertEqual(
+                        suite.quota_evidence["relief_block_hard_kib"], 32_768
+                    )
+                else:
+                    self.assertEqual(
+                        suite.failure_context["classification"], expected_failure
+                    )
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
     def test_quota_probe_rejects_root_project_and_low_filesystem_capacity(self) -> None:
         cases = (
             (

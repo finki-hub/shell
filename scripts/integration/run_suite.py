@@ -1394,7 +1394,7 @@ class Suite:
                     "quota-usage-unsafe",
                     details={"inode_used": inode_used, "inode_hard": inode_hard},
                 )
-            if block_used >= block_hard:
+            if block_used > block_hard:
                 fail(
                     "quota-report",
                     "quota-usage-unsafe",
