@@ -24,7 +24,7 @@ packages = ["shell_hub"]
 
 [dependency-groups]
 dev = [
-    "mypy>=2.3.1",
+    "mypy>=2.4.0",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
     "types-docker>=7.2.0.20260923",
