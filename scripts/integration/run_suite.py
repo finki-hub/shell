@@ -112,11 +112,15 @@ def safe_call(
     capture: bool = False,
     input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    child_env = env
+    if child_env is None:
+        child_env = os.environ.copy()
+        child_env.pop("CONFIGPROXY_AUTH_TOKEN", None)
     try:
         result = subprocess.run(
             argv,
             cwd=cwd,
-            env=env,
+            env=child_env,
             stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             input=input_bytes,
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
@@ -212,6 +216,18 @@ class Suite:
         if result.returncode:
             raise HarnessFailure("bounded Docker operation failed")
         return result.stdout or b""
+
+    def fixture_runtime_env(self) -> dict[str, str]:
+        token = self.update_env.get("CONFIGPROXY_AUTH_TOKEN")
+        if (
+            not token
+            or not self.run_root
+            or self.update_env.get("COMPOSE_PROJECT_NAME") != self.project_name
+            or self.update_env.get("UPDATE_LOCK_FILE")
+            != str(self.run_root / "update.lock")
+        ):
+            raise HarnessFailure("fixture runtime environment is unavailable")
+        return self.update_env.copy()
 
     def docker_result(
         self, *args: str, timeout: int = 30, capture: bool = False
@@ -860,6 +876,8 @@ class Suite:
         assert self.run_root is not None
         archive = self.run_root / f"source-{revision[:12]}.tar"
         destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        archive_env = os.environ.copy()
+        archive_env.pop("CONFIGPROXY_AUTH_TOKEN", None)
         with archive.open("wb") as stream:
             result = subprocess.run(
                 ["git", "-C", str(self.workspace), "archive", "--format=tar", revision],
@@ -867,6 +885,7 @@ class Suite:
                 stderr=subprocess.DEVNULL,
                 timeout=BUILD_TIMEOUT,
                 check=False,
+                env=archive_env,
             )
         if result.returncode:
             raise HarnessFailure("could not create exact source archive")
@@ -1284,8 +1303,13 @@ class Suite:
         self.compose.chmod(0o600)
         self.env_file = project / ".env"
         proxy_secret = secrets.token_urlsafe(48)
+        if (
+            not isinstance(proxy_secret, str)
+            or not proxy_secret
+            or any(char.isspace() for char in proxy_secret)
+        ):
+            raise HarnessFailure("fixture proxy credential generation failed")
         values = {
-            "CONFIGPROXY_AUTH_TOKEN": proxy_secret,
             "LOG_LEVEL": "INFO",
             "TZ": "UTC",
             "LAB_POOL_DIR": str(self.pool),
@@ -1325,6 +1349,11 @@ class Suite:
             for key, value in values.items()
         ):
             raise HarnessFailure("fixture environment contains unsupported whitespace")
+        self.update_env = os.environ.copy()
+        self.update_env.update(values)
+        self.update_env["CONFIGPROXY_AUTH_TOKEN"] = proxy_secret
+        self.update_env["COMPOSE_PROJECT_NAME"] = self.project_name
+        self.update_env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
         self.env_file.write_text(
             "".join(f"{key}={value}\n" for key, value in values.items()),
             encoding="utf-8",
@@ -1353,8 +1382,6 @@ class Suite:
             }
         }
         atomic_json(self.candidate_override, override)
-        self.update_env = os.environ.copy()
-        self.update_env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
         old_override = project / "old.override.json"
         atomic_json(
             old_override,
@@ -1422,7 +1449,12 @@ class Suite:
         if args and args[0] == "up":
             requested = [value for value in args if value in {"web", "proxy", "hub"}]
             self.register_compose_intents(requested)
-        return require_call([*argv, *args], timeout=timeout, capture=capture)
+        return require_call(
+            [*argv, *args],
+            timeout=timeout,
+            env=self.fixture_runtime_env(),
+            capture=capture,
+        )
 
     def register_compose_intents(
         self, services: list[str], wrapper_source: Path | None = None
@@ -1982,8 +2014,7 @@ class Suite:
                 ["hub", "proxy", "web"],
                 backup / "configuration" / "jupyterhub_maintenance_config.py",
             )
-        env = os.environ.copy()
-        env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
+        env = self.fixture_runtime_env()
         result = safe_call(
             argv,
             timeout=900 if verb == "migrate" else 600,
@@ -2016,8 +2047,16 @@ class Suite:
     def docker_inspect_not_found(
         result: subprocess.CompletedProcess[bytes], container_id: str
     ) -> bool:
-        if result.returncode == 0 or (result.stdout or b"").strip():
+        if result.returncode == 0:
             return False
+        stdout = (result.stdout or b"").strip()
+        if stdout:
+            try:
+                inspected = json.loads(stdout.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return False
+            if not isinstance(inspected, list) or inspected:
+                return False
         message = (result.stderr or b"").decode("utf-8", errors="replace").strip()
         return message in {
             f"Error: No such object: {container_id}",
@@ -2089,8 +2128,7 @@ class Suite:
             and self.run_root is not None
         )
         helper = self.workspace / "scripts" / "jupyterhub-maintenance.sh"
-        env = os.environ.copy()
-        env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
+        env = self.fixture_runtime_env()
         result = safe_call(
             [
                 "/bin/sh",
@@ -2152,9 +2190,7 @@ class Suite:
         self.active_case = "routine-updater-refusal-old-stack-usable"
         assert self.project_dir is not None and self.run_root is not None
         updater = self.workspace / "scripts" / "update.sh"
-        env = os.environ.copy()
-        env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
-        env["COMPOSE_PROJECT_NAME"] = self.project_name
+        env = self.fixture_runtime_env()
         old_service_ids = self.snapshot_service_ids()
         result = safe_call(
             ["/bin/sh", str(updater), str(self.project_dir)],

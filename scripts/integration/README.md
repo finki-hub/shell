@@ -20,6 +20,20 @@ Cleanup removes only verified fixture resources.
 The host-side runner requires Python 3.12 or newer; Hub workers use the pinned
 image interpreter (Python 3.14).
 
+The disposable proxy authentication token is generated once for the fixture and
+kept in the runner's dedicated runtime environment dictionary. It is not written
+to the mode-0600 fixture `.env`, Compose overrides, ownership manifest, backup
+configuration, process argument list, or the runner's global environment. Only
+Compose and the maintenance/updater child processes that consume the fixture
+configuration receive that runtime environment. Runner-launched default
+subprocesses—including direct Docker, image/build, metadata, probe, and archive
+operations—remove inherited `CONFIGPROXY_AUTH_TOKEN` values. Compose and the
+maintenance/updater children that consume fixture configuration receive the
+scoped token environment; subprocesses launched by those children may inherit
+it. This is not a claim that the token is hidden from the rootful Docker daemon:
+daemon administrators can inspect container configuration/environment, and
+that daemon is explicitly inside the disposable runner trust boundary.
+
 ```sh
 sudo env RUNNER_TEMP="$RUNNER_TEMP" python3 scripts/integration/run_suite.py \
   --workspace "$GITHUB_WORKSPACE" \

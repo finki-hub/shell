@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scripts import jupyterhub_maintenance as maintenance
 from scripts.integration import run_suite
 
 
@@ -29,6 +31,37 @@ def docker_call_logger(calls: list[list[str]]):
         return b""
 
     return docker
+
+
+def configured_suite(root: Path) -> run_suite.Suite:
+    run_root = root / "run"
+    pool = run_root / "pool"
+    source = run_root / "source" / "candidate"
+    pool.mkdir(parents=True)
+    source.mkdir(parents=True)
+    (source / "compose.yaml").write_text("name: fixture\n", encoding="utf-8")
+    suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+    suite.run_root = run_root
+    suite.pool = pool
+    suite.image_refs.update(
+        {
+            "old_hub": "registry/old-hub@sha256:" + "a" * 64,
+            "old_lab": "registry/old-lab@sha256:" + "b" * 64,
+            "candidate_hub": "registry/new-hub@sha256:" + "c" * 64,
+            "candidate_lab": "registry/new-lab@sha256:" + "d" * 64,
+            "web": "registry/web@sha256:" + "e" * 64,
+            "proxy": "registry/proxy@sha256:" + "f" * 64,
+        }
+    )
+    suite.image_ids.update(
+        {
+            "web": "sha256:" + "a" * 64,
+            "proxy": "sha256:" + "b" * 64,
+            "old_hub": "sha256:" + "c" * 64,
+            "candidate_hub": "sha256:" + "d" * 64,
+        }
+    )
+    return suite
 
 
 class SuiteContractTests(unittest.TestCase):
@@ -204,26 +237,13 @@ class SuiteContractTests(unittest.TestCase):
     def test_old_and_candidate_compose_overrides_label_web_and_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            run_root = root / "run"
-            pool = run_root / "pool"
-            source = run_root / "source" / "candidate"
-            pool.mkdir(parents=True)
-            source.mkdir(parents=True)
-            (source / "compose.yaml").write_text("name: fixture\n", encoding="utf-8")
-            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
-            suite.run_root = run_root
-            suite.pool = pool
-            suite.image_refs.update(
-                {
-                    "old_hub": "registry/old-hub@sha256:" + "a" * 64,
-                    "old_lab": "registry/old-lab@sha256:" + "b" * 64,
-                    "candidate_hub": "registry/new-hub@sha256:" + "c" * 64,
-                    "candidate_lab": "registry/new-lab@sha256:" + "d" * 64,
-                    "web": "registry/web@sha256:" + "e" * 64,
-                    "proxy": "registry/proxy@sha256:" + "f" * 64,
-                }
-            )
-            suite.write_compose_fixture()
+            suite = configured_suite(root)
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="test-generated-proxy-auth-token",
+            ):
+                suite.write_compose_fixture()
             self.assertIsNotNone(suite.initial_override)
             self.assertIsNotNone(suite.candidate_override)
             old = json.loads(suite.initial_override.read_text(encoding="utf-8"))
@@ -235,19 +255,296 @@ class SuiteContractTests(unittest.TestCase):
                         suite.run_id,
                     )
 
+    def test_proxy_token_is_runtime_only_and_excluded_from_backup_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = configured_suite(root)
+            token = "test-generated-proxy-auth-token"
+            process_environment = os.environ.copy()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CONFIGPROXY_AUTH_TOKEN": "inherited-parent-token",
+                        "LOG_LEVEL": "inherited-log-level",
+                        "FIXTURE_PARENT_MARKER": "preserved-parent-setting",
+                    },
+                ),
+                patch.object(
+                    run_suite.secrets, "token_urlsafe", return_value=token
+                ) as generate,
+            ):
+                suite.write_compose_fixture()
+                generate.assert_called_once_with(48)
+                self.assertEqual(
+                    os.environ["CONFIGPROXY_AUTH_TOKEN"], "inherited-parent-token"
+                )
+                self.assertEqual(os.environ["LOG_LEVEL"], "inherited-log-level")
+                self.assertEqual(suite.update_env["CONFIGPROXY_AUTH_TOKEN"], token)
+                self.assertEqual(suite.update_env["LOG_LEVEL"], "INFO")
+                self.assertEqual(
+                    suite.update_env["FIXTURE_PARENT_MARKER"],
+                    "preserved-parent-setting",
+                )
+                self.assertEqual(
+                    suite.update_env["COMPOSE_PROJECT_NAME"], suite.project_name
+                )
+                self.assertEqual(
+                    suite.update_env["UPDATE_LOCK_FILE"],
+                    str(suite.run_root / "update.lock"),
+                )
+            self.assertEqual(os.environ, process_environment)
+
+            assert suite.env_file and suite.compose
+            generated_files = [
+                suite.env_file,
+                suite.compose,
+                suite.candidate_override,
+                suite.initial_override,
+            ]
+            for path in generated_files:
+                if path is not None and token.encode() in path.read_bytes():
+                    self.fail("generated fixture file contains runtime proxy token")
+            if token.encode() in json.dumps(suite.manifest).encode():
+                self.fail("fixture manifest contains runtime proxy token")
+
+            backup_parent = root / "backups"
+            backup_parent.mkdir()
+            backup = backup_parent / "snapshot"
+            backup.mkdir(mode=0o700)
+            controller = maintenance.Controller(
+                project_directory=suite.project_dir,
+                project_name=suite.project_name,
+                env_file=suite.env_file,
+                compose_files=[
+                    suite.compose,
+                    suite.initial_override,
+                    suite.candidate_override,
+                ],
+                backup_dir=backup_parent / "controller-backup",
+                command=lambda *_args: "",
+            )
+            controller._copy_operator_configuration(backup)
+            for path in (backup / "configuration").iterdir():
+                if token.encode() in path.read_bytes():
+                    self.fail("copied backup configuration contains runtime token")
+
+    def test_proxy_token_is_passed_only_to_configuration_consumers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            token = "test-generated-proxy-auth-token"
+            with patch.object(run_suite.secrets, "token_urlsafe", return_value=token):
+                suite.write_compose_fixture()
+            assert suite.run_root
+
+            def verify_runtime_env(env: dict[str, str]) -> None:
+                self.assertEqual(env["CONFIGPROXY_AUTH_TOKEN"], token)
+                self.assertEqual(env["COMPOSE_PROJECT_NAME"], suite.project_name)
+                self.assertEqual(
+                    env["UPDATE_LOCK_FILE"], str(suite.run_root / "update.lock")
+                )
+                self.assertIsNot(env, suite.update_env)
+
+            compose_calls: list[dict[str, str]] = []
+
+            def capture_compose(argv, **kwargs):
+                if token in " ".join(argv):
+                    self.fail("Compose command arguments contain runtime proxy token")
+                compose_calls.append(kwargs["env"])
+                return b""
+
+            with patch.object(
+                run_suite,
+                "require_call",
+                side_effect=capture_compose,
+            ):
+                suite.compose_command("config", capture=True)
+                suite.compose_command("ps", "-aq", "--no-trunc", "hub")
+                suite.compose_command("up", "-d", "web")
+                suite.compose_command(
+                    "up",
+                    "-d",
+                    "--force-recreate",
+                    "hub",
+                    override=suite.initial_override,
+                )
+            self.assertEqual(len(compose_calls), 4)
+            for env in compose_calls:
+                verify_runtime_env(env)
+
+            helper_calls: list[dict[str, str]] = []
+            failed_child_output = subprocess.CompletedProcess(
+                [], 1, token.encode(), token.encode()
+            )
+
+            def failed_helper(argv, **kwargs):
+                if token in " ".join(argv):
+                    self.fail("helper command arguments contain runtime proxy token")
+                helper_calls.append(kwargs["env"])
+                return failed_child_output
+
+            with patch.object(
+                run_suite,
+                "safe_call",
+                side_effect=failed_helper,
+            ):
+                for verb in (
+                    "preflight",
+                    "migrate",
+                    "restore",
+                    "accept",
+                    "migrate",
+                    "accept",
+                ):
+                    with self.assertRaisesRegex(
+                        run_suite.HarnessFailure,
+                        f"shipping maintenance helper {verb} failed",
+                    ) as failure:
+                        suite.run_helper(
+                            verb,
+                            suite.run_root / f"{verb}-backup",
+                            preflight=verb == "preflight",
+                            restore=verb == "restore",
+                            acceptance=verb == "accept",
+                        )
+                    if token in str(failure.exception):
+                        self.fail("helper failure disclosed runtime proxy token")
+            self.assertEqual(len(helper_calls), 6)
+            for env in helper_calls:
+                verify_runtime_env(env)
+
+            reject_calls: list[dict[str, str]] = []
+            reject_result = subprocess.CompletedProcess(
+                [],
+                1,
+                token.encode(),
+                b'{"error":"--acceptance-passed is required"}',
+            )
+
+            def failed_unasserted_accept(argv, **kwargs):
+                if token in " ".join(argv):
+                    self.fail("accept command arguments contain runtime proxy token")
+                reject_calls.append(kwargs["env"])
+                return reject_result
+
+            with (
+                patch.object(
+                    run_suite,
+                    "safe_call",
+                    side_effect=failed_unasserted_accept,
+                ),
+                patch.object(
+                    suite,
+                    "compose_ids",
+                    side_effect=lambda service: [f"{service}-id"],
+                ),
+                patch.object(
+                    suite,
+                    "inspect_container",
+                    side_effect=lambda cid: {"State": {"Running": cid != "web-id"}},
+                ),
+            ):
+                suite.reject_unasserted_accept(suite.run_root / "accept-backup")
+            verify_runtime_env(reject_calls[0])
+
+            updater_calls: list[dict[str, str]] = []
+            updater_result = subprocess.CompletedProcess(
+                [],
+                1,
+                b"Hub version change 5.5.1 -> 6.0.1 " + token.encode(),
+                b"",
+            )
+
+            def refused_updater(argv, **kwargs):
+                if token in " ".join(argv):
+                    self.fail("updater command arguments contain runtime proxy token")
+                updater_calls.append(kwargs["env"])
+                return updater_result
+
+            with (
+                patch.object(
+                    run_suite,
+                    "safe_call",
+                    side_effect=refused_updater,
+                ),
+                patch.object(
+                    suite,
+                    "snapshot_service_ids",
+                    return_value={"web": "w", "proxy": "p", "hub": "h"},
+                ),
+                patch.object(suite, "wait_ready"),
+            ):
+                suite.run_updater_refusal()
+            verify_runtime_env(updater_calls[0])
+            if token in json.dumps(suite.results):
+                self.fail("suite result disclosed runtime proxy token")
+
+    def test_uninitialized_proxy_token_fails_before_configuration_children(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            suite.write_compose_fixture()
+            suite.update_env.pop("CONFIGPROXY_AUTH_TOKEN")
+            assert suite.run_root
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CONFIGPROXY_AUTH_TOKEN": "inherited-parent-token"},
+                ),
+                patch.object(run_suite, "require_call") as compose_child,
+                patch.object(run_suite, "safe_call") as helper_child,
+                patch.object(run_suite.secrets, "token_urlsafe") as regenerate,
+            ):
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "runtime environment is unavailable"
+                ):
+                    suite.compose_command("config")
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "runtime environment is unavailable"
+                ):
+                    suite.run_helper("preflight", suite.run_root / "backup")
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "runtime environment is unavailable"
+                ):
+                    suite.reject_unasserted_accept(suite.run_root / "backup")
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "runtime environment is unavailable"
+                ):
+                    suite.run_updater_refusal()
+            compose_child.assert_not_called()
+            helper_child.assert_not_called()
+            regenerate.assert_not_called()
+
+    def test_default_subprocess_environment_does_not_forward_parent_proxy_token(
+        self,
+    ) -> None:
+        inherited_token = "inherited-parent-token"
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with (
+            patch.dict(os.environ, {"CONFIGPROXY_AUTH_TOKEN": inherited_token}),
+            patch.object(run_suite.subprocess, "run", return_value=completed) as child,
+        ):
+            run_suite.safe_call(["docker", "inspect", "container-id"], timeout=5)
+        child_environment = child.call_args.kwargs["env"]
+        if "CONFIGPROXY_AUTH_TOKEN" in child_environment:
+            self.fail("ordinary Docker child inherited the parent proxy token")
+
     def test_updater_receives_fixture_project_and_refusal_preserves_all_old_ids(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            run_root = root / "run"
-            project = root / "project"
-            run_root.mkdir()
-            project.mkdir()
-            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
-            suite.run_root = run_root
-            suite.project_dir = project
-            suite.project_name = "fixture-" + suite.run_id
+            suite = configured_suite(root)
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="test-generated-proxy-auth-token",
+            ):
+                suite.write_compose_fixture()
+            assert suite.run_root
             old_ids = {
                 "web": "web-full-id",
                 "proxy": "proxy-full-id",
@@ -271,7 +568,8 @@ class SuiteContractTests(unittest.TestCase):
                 captured["env"]["COMPOSE_PROJECT_NAME"], suite.project_name
             )
             self.assertEqual(
-                captured["env"]["UPDATE_LOCK_FILE"], str(run_root / "update.lock")
+                captured["env"]["UPDATE_LOCK_FILE"],
+                str(suite.run_root / "update.lock"),
             )
             wait_ready.assert_called_once_with()
             self.assertEqual(
@@ -284,11 +582,13 @@ class SuiteContractTests(unittest.TestCase):
     def test_updater_refusal_rejects_missing_or_replaced_old_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            run_root = root / "run"
-            run_root.mkdir()
-            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
-            suite.run_root = run_root
-            suite.project_dir = root / "project"
+            suite = configured_suite(root)
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="test-generated-proxy-auth-token",
+            ):
+                suite.write_compose_fixture()
             old_ids = {
                 "web": "web-full-id",
                 "proxy": "proxy-full-id",
@@ -516,11 +816,69 @@ class SuiteContractTests(unittest.TestCase):
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
         resource = {"id": "a" * 64, "kind": "fixture-lab", "removed": False}
         failure = subprocess.CompletedProcess(
+            [], 1, b"[]\n", f"Error: No such object: {resource['id']}".encode()
+        )
+        with patch.object(run_suite, "safe_call", return_value=failure):
+            suite.reconcile_helper_lab_presence(resource)
+        self.assertTrue(resource["removed"])
+
+    def test_lab_inspect_empty_stdout_not_found_remains_supported(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        resource = {"id": "a" * 64, "kind": "fixture-lab", "removed": False}
+        failure = subprocess.CompletedProcess(
             [], 1, b"", f"Error: No such object: {resource['id']}".encode()
         )
         with patch.object(run_suite, "safe_call", return_value=failure):
             suite.reconcile_helper_lab_presence(resource)
         self.assertTrue(resource["removed"])
+
+    def test_lab_inspect_nonempty_or_invalid_json_is_not_absence(self) -> None:
+        container_id = "a" * 64
+        outputs = (
+            b'[{"Id":"' + container_id.encode() + b'"}]\n',
+            b"{malformed}\n",
+            b"{}\n",
+            b"null\n",
+            b"false\n",
+        )
+        for stdout in outputs:
+            with self.subTest(stdout=stdout):
+                suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+                resource = {
+                    "id": container_id,
+                    "kind": "fixture-lab",
+                    "removed": False,
+                }
+                failure = subprocess.CompletedProcess(
+                    [], 1, stdout, f"Error: No such object: {container_id}".encode()
+                )
+                with (
+                    patch.object(run_suite, "safe_call", return_value=failure),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.reconcile_helper_lab_presence(resource)
+                self.assertFalse(resource["removed"])
+
+    def test_lab_inspect_not_found_diagnostic_must_bind_exact_id(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        container_id = "a" * 64
+        resource = {
+            "id": container_id,
+            "kind": "fixture-lab",
+            "removed": False,
+        }
+        failure = subprocess.CompletedProcess(
+            [],
+            1,
+            b"[]\n",
+            f"Error: No such object: {'b' * 64}".encode(),
+        )
+        with (
+            patch.object(run_suite, "safe_call", return_value=failure),
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.reconcile_helper_lab_presence(resource)
+        self.assertFalse(resource["removed"])
 
     def test_lab_inspect_unrelated_error_is_not_absence(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
@@ -594,29 +952,20 @@ class SuiteContractTests(unittest.TestCase):
     def test_helper_replacement_intents_are_saved_before_cli_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            project = root / "project"
-            pool = root / "pool"
             backup = root / "backup"
             config = backup / "configuration" / "jupyterhub_maintenance_config.py"
-            project.mkdir()
-            pool.mkdir()
             config.parent.mkdir(parents=True)
             config.write_text("# fixture\n", encoding="utf-8")
-            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
-            suite.run_root = root
-            suite.project_dir = project
-            suite.pool = pool
-            suite.env_file = project / ".env"
-            suite.compose = project / "compose.yaml"
-            suite.candidate_override = project / "candidate.json"
-            suite.image_ids.update(
-                {
-                    "web": "sha256:" + "a" * 64,
-                    "proxy": "sha256:" + "b" * 64,
-                    "old_hub": "sha256:" + "c" * 64,
-                    "candidate_hub": "sha256:" + "d" * 64,
-                }
-            )
+            suite = configured_suite(root)
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="test-generated-proxy-auth-token",
+            ):
+                suite.write_compose_fixture()
+            assert suite.project_dir and suite.pool
+            project = suite.project_dir
+            pool = suite.pool
 
             container_id = "9" * 64
             actual: dict = {}
