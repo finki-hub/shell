@@ -7,7 +7,7 @@ dependencies = [
     "docker==7.2.0",
     "dockerspawner==14.0.0",
     "httpx>=0.28.1",
-    "jupyterhub>=6.0.1,<6.1",
+    "jupyterhub==6.0.1",
     "jupyterhub-idle-culler>=2.0.0",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.13.0",
@@ -108,6 +108,18 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "jupyterhub_config.py" = ["hardcoded-temp-file"]
+"../scripts/tests/**" = [
+    "ANN401",
+    "ARG001",
+    "ARG002",
+    "B023",
+    "PLC0415",
+    "PT009",
+    "PT027",
+    "RUF105",
+    "SIM117",
+    "SLF001",
+]
 "tests/**" = [
     "ANN",
     "ARG",
