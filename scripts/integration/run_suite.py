@@ -110,6 +110,12 @@ class HarnessFailure(RuntimeError):
     pass
 
 
+class CommandFailure(HarnessFailure):
+    def __init__(self, returncode: int) -> None:
+        super().__init__("bounded Docker operation failed")
+        self.returncode = returncode
+
+
 def digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as stream:
@@ -258,6 +264,41 @@ class Suite:
         )
         self.save_manifest()
 
+    def begin_image_operation(self, operation: str, role: str) -> None:
+        self.active_stage = f"{operation}-{role}"
+        self.failure_context = None
+
+    def fail_image_operation(
+        self,
+        operation: str,
+        role: str,
+        classification: str,
+        *,
+        error: Exception | None = None,
+        returncode: int | None = None,
+    ) -> None:
+        context: dict[str, str | int] = {
+            "operation": operation,
+            "role": role,
+            "classification": classification,
+        }
+        cause = error.__cause__ if isinstance(error, HarnessFailure) else error
+        if isinstance(error, CommandFailure):
+            returncode = error.returncode
+        elif isinstance(cause, CommandFailure):
+            returncode = cause.returncode
+        elif isinstance(cause, subprocess.TimeoutExpired):
+            context["classification"] = "timeout"
+            if isinstance(cause.timeout, (int, float)):
+                context["timeout_seconds"] = int(cause.timeout)
+        elif isinstance(cause, OSError) and isinstance(cause.errno, int):
+            context["classification"] = "operating-system-error"
+            context["errno"] = cause.errno
+        if returncode is not None:
+            context["returncode"] = returncode
+        self.active_stage = f"{operation}-{role}"
+        self.failure_context = context
+
     def save_manifest(self) -> None:
         if self.marker is not None:
             atomic_json(self.marker, self.manifest)
@@ -369,7 +410,7 @@ class Suite:
     def docker(self, *args: str, timeout: int = 30, capture: bool = False) -> bytes:
         result = self.docker_result(*args, timeout=timeout, capture=capture)
         if result.returncode:
-            raise HarnessFailure("bounded Docker operation failed")
+            raise CommandFailure(result.returncode)
         return result.stdout or b""
 
     def fixture_runtime_env(self) -> dict[str, str]:
@@ -691,17 +732,53 @@ class Suite:
             # cleanup; cleanup failures must escape and preserve fixture data.
             self.remove_owned_container(cid, force=True)
 
-    def inspect_version(self, image: str, executable: str) -> str:
+    def inspect_version(self, image: str, executable: str, *, role: str) -> str:
+        operation = "image-version-probe"
+        self.begin_image_operation(operation, role)
         code = "import importlib.metadata as m; print(m.version('jupyterhub'))"
-        status, output = self.run_owned_tool(
-            image, [executable, "-c", code], name_prefix="version-probe", timeout=30
-        )
+        try:
+            status, output = self.run_owned_tool(
+                image,
+                [executable, "-c", code],
+                name_prefix="version-probe",
+                timeout=30,
+            )
+        except Exception as exc:
+            self.fail_image_operation(operation, role, "probe-failed", error=exc)
+            raise HarnessFailure("isolated image version probe failed") from None
         if status:
+            self.fail_image_operation(
+                operation, role, "probe-failed", returncode=status
+            )
             raise HarnessFailure("isolated installed-version probe failed")
-        version = output.decode("ascii", errors="strict").strip()
+        try:
+            version = output.decode("ascii", errors="strict").strip()
+        except UnicodeDecodeError:
+            self.fail_image_operation(operation, role, "invalid-version-output")
+            raise HarnessFailure(
+                "isolated installed-version output was invalid"
+            ) from None
         if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            self.fail_image_operation(operation, role, "invalid-version-output")
             raise HarnessFailure("installed JupyterHub version was malformed")
         return version
+
+    def verify_image_label(
+        self, image: str, *, role: str, allowed: tuple[str, ...]
+    ) -> None:
+        operation = "image-label-inspect"
+        self.begin_image_operation(operation, role)
+        try:
+            value = self.image_label(image, VERSION_LABEL)
+        except Exception as exc:
+            self.fail_image_operation(operation, role, "command-failed", error=exc)
+            raise HarnessFailure("image version label inspection failed") from None
+        self.begin_image_operation("image-label-compare", role)
+        if value not in allowed:
+            self.fail_image_operation(
+                "image-label-compare", role, "version-label-mismatch"
+            )
+            raise HarnessFailure("image version label did not match its role")
 
     def preflight(self) -> None:
         if sys.platform != "linux" or os.geteuid() != 0:
@@ -1530,31 +1607,57 @@ class Suite:
             self.record_quota_failure("quota-post-state", state_failure)
             raise HarnessFailure("XFS project quota state changed after probe")
 
-    def archive_source(self, revision: str, destination: Path) -> Path:
+    def archive_source(
+        self, revision: str, destination: Path, *, role: str = "baseline"
+    ) -> Path:
         assert self.run_root is not None
-        archive = self.run_root / f"source-{revision[:12]}.tar"
-        destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        archive_env = os.environ.copy()
-        archive_env.pop("CONFIGPROXY_AUTH_TOKEN", None)
-        with archive.open("wb") as stream:
-            result = subprocess.run(
-                ["git", "-C", str(self.workspace), "archive", "--format=tar", revision],
-                stdout=stream,
-                stderr=subprocess.DEVNULL,
-                timeout=BUILD_TIMEOUT,
-                check=False,
-                env=archive_env,
-            )
-        if result.returncode:
-            raise HarnessFailure("could not create exact source archive")
-        destination.mkdir(mode=0o700)
-        with tarfile.open(archive, "r:") as bundle:
-            for member in bundle.getmembers():
-                name = Path(member.name)
-                if name.is_absolute() or ".." in name.parts:
-                    raise HarnessFailure("source archive path escaped the run root")
-            bundle.extractall(destination, filter="data")
-        return destination
+        self.begin_image_operation("source-archive", role)
+        try:
+            archive = self.run_root / f"source-{revision[:12]}.tar"
+            destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            archive_env = os.environ.copy()
+            archive_env.pop("CONFIGPROXY_AUTH_TOKEN", None)
+            with archive.open("wb") as stream:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.workspace),
+                        "archive",
+                        "--format=tar",
+                        revision,
+                    ],
+                    stdout=stream,
+                    stderr=subprocess.DEVNULL,
+                    timeout=BUILD_TIMEOUT,
+                    check=False,
+                    env=archive_env,
+                )
+            if result.returncode:
+                self.fail_image_operation(
+                    "source-archive",
+                    role,
+                    "command-failed",
+                    returncode=result.returncode,
+                )
+                raise HarnessFailure("bounded source archive failed")
+            destination.mkdir(mode=0o700)
+            with tarfile.open(archive, "r:") as bundle:
+                for member in bundle.getmembers():
+                    name = Path(member.name)
+                    if name.is_absolute() or ".." in name.parts:
+                        self.fail_image_operation(
+                            "source-archive", role, "unsafe-archive-path"
+                        )
+                        raise HarnessFailure("bounded source archive was unsafe")
+                bundle.extractall(destination, filter="data")
+            return destination
+        except Exception as exc:
+            if self.failure_context is None:
+                self.fail_image_operation(
+                    "source-archive", role, "operation-failed", error=exc
+                )
+            raise HarnessFailure("bounded source archive failed") from None
 
     def build(
         self,
@@ -1562,9 +1665,11 @@ class Suite:
         dockerfile: str,
         tag: str,
         *,
+        role: str,
         args: dict[str, str] | None = None,
         pull: bool = True,
     ) -> str:
+        self.begin_image_operation("image-build", role)
         argv = ["docker", "build"]
         if pull:
             argv.append("--pull")
@@ -1572,126 +1677,301 @@ class Suite:
         for key, value in (args or {}).items():
             argv.extend(["--build-arg", f"{key}={value}"])
         argv.append(".")
-        result = safe_call(argv, timeout=BUILD_TIMEOUT, cwd=context)
+        try:
+            result = safe_call(argv, timeout=BUILD_TIMEOUT, cwd=context)
+        except Exception as exc:
+            self.fail_image_operation("image-build", role, "command-failed", error=exc)
+            raise HarnessFailure("bounded image build failed") from None
         if result.returncode:
-            raise HarnessFailure("bounded locked-image build failed")
-        image_id = self.image_id(tag)
-        self.manifest["resources"]["images"].append(
-            {
-                "ref": tag,
-                "id": image_id,
-                "kind": "built",
-                "source_context": str(context),
-                "removed": False,
-            }
-        )
-        self.owned_image_refs[tag] = image_id
-        self.save_manifest()
+            self.fail_image_operation(
+                "image-build", role, "command-failed", returncode=result.returncode
+            )
+            raise HarnessFailure("bounded image build failed")
+        image_id = self.operation_image_id(tag, role=role)
+        self.begin_image_operation("image-registration", role)
+        try:
+            self.manifest["resources"]["images"].append(
+                {
+                    "ref": tag,
+                    "id": image_id,
+                    "kind": "built",
+                    "source_context": str(context),
+                    "removed": False,
+                }
+            )
+            self.owned_image_refs[tag] = image_id
+            self.save_manifest()
+        except Exception as exc:
+            self.fail_image_operation(
+                "image-registration", role, "ownership-record-failed", error=exc
+            )
+            raise HarnessFailure("could not record built image ownership") from None
         return image_id
 
-    def pull_image(self, reference: str, timeout: int = 300) -> str:
-        require_call(["docker", "pull", reference], timeout=timeout)
-        image_id = self.image_id(reference)
-        self.owned_image_refs[reference] = image_id
-        self.manifest["resources"]["images"].append(
-            {"ref": reference, "id": image_id, "kind": "pulled", "removed": False}
-        )
-        self.save_manifest()
+    def operation_image_id(
+        self, reference: str, *, role: str, operation: str = "image-inspect"
+    ) -> str:
+        self.begin_image_operation(operation, role)
+        try:
+            result = self.docker_result(
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                reference,
+                capture=True,
+            )
+        except Exception as exc:
+            self.fail_image_operation(operation, role, "command-failed", error=exc)
+            raise HarnessFailure("bounded image inspection failed") from None
+        if result.returncode:
+            self.fail_image_operation(
+                operation, role, "command-failed", returncode=result.returncode
+            )
+            raise HarnessFailure("bounded image inspection failed")
+        try:
+            image_id = (result.stdout or b"").decode("ascii").strip()
+        except UnicodeDecodeError:
+            self.fail_image_operation(operation, role, "invalid-content-id")
+            raise HarnessFailure("image inspection returned invalid identity") from None
+        if not IMAGE_RE.fullmatch(image_id):
+            self.fail_image_operation(operation, role, "invalid-content-id")
+            raise HarnessFailure("image inspection returned invalid identity")
         return image_id
 
-    def tag_image(self, image_id: str, reference: str) -> None:
-        self.docker("image", "tag", image_id, reference)
-        self.owned_image_refs[reference] = image_id
-        self.manifest["resources"]["images"].append(
-            {"ref": reference, "id": image_id, "kind": "tag", "removed": False}
+    def verify_wrapper_base_reference(
+        self, reference: str, expected_id: str, *, role: str
+    ) -> None:
+        self.begin_image_operation("wrapper-base-verify", role)
+        if self.owned_image_refs.get(reference) != expected_id:
+            self.fail_image_operation(
+                "wrapper-base-verify", role, "ownership-id-mismatch"
+            )
+            raise HarnessFailure("owned wrapper base reference changed")
+        actual_id = self.operation_image_id(
+            reference, role=role, operation="wrapper-base-verify"
         )
-        self.save_manifest()
+        if actual_id != expected_id:
+            self.fail_image_operation("wrapper-base-verify", role, "tag-id-mismatch")
+            raise HarnessFailure("wrapper base tag no longer resolves to its owned ID")
+
+    def build_wrapper_image(
+        self,
+        context: Path,
+        tag: str,
+        base_reference: str,
+        base_id: str,
+        *,
+        role: str,
+    ) -> str:
+        self.verify_wrapper_base_reference(base_reference, base_id, role=role)
+        wrapper_id = self.build(
+            context,
+            "Dockerfile",
+            tag,
+            role=role,
+            args={"HUB_BASE": base_reference},
+            pull=False,
+        )
+        self.verify_wrapper_base_reference(base_reference, base_id, role=role)
+        return wrapper_id
+
+    def pull_image(self, reference: str, timeout: int = 300, *, role: str) -> str:
+        operation = "image-pull"
+        self.begin_image_operation(operation, role)
+        try:
+            result = safe_call(["docker", "pull", reference], timeout=timeout)
+        except Exception as exc:
+            self.fail_image_operation(operation, role, "command-failed", error=exc)
+            raise HarnessFailure("bounded image pull failed") from None
+        if result.returncode:
+            self.fail_image_operation(
+                operation, role, "command-failed", returncode=result.returncode
+            )
+            raise HarnessFailure("bounded image pull failed")
+        image_id = self.operation_image_id(reference, role=role)
+        self.begin_image_operation("image-registration", role)
+        try:
+            self.owned_image_refs[reference] = image_id
+            self.manifest["resources"]["images"].append(
+                {"ref": reference, "id": image_id, "kind": "pulled", "removed": False}
+            )
+            self.save_manifest()
+        except Exception as exc:
+            self.fail_image_operation(
+                "image-registration", role, "ownership-record-failed", error=exc
+            )
+            raise HarnessFailure("could not record pulled image ownership") from None
+        return image_id
+
+    def tag_image(self, image_id: str, reference: str, *, role: str) -> None:
+        operation = "image-tag"
+        self.begin_image_operation(operation, role)
+        try:
+            result = self.docker_result("image", "tag", image_id, reference)
+        except Exception as exc:
+            self.fail_image_operation(operation, role, "command-failed", error=exc)
+            raise HarnessFailure("bounded image tag operation failed") from None
+        if result.returncode:
+            self.fail_image_operation(
+                operation, role, "command-failed", returncode=result.returncode
+            )
+            raise HarnessFailure("bounded image tag operation failed")
+        self.begin_image_operation("image-registration", role)
+        try:
+            self.owned_image_refs[reference] = image_id
+            self.manifest["resources"]["images"].append(
+                {"ref": reference, "id": image_id, "kind": "tag", "removed": False}
+            )
+            self.save_manifest()
+        except Exception as exc:
+            self.fail_image_operation(
+                "image-registration", role, "ownership-record-failed", error=exc
+            )
+            raise HarnessFailure("could not record image tag ownership") from None
 
     def build_images(self) -> None:
         assert self.run_root is not None
         source_root = self.run_root / "source"
-        old_source = self.archive_source(self.baseline_sha, source_root / "baseline")
+        old_source = self.archive_source(
+            self.baseline_sha, source_root / "baseline", role="baseline"
+        )
         candidate_source = self.archive_source(
-            self.candidate_sha, source_root / "candidate"
+            self.candidate_sha, source_root / "candidate", role="candidate"
         )
         run_tag = self.run_id
+        old_hub_base_tag = f"local/jh6/base-hub5:{run_tag}"
+        candidate_hub_base_tag = f"local/jh6/base-hub6:{run_tag}"
         old_hub_base = self.build(
-            old_source / "hub", "Dockerfile", f"local/jh6/base-hub5:{run_tag}"
+            old_source / "hub",
+            "Dockerfile",
+            old_hub_base_tag,
+            role="baseline-hub-base",
         )
         old_lab = self.build(
-            old_source / "lab", "Dockerfile", f"local/jh6/lab5:{run_tag}"
+            old_source / "lab",
+            "Dockerfile",
+            f"local/jh6/lab5:{run_tag}",
+            role="baseline-lab",
         )
         candidate_hub_base = self.build(
-            candidate_source / "hub", "Dockerfile", f"local/jh6/base-hub6:{run_tag}"
+            candidate_source / "hub",
+            "Dockerfile",
+            candidate_hub_base_tag,
+            role="candidate-hub-base",
         )
         candidate_lab = self.build(
-            candidate_source / "lab", "Dockerfile", f"local/jh6/lab6:{run_tag}"
+            candidate_source / "lab",
+            "Dockerfile",
+            f"local/jh6/lab6:{run_tag}",
+            role="candidate-lab",
         )
-        web = self.build(candidate_source, "web/Dockerfile", f"local/jh6/web:{run_tag}")
-        old_hub_version = self.inspect_version(old_hub_base, "/app/.venv/bin/python")
-        old_lab_version = self.inspect_version(old_lab, "/opt/jupyter/bin/python")
+        web = self.build(
+            candidate_source,
+            "web/Dockerfile",
+            f"local/jh6/web:{run_tag}",
+            role="web",
+        )
+        old_hub_version = self.inspect_version(
+            old_hub_base, "/app/.venv/bin/python", role="baseline-hub"
+        )
+        old_lab_version = self.inspect_version(
+            old_lab, "/opt/jupyter/bin/python", role="baseline-lab"
+        )
         new_hub_version = self.inspect_version(
-            candidate_hub_base, "/app/.venv/bin/python"
+            candidate_hub_base,
+            "/app/.venv/bin/python",
+            role="candidate-hub",
         )
-        new_lab_version = self.inspect_version(candidate_lab, "/opt/jupyter/bin/python")
+        new_lab_version = self.inspect_version(
+            candidate_lab, "/opt/jupyter/bin/python", role="candidate-lab"
+        )
+        self.begin_image_operation("image-version-compare", "fixture-images")
         if (old_hub_version, old_lab_version, new_hub_version, new_lab_version) != (
             "5.5.1",
             "5.5.1",
             "6.0.1",
             "6.0.1",
         ):
+            self.fail_image_operation(
+                "image-version-compare", "fixture-images", "version-mismatch"
+            )
             raise HarnessFailure(
                 "actual installed Hub/Lab versions differ from pinned baseline/candidate"
             )
-        if (
-            self.image_label(candidate_hub_base, VERSION_LABEL) != "6.0.1"
-            or self.image_label(candidate_lab, VERSION_LABEL) != "6.0.1"
-        ):
-            raise HarnessFailure("candidate build-verified version labels mismatch")
+        self.verify_image_label(
+            candidate_hub_base, role="candidate-hub-base", allowed=("6.0.1",)
+        )
+        self.verify_image_label(candidate_lab, role="candidate-lab", allowed=("6.0.1",))
         # A test-only Hub image wrapper adds only a run label to DockerSpawner.
         wrapper = self.run_root / "integration_jupyterhub_config.py"
-        wrapper.write_text(
-            "import os\nfrom pathlib import Path\n"
-            "_base = Path('/app/jupyterhub_config.base.py')\n"
-            "exec(compile(_base.read_text(encoding='utf-8'), str(_base), 'exec'), globals())\n"
-            "_labels = c.DockerSpawner.extra_create_kwargs['labels']\n"
-            "_labels['shell.integration.run'] = os.environ['SHELL_INTEGRATION_RUN_ID']\n",
-            encoding="utf-8",
-        )
-        wrapper.chmod(0o600)
+        self.begin_image_operation("wrapper-source-create", "shared")
+        try:
+            wrapper.write_text(
+                "import os\nfrom pathlib import Path\n"
+                "_base = Path('/app/jupyterhub_config.base.py')\n"
+                "exec(compile(_base.read_text(encoding='utf-8'), str(_base), 'exec'), globals())\n"
+                "_labels = c.DockerSpawner.extra_create_kwargs['labels']\n"
+                "_labels['shell.integration.run'] = os.environ['SHELL_INTEGRATION_RUN_ID']\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o600)
+        except Exception as exc:
+            self.fail_image_operation(
+                "wrapper-source-create", "shared", "operation-failed", error=exc
+            )
+            raise HarnessFailure("could not create test-only image wrapper") from None
         dockerfile = self.run_root / "Integration.Dockerfile"
-        dockerfile.write_text(
-            "ARG HUB_BASE\nFROM ${HUB_BASE}\nUSER root\n"
-            "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
-            "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n",
-            encoding="utf-8",
-        )
+        self.begin_image_operation("wrapper-dockerfile-create", "shared")
+        try:
+            dockerfile.write_text(
+                "ARG HUB_BASE\nFROM ${HUB_BASE}\nUSER root\n"
+                "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
+                "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.fail_image_operation(
+                "wrapper-dockerfile-create", "shared", "operation-failed", error=exc
+            )
+            raise HarnessFailure("could not create test-only Dockerfile") from None
         old_context = self.run_root / "hub-wrapper-old"
         new_context = self.run_root / "hub-wrapper-new"
-        for context in (old_context, new_context):
-            context.mkdir(mode=0o700)
-            shutil.copy2(wrapper, context / "integration_jupyterhub_config.py")
-            shutil.copy2(dockerfile, context / "Dockerfile")
-        old_hub = self.build(
+        for role, context in (
+            ("baseline-wrapper", old_context),
+            ("candidate-wrapper", new_context),
+        ):
+            self.begin_image_operation("wrapper-context-create", role)
+            try:
+                context.mkdir(mode=0o700)
+                shutil.copy2(wrapper, context / "integration_jupyterhub_config.py")
+                shutil.copy2(dockerfile, context / "Dockerfile")
+            except Exception as exc:
+                self.fail_image_operation(
+                    "wrapper-context-create", role, "operation-failed", error=exc
+                )
+                raise HarnessFailure(
+                    "could not prepare wrapper build context"
+                ) from None
+        old_hub = self.build_wrapper_image(
             old_context,
-            "Dockerfile",
             f"local/jh6/hub5:{run_tag}",
-            args={"HUB_BASE": old_hub_base},
-            pull=False,
+            old_hub_base_tag,
+            old_hub_base,
+            role="baseline-wrapper",
         )
-        new_hub = self.build(
+        new_hub = self.build_wrapper_image(
             new_context,
-            "Dockerfile",
             f"local/jh6/hub6:{run_tag}",
-            args={"HUB_BASE": candidate_hub_base},
-            pull=False,
+            candidate_hub_base_tag,
+            candidate_hub_base,
+            role="candidate-wrapper",
         )
-        if self.image_label(new_hub, VERSION_LABEL) != "6.0.1":
-            raise HarnessFailure(
-                "candidate wrapper lost its build-verified version label"
-            )
-        if self.image_label(old_hub, VERSION_LABEL) not in {"", "<no value>"}:
-            raise HarnessFailure("baseline Hub acquired a synthetic version label")
+        self.verify_image_label(new_hub, role="candidate-wrapper", allowed=("6.0.1",))
+        self.verify_image_label(
+            old_hub, role="baseline-wrapper", allowed=("", "<no value>")
+        )
+        self.begin_image_operation("image-registration", "fixture-images")
         self.image_ids.update(
             {
                 "old_hub": old_hub,
@@ -1710,12 +1990,15 @@ class Suite:
                 "web": f"local/jh6/web:{run_tag}",
             }
         )
-        proxy = self.pull_image("quay.io/jupyterhub/configurable-http-proxy:5.3.0")
+        proxy = self.pull_image(
+            "quay.io/jupyterhub/configurable-http-proxy:5.3.0", role="proxy"
+        )
         proxy_local = f"local/jh6/proxy:{run_tag}"
-        self.tag_image(proxy, proxy_local)
+        self.tag_image(proxy, proxy_local, role="proxy")
         self.register_image_reference("proxy", proxy, proxy_local)
-        registry = self.pull_image("registry:2.8.3")
+        registry = self.pull_image("registry:2.8.3", role="registry")
         self.image_ids["registry"] = registry
+        self.begin_image_operation("image-registration", "fixture-images")
         self.manifest["images"] = {
             key: {"id": value, "ref": self.image_refs.get(key)}
             for key, value in self.image_ids.items()
@@ -1726,7 +2009,16 @@ class Suite:
             "candidate_hub": new_hub_version,
             "candidate_lab": new_lab_version,
         }
-        self.save_manifest()
+        try:
+            self.save_manifest()
+        except Exception as exc:
+            self.fail_image_operation(
+                "image-registration",
+                "fixture-images",
+                "ownership-record-failed",
+                error=exc,
+            )
+            raise HarnessFailure("could not record fixture image identities") from None
         self.test_db_runner()
         self.record_stage(
             "db-runner-complete", result="pass", db_runner="actual-images-upstream-orm"
@@ -1752,10 +2044,10 @@ class Suite:
             "proxy",
         ):
             local_ref = self.image_refs[key]
-            self.tag_image(self.image_ids[key], local_ref)
+            self.tag_image(self.image_ids[key], local_ref, role=key)
             ref = f"127.0.0.1:5000/{local_ref}"
             self.image_refs[key] = ref
-            self.tag_image(self.image_ids[key], ref)
+            self.tag_image(self.image_ids[key], ref, role=key)
             require_call(["docker", "push", ref], timeout=300)
             if self.image_id(ref) != self.image_ids[key]:
                 raise HarnessFailure(

@@ -1390,6 +1390,134 @@ class SuiteContractTests(unittest.TestCase):
                 extracted = suite.archive_source("a" * 40, destination)
             self.assertEqual((extracted / "marker.txt").read_bytes(), b"fixture-source")
 
+    def test_wrapper_build_passes_owned_tag_and_verifies_base_before_and_after(
+        self,
+    ) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        base_id = "sha256:" + "a" * 64
+        wrapper_id = "sha256:" + "b" * 64
+        base_ref = f"local/jh6/base-hub6:{suite.run_id}"
+        suite.owned_image_refs[base_ref] = base_id
+        inspect = patch.object(
+            suite, "operation_image_id", side_effect=[base_id, base_id]
+        )
+
+        def build(context, dockerfile, tag, *, role, args, pull):
+            self.assertEqual(dockerfile, "Dockerfile")
+            self.assertEqual(role, "candidate-wrapper")
+            self.assertEqual(args, {"HUB_BASE": base_ref})
+            self.assertFalse(pull)
+            suite.owned_image_refs[tag] = wrapper_id
+            return wrapper_id
+
+        with (
+            inspect as inspect_mock,
+            patch.object(suite, "build", side_effect=build) as build_mock,
+        ):
+            self.assertEqual(
+                suite.build_wrapper_image(
+                    Path("wrapper-context"),
+                    f"local/jh6/hub6:{suite.run_id}",
+                    base_ref,
+                    base_id,
+                    role="candidate-wrapper",
+                ),
+                wrapper_id,
+            )
+        self.assertEqual(inspect_mock.call_count, 2)
+        self.assertEqual(build_mock.call_count, 1)
+
+    def test_wrapper_build_stops_before_build_if_base_tag_identity_changed(
+        self,
+    ) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        expected_id = "sha256:" + "a" * 64
+        changed_id = "sha256:" + "b" * 64
+        base_ref = f"local/jh6/base-hub5:{suite.run_id}"
+        suite.owned_image_refs[base_ref] = expected_id
+        with (
+            patch.object(suite, "operation_image_id", return_value=changed_id),
+            patch.object(suite, "build") as build_mock,
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.build_wrapper_image(
+                Path("wrapper-context"),
+                f"local/jh6/hub5:{suite.run_id}",
+                base_ref,
+                expected_id,
+                role="baseline-wrapper",
+            )
+        build_mock.assert_not_called()
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "wrapper-base-verify",
+                "role": "baseline-wrapper",
+                "classification": "tag-id-mismatch",
+            },
+        )
+
+    def test_wrapper_build_rejects_postbuild_retag_but_keeps_owned_id(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        base_id = "sha256:" + "a" * 64
+        wrapper_id = "sha256:" + "b" * 64
+        changed_id = "sha256:" + "c" * 64
+        base_ref = f"local/jh6/base-hub6:{suite.run_id}"
+        wrapper_ref = f"local/jh6/hub6:{suite.run_id}"
+        suite.owned_image_refs[base_ref] = base_id
+
+        def build(_context, _dockerfile, tag, **_kwargs):
+            suite.owned_image_refs[tag] = wrapper_id
+            suite.manifest["resources"]["images"].append(
+                {"ref": tag, "id": wrapper_id, "kind": "built", "removed": False}
+            )
+            return wrapper_id
+
+        with (
+            patch.object(
+                suite,
+                "operation_image_id",
+                side_effect=[base_id, changed_id],
+            ),
+            patch.object(suite, "build", side_effect=build),
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.build_wrapper_image(
+                Path("wrapper-context"),
+                wrapper_ref,
+                base_ref,
+                base_id,
+                role="candidate-wrapper",
+            )
+
+        self.assertEqual(suite.owned_image_refs[wrapper_ref], wrapper_id)
+        self.assertNotIn("candidate_hub", suite.image_ids)
+        self.assertEqual(suite.failure_context["classification"], "tag-id-mismatch")
+
+    def test_image_version_probe_failure_has_safe_candidate_lab_stage(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        secret = b"private container output"
+        with (
+            patch.object(suite, "run_owned_tool", return_value=(23, secret)),
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.inspect_version(
+                "sha256:" + "a" * 64,
+                "/opt/jupyter/bin/python",
+                role="candidate-lab",
+            )
+        self.assertEqual(suite.active_stage, "image-version-probe-candidate-lab")
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "image-version-probe",
+                "role": "candidate-lab",
+                "classification": "probe-failed",
+                "returncode": 23,
+            },
+        )
+        self.assertNotIn(secret.decode(), json.dumps(suite.failure_context))
+
     def test_proxy_image_reference_is_registered_with_its_content_id(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
         content_id = "sha256:" + "a" * 64
