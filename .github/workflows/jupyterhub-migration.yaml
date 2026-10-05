@@ -98,11 +98,87 @@ jobs:
             scripts/integration/probe.py \
             scripts/integration/run_suite.py
 
-  integration:
+  xfs-preflight:
     needs: checks
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact PR revision and pinned baseline object
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up project Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install XFS tools on the approved ephemeral runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s sudo -n apt-get update
+          timeout 300s sudo -n apt-get install --no-install-recommends -y xfsprogs
+          command -v mkfs.xfs
+          command -v xfs_quota
+          sudo -n docker info >/dev/null
+
+      - name: Run owned XFS quota preflight only
+        id: xfs_probe
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/jupyterhub-xfs-preflight.json"
+          if sudo -n env RUNNER_TEMP="$RUNNER_TEMP" bash scripts/integration/jupyterhub-migration.sh run \
+            --workspace "$GITHUB_WORKSPACE" \
+            --acknowledge-disposable \
+            --acknowledge-interruption \
+            --acknowledge-ingress-fenced \
+            --acknowledge-updater-paused \
+            --xfs-only | tee "$result" >/dev/null; then
+            exit_code=0
+          else
+            exit_code=$?
+          fi
+          if [[ ! -s "$result" ]]; then
+            printf '%s\n' '{"failure":"xfs-preflight-result-missing","phase":"xfs-only","runtime":"not-run","xfs_probe":"fail"}' > "$result"
+            exit_code=1
+          fi
+          printf 'exit_code=%s\n' "$exit_code" >> "$GITHUB_OUTPUT"
+          {
+            printf '%s\n\n' '## Sanitized XFS preflight result'
+            cat "$result"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload only the sanitized XFS result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jupyterhub-xfs-preflight-${{ github.run_id }}
+          path: ${{ runner.temp }}/jupyterhub-xfs-preflight.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require focused XFS verification and cleanup to pass
+        if: always()
+        shell: bash
+        env:
+          XFS_PREFLIGHT_EXIT_CODE: ${{ steps.xfs_probe.outputs.exit_code }}
+        run: test "$XFS_PREFLIGHT_EXIT_CODE" = 0
+
+  integration:
+    needs: [checks, xfs-preflight]
+    if: >-
+      needs.xfs-preflight.result == 'success' &&
+      (
+      (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:

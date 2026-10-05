@@ -106,7 +106,486 @@ def run_xfs_setup_case(root: Path, safe_call, *, fail_save_at: int | None = None
     return exit_code, json.loads(stdout.getvalue()), suite
 
 
+def quota_test_suite(root: Path) -> tuple[run_suite.Suite, Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    pool = root / "pool"
+    pool.mkdir()
+    projects = pool / ".projects"
+    projects.write_text("1000:/pool/users\n", encoding="utf-8")
+    suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+    suite.pool = pool
+    return suite, projects
+
+
+XFS_PROJECT_QUOTA_ON = """User quota state on fixture (/dev/loop0)
+\tAccounting: ON
+\tEnforcement: ON
+Project quota state on fixture (/dev/loop0)
+\tAccounting: ON
+\tEnforcement:\tON
+\tInode: #45 (2 blocks, 2 extents)
+"""
+
+
 class SuiteContractTests(unittest.TestCase):
+    def test_workflow_gates_full_runtime_on_sanitized_xfs_preflight(self) -> None:
+        workflow = Path(".github/workflows/jupyterhub-migration.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("  xfs-preflight:\n    needs: checks", workflow)
+        self.assertIn("timeout-minutes: 15", workflow)
+        self.assertIn("--xfs-only", workflow)
+        self.assertIn("needs: [checks, xfs-preflight]", workflow)
+        self.assertIn("needs.xfs-preflight.result == 'success'", workflow)
+        self.assertIn(
+            "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            workflow,
+        )
+        self.assertIn("jupyterhub-xfs-preflight.json", workflow)
+        self.assertEqual(
+            workflow.count(
+                "contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime')"
+            ),
+            2,
+        )
+
+    def test_project_quota_state_parser_uses_project_section_and_tolerates_spacing(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            run_suite.Suite.project_quota_state_classification(XFS_PROJECT_QUOTA_ON)
+        )
+        user_only = "User quota state on fixture\n Accounting: ON\n Enforcement: ON\n"
+        self.assertEqual(
+            run_suite.Suite.project_quota_state_classification(user_only),
+            "project-state-missing",
+        )
+        accounting_off = XFS_PROJECT_QUOTA_ON.replace(
+            "Project quota state on fixture (/dev/loop0)\n\tAccounting: ON",
+            "Project quota state on fixture (/dev/loop0)\n\tAccounting: OFF",
+        )
+        self.assertEqual(
+            run_suite.Suite.project_quota_state_classification(accounting_off),
+            "project-accounting-disabled",
+        )
+        enforcement_off = XFS_PROJECT_QUOTA_ON.replace(
+            "\tEnforcement:\tON", "\tEnforcement:\tOFF"
+        )
+        self.assertEqual(
+            run_suite.Suite.project_quota_state_classification(enforcement_off),
+            "project-enforcement-disabled",
+        )
+
+    def test_quota_command_detects_diagnostic_even_with_zero_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, _projects = quota_test_suite(Path(directory))
+            secret = b"Error: project token-secret was not set"
+            argv = ["xfs_quota", "-x", "-c", "project -s", str(suite.pool)]
+            with patch.object(
+                run_suite,
+                "safe_call",
+                return_value=subprocess.CompletedProcess(argv, 0, b"", secret),
+            ):
+                with self.assertRaises(run_suite.HarnessFailure):
+                    suite.quota_command("project -s", "quota-project")
+
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "quota-project",
+                "classification": "command-reported-error",
+                "returncode": 0,
+            },
+        )
+        self.assertNotIn("token-secret", json.dumps(suite.failure_context))
+
+    def test_quota_state_rejects_disabled_project_accounting_and_enforcement(
+        self,
+    ) -> None:
+        states = (
+            (
+                XFS_PROJECT_QUOTA_ON.replace(
+                    "Project quota state on fixture (/dev/loop0)\n\tAccounting: ON",
+                    "Project quota state on fixture (/dev/loop0)\n\tAccounting: OFF",
+                ),
+                "project-accounting-disabled",
+            ),
+            (
+                XFS_PROJECT_QUOTA_ON.replace(
+                    "\tEnforcement:\tON", "\tEnforcement:\tOFF"
+                ),
+                "project-enforcement-disabled",
+            ),
+        )
+        for state, expected in states:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, _projects = quota_test_suite(Path(directory))
+                with patch.object(suite, "quota_state", return_value=state):
+                    with self.assertRaises(run_suite.HarnessFailure):
+                        suite.verify_quota_enforcement()
+                self.assertEqual(
+                    suite.failure_context,
+                    {"operation": "quota-state", "classification": expected},
+                )
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
+    def test_quota_probe_accepts_edquot_from_write_or_fsync_and_restores_fixture(
+        self,
+    ) -> None:
+        for edquot_location in ("write", "fsync"):
+            with (
+                self.subTest(edquot_location=edquot_location),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                calls: list[tuple[str, str]] = []
+
+                def quota(command, operation, calls=calls, **_kwargs):
+                    calls.append((command, operation))
+                    return (
+                        XFS_PROJECT_QUOTA_ON
+                        if operation
+                        in {
+                            "quota-state",
+                            "quota-post-state",
+                        }
+                        else ""
+                    )
+
+                written_total = 0
+
+                def write(_fd, payload, edquot_location=edquot_location):
+                    nonlocal written_total
+                    if edquot_location == "write" and written_total >= 16 * 1024 * 1024:
+                        raise OSError(errno.EDQUOT, "synthetic quota denial")
+                    written_total += len(payload)
+                    return len(payload)
+
+                def fsync(_fd, edquot_location=edquot_location):
+                    if edquot_location == "fsync":
+                        raise OSError(errno.EDQUOT, "synthetic quota denial")
+
+                with (
+                    patch.object(suite, "quota_command", side_effect=quota),
+                    patch.object(run_suite.os, "open", return_value=77),
+                    patch.object(run_suite.os, "write", side_effect=write),
+                    patch.object(run_suite.os, "fsync", side_effect=fsync),
+                    patch.object(run_suite.os, "close"),
+                ):
+                    suite.verify_quota_enforcement()
+
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+                self.assertEqual(suite.failure_context, None)
+                self.assertEqual(suite.cleanup_failure_context, None)
+                self.assertIn(
+                    ("limit -p bhard=16m ihard=1000 9999", "quota-limit"), calls
+                )
+                self.assertIn(
+                    ("limit -p bhard=0 ihard=0 9999", "quota-reset-limit"), calls
+                )
+
+    def test_quota_probe_fails_if_write_and_fsync_never_report_edquot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, projects = quota_test_suite(Path(directory))
+            original = projects.read_text(encoding="utf-8")
+
+            def quota(_command, operation, **_kwargs):
+                return (
+                    XFS_PROJECT_QUOTA_ON
+                    if operation
+                    in {
+                        "quota-state",
+                        "quota-post-state",
+                    }
+                    else ""
+                )
+
+            with (
+                patch.object(suite, "quota_command", side_effect=quota),
+                patch.object(run_suite.os, "open", return_value=78),
+                patch.object(
+                    run_suite.os, "write", side_effect=lambda _fd, data: len(data)
+                ),
+                patch.object(run_suite.os, "fsync"),
+                patch.object(run_suite.os, "close"),
+                self.assertRaises(run_suite.HarnessFailure),
+            ):
+                suite.verify_quota_enforcement()
+
+            self.assertEqual(
+                suite.failure_context,
+                {"operation": "quota-write", "classification": "limit-not-enforced"},
+            )
+            self.assertEqual(projects.read_text(encoding="utf-8"), original)
+            self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
+    def test_post_probe_state_is_checked_once_and_must_remain_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, _projects = quota_test_suite(Path(directory))
+            state_calls: list[str] = []
+
+            def quota(_command, operation, **_kwargs):
+                if operation in {"quota-state", "quota-post-state"}:
+                    state_calls.append(operation)
+                    if operation == "quota-post-state":
+                        return XFS_PROJECT_QUOTA_ON.replace(
+                            "\tEnforcement:\tON", "\tEnforcement:\tOFF"
+                        )
+                    return XFS_PROJECT_QUOTA_ON
+                return ""
+
+            with (
+                patch.object(suite, "quota_command", side_effect=quota),
+                patch.object(run_suite.os, "open", return_value=81),
+                patch.object(
+                    run_suite.os,
+                    "write",
+                    side_effect=OSError(errno.EDQUOT, "synthetic quota denial"),
+                ),
+                patch.object(run_suite.os, "close"),
+                self.assertRaises(run_suite.HarnessFailure),
+            ):
+                suite.verify_quota_enforcement()
+
+        self.assertEqual(state_calls, ["quota-state", "quota-post-state"])
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "quota-post-state",
+                "classification": "project-enforcement-disabled",
+            },
+        )
+
+    def test_reset_only_failure_is_reported_as_the_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, _projects = quota_test_suite(Path(directory))
+
+            def quota(_command, operation, **_kwargs):
+                if operation in {"quota-state", "quota-post-state"}:
+                    return XFS_PROJECT_QUOTA_ON
+                if operation == "quota-reset-limit":
+                    suite.record_quota_failure(
+                        "quota-reset-limit",
+                        "command-reported-error",
+                        returncode=1,
+                        cleanup_phase="limit-reset",
+                    )
+                    raise run_suite.HarnessFailure("unreported mock detail")
+                return ""
+
+            with (
+                patch.object(suite, "quota_command", side_effect=quota),
+                patch.object(run_suite.os, "open", return_value=82),
+                patch.object(
+                    run_suite.os,
+                    "write",
+                    side_effect=OSError(errno.EDQUOT, "synthetic quota denial"),
+                ),
+                patch.object(run_suite.os, "close"),
+                self.assertRaises(run_suite.HarnessFailure),
+            ):
+                suite.verify_quota_enforcement()
+
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "quota-reset-limit",
+                "classification": "command-reported-error",
+                "returncode": 1,
+                "phase": "limit-reset",
+            },
+        )
+        self.assertEqual(suite.cleanup_failure_context, suite.failure_context)
+        self.assertEqual(suite.active_stage, "quota-reset-limit")
+
+    def test_unexpected_quota_write_and_fsync_errors_are_classified(self) -> None:
+        for operation in ("quota-write", "quota-fsync"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, _projects = quota_test_suite(Path(directory))
+
+                def quota(_command, quota_operation, **_kwargs):
+                    return (
+                        XFS_PROJECT_QUOTA_ON
+                        if quota_operation
+                        in {
+                            "quota-state",
+                            "quota-post-state",
+                        }
+                        else ""
+                    )
+
+                def write(_fd, data, operation=operation):
+                    if operation == "quota-write":
+                        raise OSError(errno.EIO, "synthetic secret I/O message")
+                    return len(data)
+
+                def fsync(_fd, operation=operation):
+                    if operation == "quota-fsync":
+                        raise OSError(errno.EIO, "synthetic secret fsync message")
+
+                with (
+                    patch.object(suite, "quota_command", side_effect=quota),
+                    patch.object(run_suite.os, "open", return_value=79),
+                    patch.object(run_suite.os, "write", side_effect=write),
+                    patch.object(run_suite.os, "fsync", side_effect=fsync),
+                    patch.object(run_suite.os, "close"),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_quota_enforcement()
+
+                self.assertEqual(
+                    suite.failure_context,
+                    {
+                        "operation": operation,
+                        "classification": "io-error",
+                        "errno": errno.EIO,
+                    },
+                )
+
+    def test_quota_reset_failure_does_not_replace_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, _projects = quota_test_suite(Path(directory))
+            call_number = 0
+            commands = [
+                subprocess.CompletedProcess([], 0, XFS_PROJECT_QUOTA_ON.encode(), b""),
+                subprocess.CompletedProcess([], 0, b"", b""),
+                subprocess.CompletedProcess([], 1, b"", b"Error: primary-secret"),
+                subprocess.CompletedProcess([], 1, b"", b"Error: reset-secret"),
+            ]
+
+            def safe_call(argv, **_kwargs):
+                nonlocal call_number
+                result = commands[call_number]
+                call_number += 1
+                return subprocess.CompletedProcess(
+                    argv, result.returncode, result.stdout, result.stderr
+                )
+
+            with (
+                patch.object(run_suite, "safe_call", side_effect=safe_call),
+                patch.object(run_suite.os, "open", return_value=80),
+                patch.object(run_suite.os, "write", return_value=1024),
+                patch.object(run_suite.os, "close"),
+                self.assertRaises(run_suite.HarnessFailure),
+            ):
+                suite.verify_quota_enforcement()
+
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "quota-limit",
+                "classification": "command-reported-error",
+                "returncode": 1,
+            },
+        )
+        self.assertEqual(
+            suite.cleanup_failure_context,
+            {
+                "operation": "quota-reset-limit",
+                "classification": "command-reported-error",
+                "returncode": 1,
+                "phase": "limit-reset",
+            },
+        )
+        self.assertEqual(suite.active_stage, "quota-limit")
+        self.assertNotIn("primary-secret", json.dumps(suite.failure_context))
+        self.assertNotIn("reset-secret", json.dumps(suite.cleanup_failure_context))
+
+    def test_xfs_only_mode_does_not_build_images_or_claim_runtime_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = run_suite.Suite(Path(directory), run_suite.BASELINE_SHA)
+            suite.preflight = lambda: None
+            suite.create_run_root = lambda: setattr(suite, "created_run_root", True)
+            suite.setup_xfs_pool = lambda: None
+            suite.cleanup = lambda: []
+            suite.build_images = lambda: self.fail("xfs-only must not build images")
+            suite.scenario = lambda: self.fail("xfs-only must not start acceptance")
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                code = suite.run_xfs_only()
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(result["xfs_probe"], "pass")
+        self.assertEqual(result["runtime"], "not-run")
+        self.assertEqual(result["phase"], "xfs-only")
+        self.assertEqual(result["cleanup"], "verified")
+        self.assertEqual(result["cases"], {})
+        self.assertNotIn("images", result)
+
+    def test_xfs_only_failure_emits_only_sanitized_quota_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = run_suite.Suite(Path(directory), run_suite.BASELINE_SHA)
+            suite.preflight = lambda: None
+            suite.create_run_root = lambda: setattr(suite, "created_run_root", True)
+
+            def failed_setup():
+                suite.record_quota_failure(
+                    "quota-state", "project-enforcement-disabled"
+                )
+                raise run_suite.HarnessFailure("synthetic raw path and token-secret")
+
+            suite.setup_xfs_pool = failed_setup
+            suite.cleanup = lambda: []
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                code = suite.run_xfs_only()
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(result["phase"], "xfs-only")
+        self.assertEqual(result["runtime"], "not-run")
+        self.assertEqual(result["xfs_probe"], "fail")
+        self.assertEqual(result["failed_stage"], "quota-state")
+        self.assertEqual(
+            result["failure_context"],
+            {
+                "operation": "quota-state",
+                "classification": "project-enforcement-disabled",
+            },
+        )
+        self.assertNotIn("raw path", json.dumps(result))
+        self.assertNotIn("token-secret", json.dumps(result))
+
+    def test_xfs_only_cleanup_summary_does_not_emit_resource_identifiers_or_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = run_suite.Suite(Path(directory), run_suite.BASELINE_SHA)
+            suite.preflight = lambda: None
+            suite.create_run_root = lambda: setattr(suite, "created_run_root", True)
+            suite.setup_xfs_pool = lambda: None
+
+            def failed_cleanup():
+                suite.results["preserved_run_root"] = "secret-path"
+                suite.results["cleanup_incomplete"] = ["xfs-pool"]
+                return ["xfs-pool"]
+
+            suite.cleanup = failed_cleanup
+            suite.cleanup_resource_summary = lambda: [
+                {"id": "secret-device-id", "name": "secret-path", "kind": "loop-mount"}
+            ]
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                code = suite.run_xfs_only()
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(result["runtime"], "not-run")
+        self.assertEqual(result["cleanup"], "incomplete")
+        self.assertEqual(result["remaining_owned_resource_count"], 1)
+        self.assertEqual(result["remaining_owned_resource_kinds"], ["loop-mount"])
+        self.assertNotIn("secret-device-id", json.dumps(result))
+        self.assertNotIn("secret-path", json.dumps(result))
+
     def test_loop_attach_failure_emits_only_safe_static_classification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             secret = b"CONFIGPROXY_AUTH_TOKEN=fixture-secret no free loop device"

@@ -44,6 +44,43 @@ DB_TIMEOUT = 1800
 PROBE_TIMEOUT = 1230
 STAGE_TIMEOUT = 1800
 OVERALL_TEST_TIMEOUT = 4800
+QuotaOperation = Literal[
+    "quota-state",
+    "quota-project",
+    "quota-limit",
+    "quota-write",
+    "quota-fsync",
+    "quota-reset-limit",
+    "quota-post-state",
+    "quota-report",
+]
+QuotaClassification = Literal[
+    "timeout",
+    "permission-denied",
+    "missing-command-or-path",
+    "operating-system-error",
+    "command-launch-failure",
+    "quota-not-enabled",
+    "missing-path-or-device",
+    "command-reported-error",
+    "unclassified-command-failure",
+    "project-state-missing",
+    "project-accounting-disabled",
+    "project-enforcement-disabled",
+    "quota-exceeded",
+    "filesystem-full",
+    "io-error",
+    "no-write-progress",
+    "limit-not-enforced",
+    "write-failed",
+    "fsync-failed",
+    "scratch-create-failed",
+    "project-map-read-failed",
+    "project-map-write-failed",
+    "project-map-restore-failed",
+    "scratch-remove-failed",
+]
+QuotaCleanupPhase = Literal["limit-reset", "scratch-remove", "project-map-restore"]
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FULL_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -167,6 +204,7 @@ class Suite:
         self.active_stage = "initialization"
         self.active_case = ""
         self.failure_context: dict[str, str | int] | None = None
+        self.cleanup_failure_context: dict[str, str | int] | None = None
         self.started = time.monotonic()
         self.stage_deadline = self.started + OVERALL_TEST_TIMEOUT
         self.project_dir: Path | None = None
@@ -917,37 +955,215 @@ class Suite:
             size_bytes=POOL_SIZE,
         )
 
-    def quota_command(self, command: str) -> str:
-        assert self.pool is not None
-        return require_call(
-            ["xfs_quota", "-x", "-c", command, str(self.pool)], timeout=20, capture=True
-        ).decode(errors="replace")
+    def record_quota_failure(
+        self,
+        operation: QuotaOperation,
+        classification: QuotaClassification,
+        *,
+        returncode: int | None = None,
+        error_number: int | None = None,
+        cleanup_phase: QuotaCleanupPhase | None = None,
+    ) -> None:
+        context: dict[str, str | int] = {
+            "operation": operation,
+            "classification": classification,
+        }
+        if returncode is not None:
+            context["returncode"] = returncode
+        if error_number is not None:
+            context["errno"] = error_number
+        if cleanup_phase is not None:
+            context["phase"] = cleanup_phase
+            self.cleanup_failure_context = context
+        else:
+            self.active_stage = operation
+            self.failure_context = context
 
-    def quota_state(self) -> str:
-        return self.quota_command("state -p")
+    @staticmethod
+    def quota_stderr_classification(stderr: bytes) -> QuotaClassification | None:
+        message = stderr.lower()
+        if b"operation not permitted" in message or b"permission denied" in message:
+            return "permission-denied"
+        if b"quota" in message and (
+            b"not enabled" in message or b"not supported" in message
+        ):
+            return "quota-not-enabled"
+        if b"no such file or directory" in message:
+            return "missing-path-or-device"
+        if any(marker in message for marker in (b"error:", b" failed", b"cannot ")):
+            return "command-reported-error"
+        return None
+
+    @staticmethod
+    def quota_os_classification(error_number: int | None) -> QuotaClassification:
+        if error_number == errno.EDQUOT:
+            return "quota-exceeded"
+        if error_number in (errno.EACCES, errno.EPERM):
+            return "permission-denied"
+        if error_number == errno.ENOENT:
+            return "missing-path-or-device"
+        if error_number == errno.ENOSPC:
+            return "filesystem-full"
+        if error_number == errno.EIO:
+            return "io-error"
+        return "operating-system-error"
+
+    @staticmethod
+    def project_quota_state_classification(state: str) -> QuotaClassification | None:
+        headers = list(
+            re.finditer(
+                r"(?im)^\s*(?:user|group|project)\s+quota\s+state\b[^\r\n]*",
+                state,
+            )
+        )
+        project_section = None
+        for index, header in enumerate(headers):
+            if not header.group(0).strip().lower().startswith("project quota state"):
+                continue
+            section_end = (
+                headers[index + 1].start() if index + 1 < len(headers) else len(state)
+            )
+            project_section = state[header.start() : section_end]
+            break
+        if project_section is None:
+            return "project-state-missing"
+        if not re.search(r"(?im)^\s*accounting\s*:\s*on\b", project_section):
+            return "project-accounting-disabled"
+        if not re.search(r"(?im)^\s*enforcement\s*:\s*on\b", project_section):
+            return "project-enforcement-disabled"
+        return None
+
+    def quota_command(
+        self,
+        command: str,
+        operation: Literal[
+            "quota-state",
+            "quota-project",
+            "quota-limit",
+            "quota-reset-limit",
+            "quota-post-state",
+            "quota-report",
+        ],
+        *,
+        cleanup_phase: QuotaCleanupPhase | None = None,
+    ) -> str:
+        assert self.pool is not None
+        if cleanup_phase is None:
+            self.active_stage = operation
+        try:
+            result = safe_call(
+                ["xfs_quota", "-x", "-c", command, str(self.pool)],
+                timeout=20,
+                capture=True,
+            )
+        except HarnessFailure as exc:
+            cause = exc.__cause__
+            error_number = cause.errno if isinstance(cause, OSError) else None
+            if isinstance(cause, subprocess.TimeoutExpired):
+                classification: QuotaClassification = "timeout"
+            elif isinstance(cause, OSError):
+                classification = self.quota_os_classification(error_number)
+            else:
+                classification = "command-launch-failure"
+            self.record_quota_failure(
+                operation,
+                classification,
+                error_number=error_number,
+                cleanup_phase=cleanup_phase,
+            )
+            raise HarnessFailure("bounded XFS quota command could not run") from None
+
+        output = result.stdout or b""
+        error_output = result.stderr or b""
+        diagnostic = self.quota_stderr_classification(error_output + output)
+        if result.returncode or diagnostic is not None:
+            self.record_quota_failure(
+                operation,
+                diagnostic or "unclassified-command-failure",
+                returncode=result.returncode,
+                cleanup_phase=cleanup_phase,
+            )
+            raise HarnessFailure("bounded XFS quota command failed")
+        return output.decode(errors="replace")
+
+    def quota_state(self, operation: Literal["quota-state", "quota-post-state"]) -> str:
+        return self.quota_command("state -p", operation)
 
     def verify_quota_enforcement(self) -> None:
         assert self.pool is not None
-        state = self.quota_state().lower()
-        if (
-            "project" not in state
-            or "accounting: on" not in state
-            or "enforcement: on" not in state
-        ):
-            raise HarnessFailure("XFS project quota accounting/enforcement is not ON")
+        state = self.quota_state("quota-state")
+        state_failure = self.project_quota_state_classification(state)
+        if state_failure is not None:
+            self.record_quota_failure("quota-state", state_failure)
+            raise HarnessFailure(
+                "XFS project quota state did not prove accounting and enforcement"
+            )
+
         scratch_id = 9999
         scratch = self.pool / ".integration-quota-probe"
-        scratch.mkdir(mode=0o700)
         projects = self.pool / ".projects"
-        original = projects.read_text(encoding="utf-8")
+        scratch_created = False
+        project_map_may_be_modified = False
+        limit_may_be_set = False
+        original: str | None = None
+        primary_failure: Exception | None = None
         try:
-            projects.write_text(
-                original + f"{scratch_id}:{scratch}\n", encoding="utf-8"
+            try:
+                scratch.mkdir(mode=0o700)
+                scratch_created = True
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-write",
+                    "scratch-create-failed",
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                )
+                raise HarnessFailure(
+                    "bounded XFS quota probe could not create scratch"
+                ) from None
+            try:
+                original = projects.read_text(encoding="utf-8")
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-project",
+                    "project-map-read-failed",
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                )
+                raise HarnessFailure(
+                    "bounded XFS quota probe could not read project map"
+                ) from None
+
+            try:
+                project_map_may_be_modified = True
+                projects.write_text(
+                    original + f"{scratch_id}:{scratch}\n", encoding="utf-8"
+                )
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-project",
+                    "project-map-write-failed",
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                )
+                raise HarnessFailure(
+                    "bounded XFS quota probe could not update project map"
+                ) from None
+            self.quota_command(f"project -s -p {scratch} {scratch_id}", "quota-project")
+            limit_may_be_set = True
+            self.quota_command(
+                f"limit -p bhard=16m ihard=1000 {scratch_id}", "quota-limit"
             )
-            self.quota_command(f"project -s -p {scratch} {scratch_id}")
-            self.quota_command(f"limit -p bhard=16m ihard=1000 {scratch_id}")
             blob = scratch / "probe.bin"
-            fd = os.open(blob, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+            try:
+                fd = os.open(blob, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-write",
+                    self.quota_os_classification(exc.errno),
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                )
+                raise HarnessFailure(
+                    "bounded XFS quota probe could not open scratch file"
+                ) from None
+
             saw_edquot = False
             try:
                 block = b"\0" * (1024 * 1024)
@@ -955,16 +1171,26 @@ class Suite:
                 while remaining:
                     try:
                         written = os.write(fd, block[: min(len(block), remaining)])
-                        if written <= 0:
-                            raise HarnessFailure(
-                                "bounded XFS quota probe made no write progress"
-                            )
-                        remaining -= written
                     except OSError as exc:
                         if exc.errno == errno.EDQUOT:
                             saw_edquot = True
                             break
-                        raise
+                        self.record_quota_failure(
+                            "quota-write",
+                            self.quota_os_classification(exc.errno),
+                            error_number=exc.errno
+                            if isinstance(exc.errno, int)
+                            else None,
+                        )
+                        raise HarnessFailure(
+                            "bounded XFS quota probe write failed"
+                        ) from None
+                    if written <= 0:
+                        self.record_quota_failure("quota-write", "no-write-progress")
+                        raise HarnessFailure(
+                            "bounded XFS quota probe made no write progress"
+                        )
+                    remaining -= written
                 if not saw_edquot:
                     try:
                         os.fsync(fd)
@@ -972,26 +1198,90 @@ class Suite:
                         if exc.errno == errno.EDQUOT:
                             saw_edquot = True
                         else:
-                            raise
+                            self.record_quota_failure(
+                                "quota-fsync",
+                                self.quota_os_classification(exc.errno),
+                                error_number=exc.errno
+                                if isinstance(exc.errno, int)
+                                else None,
+                            )
+                            raise HarnessFailure(
+                                "bounded XFS quota probe fsync failed"
+                            ) from None
             finally:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    if self.failure_context is None:
+                        self.record_quota_failure(
+                            "quota-write",
+                            self.quota_os_classification(exc.errno),
+                            error_number=exc.errno
+                            if isinstance(exc.errno, int)
+                            else None,
+                        )
+            if self.failure_context is not None and self.failure_context.get(
+                "operation"
+            ) in {
+                "quota-write",
+                "quota-fsync",
+            }:
+                raise HarnessFailure("bounded XFS quota probe I/O failed")
             if not saw_edquot:
-                raise HarnessFailure(
-                    "XFS project quota scratch write did not return EDQUOT"
-                )
-        finally:
+                self.record_quota_failure("quota-write", "limit-not-enforced")
+                raise HarnessFailure("XFS project quota probe did not return EDQUOT")
+        except Exception as exc:
+            primary_failure = exc
+
+        if limit_may_be_set:
             try:
-                self.quota_command(f"limit -p bhard=0 ihard=0 {scratch_id}")
-            finally:
-                if scratch.exists():
-                    shutil.rmtree(scratch)
+                self.quota_command(
+                    f"limit -p bhard=0 ihard=0 {scratch_id}",
+                    "quota-reset-limit",
+                    cleanup_phase="limit-reset",
+                )
+            except HarnessFailure:
+                pass
+        if scratch_created and scratch.exists():
+            try:
+                shutil.rmtree(scratch)
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-reset-limit",
+                    "scratch-remove-failed",
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                    cleanup_phase="scratch-remove",
+                )
+        if original is not None and project_map_may_be_modified:
+            try:
                 projects.write_text(original, encoding="utf-8")
                 projects.chmod(0o600)
-        if (
-            self.quota_state().lower().count("accounting: on") < 1
-            or self.quota_state().lower().count("enforcement: on") < 1
-        ):
-            raise HarnessFailure("XFS quota state changed after enforcement probe")
+            except OSError as exc:
+                self.record_quota_failure(
+                    "quota-reset-limit",
+                    "project-map-restore-failed",
+                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                    cleanup_phase="project-map-restore",
+                )
+
+        if primary_failure is not None:
+            raise HarnessFailure(
+                "bounded XFS project quota verification failed"
+            ) from None
+        if self.cleanup_failure_context is not None:
+            self.failure_context = self.cleanup_failure_context.copy()
+            operation = self.failure_context.get("operation")
+            if isinstance(operation, str):
+                self.active_stage = operation
+            raise HarnessFailure("bounded XFS project quota cleanup failed")
+
+        state = self.quota_state("quota-post-state")
+        state_failure = self.project_quota_state_classification(state)
+        if state_failure is not None:
+            self.record_quota_failure("quota-post-state", state_failure)
+            raise HarnessFailure(
+                "XFS project quota state changed after enforcement probe"
+            )
 
     def archive_source(self, revision: str, destination: Path) -> Path:
         assert self.run_root is not None
@@ -1951,7 +2241,9 @@ class Suite:
         return mapping
 
     def quota_hard_limit(self, projid: int, *, inode: bool) -> tuple[int, int]:
-        report = self.quota_command("report -p -i -n" if inode else "report -p -b -n")
+        report = self.quota_command(
+            "report -p -i -n" if inode else "report -p -b -n", "quota-report"
+        )
         for line in report.splitlines():
             fields = line.split()
             if not fields:
@@ -3120,6 +3412,52 @@ class Suite:
                 self.results["preserved_run_root"] = str(self.run_root)
         return failures
 
+    def run_xfs_only(self) -> int:
+        self.results.update(
+            {"runtime": "not-run", "phase": "xfs-only", "xfs_probe": "not-run"}
+        )
+        try:
+            self.active_stage = "preflight"
+            self.preflight()
+            self.create_run_root()
+            self.stage_deadline = time.monotonic() + 900
+            self.active_stage = "xfs-pool-setup"
+            self.setup_xfs_pool()
+            self.results["xfs_probe"] = "pass"
+        except Exception:
+            self.results["xfs_probe"] = "fail"
+            self.results["failure"] = "bounded-xfs-preflight-failed"
+            self.results["failed_stage"] = self.active_stage
+            if self.failure_context is not None:
+                self.results["failure_context"] = self.failure_context.copy()
+            if self.cleanup_failure_context is not None:
+                self.results["cleanup_failure_context"] = (
+                    self.cleanup_failure_context.copy()
+                )
+
+        if self.created_run_root:
+            self.stage_deadline = time.monotonic() + 300
+            failures = self.cleanup()
+            if failures:
+                self.results["cleanup"] = "incomplete"
+                self.results["cleanup_stages_failed"] = failures
+                remaining = self.cleanup_resource_summary()
+                self.results["remaining_owned_resource_count"] = len(remaining)
+                self.results["remaining_owned_resource_kinds"] = sorted(
+                    {item["kind"] for item in remaining}
+                )
+            else:
+                self.results["cleanup"] = "verified"
+            self.results.pop("cleanup_incomplete", None)
+            self.results.pop("preserved_run_root", None)
+        else:
+            self.results["cleanup"] = "not-started"
+
+        print(json.dumps(self.results, sort_keys=True))
+        return int(
+            self.results["xfs_probe"] != "pass" or self.results["cleanup"] != "verified"
+        )
+
     def run(self) -> int:
         self.preflight()
         self.create_run_root()
@@ -3157,6 +3495,10 @@ class Suite:
             self.results["failed_stage"] = self.active_stage
             if self.failure_context is not None:
                 self.results["failure_context"] = self.failure_context.copy()
+            if self.cleanup_failure_context is not None:
+                self.results["cleanup_failure_context"] = (
+                    self.cleanup_failure_context.copy()
+                )
             if self.active_case:
                 self.results["failed_case"] = self.active_case
             self.stage_deadline = time.monotonic() + 300
@@ -3230,6 +3572,11 @@ def main() -> int:
     parser.add_argument("--acknowledge-interruption", action="store_true")
     parser.add_argument("--acknowledge-ingress-fenced", action="store_true")
     parser.add_argument("--acknowledge-updater-paused", action="store_true")
+    parser.add_argument(
+        "--xfs-only",
+        action="store_true",
+        help="run only the owned XFS project-quota preflight and cleanup",
+    )
     args = parser.parse_args()
     if not all(
         (
@@ -3245,14 +3592,22 @@ def main() -> int:
     if args.baseline_revision != BASELINE_SHA:
         parser.error("only the accepted exact pre-PR baseline is supported")
     try:
-        return Suite(args.workspace, args.baseline_revision).run()
+        suite = Suite(args.workspace, args.baseline_revision)
+        return suite.run_xfs_only() if args.xfs_only else suite.run()
     except Exception:
-        print(
-            json.dumps(
-                {"runtime": "fail", "failure": "runner-preflight-or-setup-failed"},
-                sort_keys=True,
-            )
-        )
+        if args.xfs_only:
+            result = {
+                "failure": "runner-preflight-or-setup-failed",
+                "phase": "xfs-only",
+                "runtime": "not-run",
+                "xfs_probe": "fail",
+            }
+        else:
+            result = {
+                "runtime": "fail",
+                "failure": "runner-preflight-or-setup-failed",
+            }
+        print(json.dumps(result, sort_keys=True))
         return 1
 
 

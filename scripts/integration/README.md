@@ -17,6 +17,10 @@ It provisions its own one-GiB XFS loop filesystem, verifies project quota
 accounting/enforcement with a bounded EDQUOT probe, and persists resource
 creation intent before Docker calls, reconciling IDs and ownership afterward.
 Cleanup removes only verified fixture resources.
+The `--xfs-only` mode uses the same runner preflight and owned loop-filesystem
+setup, then cleans up without building images or starting the migration stack.
+It reports `xfs_probe` separately and always leaves `runtime` as `not-run`; it
+is a prerequisite check, not migration-acceptance evidence.
 The host-side runner requires Python 3.12 or newer; Hub workers use the pinned
 image interpreter (Python 3.14).
 
@@ -43,10 +47,13 @@ sudo env RUNNER_TEMP="$RUNNER_TEMP" python3 scripts/integration/run_suite.py \
 
 The workflow runs on relevant pull requests using read-only repository
 permissions, and offers a separately acknowledged manual run. It does not use
-`pull_request_target`, secrets, artifact upload, or production deployment.
-The Linux nonprivileged checks run on each relevant PR. The 90-minute rootful
-runtime job runs only after the parent applies the explicit
-`jupyterhub-migration-runtime` PR label (or the acknowledged manual input).
+`pull_request_target`, secrets, or production deployment. The Linux
+nonprivileged checks run on each relevant PR. After the explicit runtime label
+(or acknowledged manual input), a focused XFS/quota preflight runs on a fresh
+ephemeral runner and uploads only its sanitized JSON result. It does not upload
+raw logs, environments, DB files, or fixture credentials. The 90-minute
+rootful migration job runs only if that preflight succeeds; it uses a separate
+fresh runner and repeats its own XFS/quota verification.
 
 `probe.py` is a reusable finite baseline/candidate/restore API-stage runner.
 It creates two custom-login identities in baseline, stores raw test credentials
