@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import io
 import json
@@ -10,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -127,7 +129,84 @@ Project quota state on fixture (/dev/loop0)
 """
 
 
+def isolated_os_proxy(**overrides):
+    proxy = SimpleNamespace(**vars(os))
+    for name, value in overrides.items():
+        setattr(proxy, name, value)
+    return proxy
+
+
+@contextlib.contextmanager
+def patch_quota_probe_io(
+    write_probe: Callable[[int, bytes], int],
+    fsync_probe: Callable[[int], None],
+) -> Iterator[None]:
+    original_open = run_suite.os.open
+    original_write = run_suite.os.write
+    original_fsync = run_suite.os.fsync
+    original_close = run_suite.os.close
+    probe_fds: set[int] = set()
+
+    def tracked_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        candidate = Path(os.fspath(path))
+        if (
+            candidate.name == "probe.bin"
+            and candidate.parent.name == ".integration-quota-probe"
+        ):
+            probe_fds.add(fd)
+        return fd
+
+    def scoped_write(fd: int, payload: bytes) -> int:
+        if fd in probe_fds:
+            return write_probe(fd, payload)
+        return original_write(fd, payload)
+
+    def scoped_fsync(fd: int) -> None:
+        if fd in probe_fds:
+            fsync_probe(fd)
+            return
+        original_fsync(fd)
+
+    def scoped_close(fd: int) -> None:
+        try:
+            original_close(fd)
+        finally:
+            probe_fds.discard(fd)
+
+    os_proxy = isolated_os_proxy(
+        open=tracked_open,
+        write=scoped_write,
+        fsync=scoped_fsync,
+        close=scoped_close,
+    )
+    with patch.object(run_suite, "os", os_proxy):
+        yield
+
+
 class SuiteContractTests(unittest.TestCase):
+    def test_quota_io_mocks_forward_unrelated_descriptors_to_the_os(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ordinary-file"
+
+            def unexpected_probe_write(_fd, _payload):
+                self.fail("ordinary file descriptor was treated as the quota probe")
+
+            def unexpected_probe_fsync(_fd):
+                self.fail("ordinary file descriptor was treated as the quota probe")
+
+            with patch_quota_probe_io(unexpected_probe_write, unexpected_probe_fsync):
+                fd = run_suite.os.open(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                try:
+                    run_suite.os.write(fd, b"forwarded-to-operating-system")
+                    run_suite.os.fsync(fd)
+                finally:
+                    run_suite.os.close(fd)
+
+            self.assertEqual(path.read_bytes(), b"forwarded-to-operating-system")
+
     def test_workflow_gates_full_runtime_on_sanitized_xfs_preflight(self) -> None:
         workflow = Path(".github/workflows/jupyterhub-migration.yaml").read_text(
             encoding="utf-8"
@@ -271,10 +350,7 @@ class SuiteContractTests(unittest.TestCase):
 
                 with (
                     patch.object(suite, "quota_command", side_effect=quota),
-                    patch.object(run_suite.os, "open", return_value=77),
-                    patch.object(run_suite.os, "write", side_effect=write),
-                    patch.object(run_suite.os, "fsync", side_effect=fsync),
-                    patch.object(run_suite.os, "close"),
+                    patch_quota_probe_io(write, fsync),
                 ):
                     suite.verify_quota_enforcement()
 
@@ -305,14 +381,15 @@ class SuiteContractTests(unittest.TestCase):
                     else ""
                 )
 
+            def write(_fd, data):
+                return len(data)
+
+            def fsync(_fd):
+                return None
+
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
-                patch.object(run_suite.os, "open", return_value=78),
-                patch.object(
-                    run_suite.os, "write", side_effect=lambda _fd, data: len(data)
-                ),
-                patch.object(run_suite.os, "fsync"),
-                patch.object(run_suite.os, "close"),
+                patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
                 suite.verify_quota_enforcement()
@@ -339,15 +416,15 @@ class SuiteContractTests(unittest.TestCase):
                     return XFS_PROJECT_QUOTA_ON
                 return ""
 
+            def write(_fd, _data):
+                raise OSError(errno.EDQUOT, "synthetic quota denial")
+
+            def fsync(_fd):
+                return None
+
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
-                patch.object(run_suite.os, "open", return_value=81),
-                patch.object(
-                    run_suite.os,
-                    "write",
-                    side_effect=OSError(errno.EDQUOT, "synthetic quota denial"),
-                ),
-                patch.object(run_suite.os, "close"),
+                patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
                 suite.verify_quota_enforcement()
@@ -378,15 +455,15 @@ class SuiteContractTests(unittest.TestCase):
                     raise run_suite.HarnessFailure("unreported mock detail")
                 return ""
 
+            def write(_fd, _data):
+                raise OSError(errno.EDQUOT, "synthetic quota denial")
+
+            def fsync(_fd):
+                return None
+
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
-                patch.object(run_suite.os, "open", return_value=82),
-                patch.object(
-                    run_suite.os,
-                    "write",
-                    side_effect=OSError(errno.EDQUOT, "synthetic quota denial"),
-                ),
-                patch.object(run_suite.os, "close"),
+                patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
                 suite.verify_quota_enforcement()
@@ -433,10 +510,7 @@ class SuiteContractTests(unittest.TestCase):
 
                 with (
                     patch.object(suite, "quota_command", side_effect=quota),
-                    patch.object(run_suite.os, "open", return_value=79),
-                    patch.object(run_suite.os, "write", side_effect=write),
-                    patch.object(run_suite.os, "fsync", side_effect=fsync),
-                    patch.object(run_suite.os, "close"),
+                    patch_quota_probe_io(write, fsync),
                     self.assertRaises(run_suite.HarnessFailure),
                 ):
                     suite.verify_quota_enforcement()
@@ -469,11 +543,15 @@ class SuiteContractTests(unittest.TestCase):
                     argv, result.returncode, result.stdout, result.stderr
                 )
 
+            def write(_fd, _data):
+                return 1024
+
+            def fsync(_fd):
+                return None
+
             with (
                 patch.object(run_suite, "safe_call", side_effect=safe_call),
-                patch.object(run_suite.os, "open", return_value=80),
-                patch.object(run_suite.os, "write", return_value=1024),
-                patch.object(run_suite.os, "close"),
+                patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
                 suite.verify_quota_enforcement()
@@ -1326,14 +1404,29 @@ class SuiteContractTests(unittest.TestCase):
     def test_inode_project_id_reads_inode_xfs_attribute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             encoded_id = 12345
+            fake_fd = 123
+            target = Path(directory).resolve()
+            original_open = run_suite.os.open
+            original_close = run_suite.os.close
+
+            def scoped_open(path, *args, **kwargs):
+                if Path(path).resolve() == target:
+                    return fake_fd
+                return original_open(path, *args, **kwargs)
+
+            def scoped_close(fd):
+                if fd == fake_fd:
+                    return None
+                return original_close(fd)
+
+            os_proxy = isolated_os_proxy(open=scoped_open, close=scoped_close)
 
             def ioctl(_fd, _request, attributes, _mutate):
                 run_suite.struct.pack_into("=I", attributes, 12, encoded_id)
 
             with (
                 patch.dict("sys.modules", {"fcntl": SimpleNamespace(ioctl=ioctl)}),
-                patch.object(run_suite.os, "open", return_value=123),
-                patch.object(run_suite.os, "close"),
+                patch.object(run_suite, "os", os_proxy),
             ):
                 self.assertEqual(
                     run_suite.Suite.inode_project_id(Path(directory)), encoded_id
