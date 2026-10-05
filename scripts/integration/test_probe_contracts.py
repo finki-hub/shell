@@ -94,6 +94,7 @@ class ProbeSafetyTests(unittest.TestCase):
         import httpx
 
         calls: list[tuple[str, str, str, str]] = []
+        locations: list[str] = []
 
         def handler(request):
             parsed = urlsplit(str(request.url))
@@ -125,27 +126,35 @@ class ProbeSafetyTests(unittest.TestCase):
                     request=request,
                 )
             if parsed.path == "/hub/":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "/hub/home"},
+                    request=request,
+                )
+            if parsed.path == "/hub/home":
                 if cookies:
                     return httpx.Response(200, text="authenticated", request=request)
                 return httpx.Response(
                     302,
-                    headers={"Location": "/hub/login?next=%2Fhub%2F"},
+                    headers={"Location": "/hub/login?next=%2Fhub%2Fhome"},
                     request=request,
                 )
             if parsed.path.startswith("/hub/api/oauth2/authorize"):
                 values = parse_qs(parsed.query)
                 callback = values["redirect_uri"][0]
-                if urlsplit(callback).netloc == "attacker.invalid":
+                client_id = values["client_id"][0]
+                prefix = "jupyterhub-user-"
+                if not client_id.startswith(prefix):
                     return httpx.Response(400, request=request)
+                username = client_id[len(prefix) :]
+                registered_callback = f"/user/{username}/oauth_callback"
+                if callback != registered_callback:
+                    return httpx.Response(400, request=request)
+                location = callback + "?code=synthetic-code&state=" + values["state"][0]
+                locations.append(location)
                 return httpx.Response(
                     302,
-                    headers={
-                        "Location": (
-                            callback
-                            + "?code=synthetic-code&state="
-                            + values["state"][0]
-                        )
-                    },
+                    headers={"Location": location},
                     request=request,
                 )
             if parsed.path.startswith("/hub/api/users/"):
@@ -174,7 +183,19 @@ class ProbeSafetyTests(unittest.TestCase):
             )
             self.assertFalse(probe.client.cookies.jar)
             self.assertFalse(probe.anonymous_client.cookies.jar)
-            self.assertIn(("GET", "/hub/", "", ""), calls)
+            self.assertIn(("GET", "/hub/home", "", ""), calls)
+            self.assertIn(
+                (
+                    "GET",
+                    "/hub/home",
+                    "jupyterhub-hub-login=" + identities[0]["username"],
+                    "",
+                ),
+                calls,
+            )
+            self.assertTrue(
+                all(location.startswith("/user/") for location in locations)
+            )
             self.assertTrue(
                 any(
                     method == "GET"

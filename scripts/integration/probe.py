@@ -23,7 +23,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 RUN_ID_RE = re.compile(r"^[a-f0-9]{12,32}$")
 ALLOWED_DENIALS = {401, 403, 404}
@@ -232,7 +232,7 @@ class Probe:
             if len(cookies) != 1:
                 raise AssertionError("expected exactly one Hub login cookie per user")
             cookie_values.append(cookies[0].value)
-            page = self.request("GET", "/hub/", session=session)
+            page = self.request("GET", "/hub/home", session=session)
             assert_status(page.status_code, {200}, "cookie-authenticated-hub-page")
             self.record("cookie-authenticated-hub-page")
         if cookie_values[0] == cookie_values[1]:
@@ -245,21 +245,29 @@ class Probe:
         )
         self.anonymous_client.cookies.clear()
         assert_status(anonymous_api.status_code, ALLOWED_DENIALS, "cookie-less-hub-api")
-        anonymous_page = self.anonymous_client.get(
-            self.origin + "/hub/", timeout=self.timeout
-        )
+        try:
+            anonymous_page = self.anonymous_client.get(
+                self.origin + "/hub/home", timeout=self.timeout
+            )
+        finally:
+            self.anonymous_client.cookies.clear()
         if anonymous_page.status_code not in {302, 303}:
             raise AssertionError("empty anonymous browser session was not redirected")
-        location = urlsplit(anonymous_page.headers.get("location", ""))
-        if location.netloc and location.netloc != urlsplit(self.origin).netloc:
-            raise AssertionError("anonymous login redirect escaped the private origin")
-        if not location.path.endswith("/hub/login"):
-            raise AssertionError("anonymous browser redirect was not to Hub login")
+        anonymous_location = urlsplit(
+            urljoin(self.origin + "/", anonymous_page.headers.get("location", ""))
+        )
+        private_origin = urlsplit(self.origin)
+        if (
+            anonymous_location.scheme != private_origin.scheme
+            or anonymous_location.netloc != private_origin.netloc
+            or not anonymous_location.path.endswith("/hub/login")
+        ):
+            raise AssertionError("anonymous Hub home did not redirect to private login")
         self.record("empty-anonymous-session-denied")
 
         username_value = str(identities[0]["username"])
         session = self.cookie_clients[username_value]
-        callback = f"{self.origin}/user/{quote(username_value, safe='')}/oauth_callback"
+        callback = f"/user/{quote(username_value, safe='')}/oauth_callback"
         state = secrets.token_urlsafe(18)
         oauth_path = "/hub/api/oauth2/authorize?" + urlencode(
             {
@@ -272,11 +280,12 @@ class Probe:
         oauth = session.get(self.origin + oauth_path, timeout=self.timeout)
         if oauth.status_code not in {302, 303}:
             raise AssertionError("private cookie OAuth authorization did not redirect")
-        target = urlsplit(oauth.headers.get("location", ""))
+        target = urlsplit(urljoin(self.origin + "/", oauth.headers.get("location", "")))
         params = dict(parse_qsl(target.query))
         if (
-            target.netloc != urlsplit(self.origin).netloc
-            or target.path != urlsplit(callback).path
+            target.scheme != private_origin.scheme
+            or target.netloc != private_origin.netloc
+            or target.path != callback
             or params.get("state") != state
             or not params.get("code")
         ):
@@ -293,8 +302,13 @@ class Probe:
         )
         off_origin = session.get(self.origin + off_origin_path, timeout=self.timeout)
         if off_origin.status_code in {302, 303}:
-            target = urlsplit(off_origin.headers.get("location", ""))
-            if target.netloc and target.netloc != urlsplit(self.origin).netloc:
+            target = urlsplit(
+                urljoin(self.origin + "/", off_origin.headers.get("location", ""))
+            )
+            if target.netloc and (target.scheme, target.netloc) != (
+                private_origin.scheme,
+                private_origin.netloc,
+            ):
                 raise AssertionError(
                     "OAuth rejected redirect escaped the private origin"
                 )

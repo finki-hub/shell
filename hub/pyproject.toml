@@ -109,16 +109,16 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "jupyterhub_config.py" = ["hardcoded-temp-file"]
 "../scripts/tests/**" = [
-    "ANN401",
-    "ARG001",
-    "ARG002",
-    "B023",
-    "PLC0415",
-    "PT009",
-    "PT027",
-    "RUF105",
-    "SIM117",
-    "SLF001",
+    "any-type",
+    "unused-function-argument",
+    "unused-method-argument",
+    "function-uses-loop-variable",
+    "import-outside-top-level",
+    "pytest-unittest-assertion",
+    "pytest-unittest-raises-assertion",
+    "noqa-comments",
+    "multiple-with-statements",
+    "private-member-access",
 ]
 "tests/**" = [
     "ANN",

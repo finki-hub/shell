@@ -25,7 +25,7 @@ from pathlib import Path
 LABEL = "shell.integration.db-test"
 OLD_VERSION = "5.5.1"
 NEW_VERSION = "6.0.1"
-CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
+FULL_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 IMAGE_DIGEST = re.compile(r"^[^@]+@sha256:[0-9a-f]{64}$")
 _SUITE_DEADLINE: float | None = None
@@ -214,7 +214,7 @@ class OwnedContainers:
             capture=True,
         )
         cid = created.stdout.strip()
-        if created.returncode or not CONTAINER_ID.fullmatch(cid):
+        if created.returncode or not FULL_CONTAINER_ID.fullmatch(cid):
             raise RuntimeError("could not create owned Hub migration test container")
         self.containers.append(cid)
         self.ids_by_name[name] = cid
@@ -235,7 +235,7 @@ class OwnedContainers:
         self.cleanup_failures.clear()
         for name in reversed(self.names):
             found = docker(
-                ["ps", "-aq", "--filter", f"name=^/{name}$"],
+                ["ps", "-aq", "--no-trunc", "--filter", f"name=^/{name}$"],
                 timeout=15,
                 capture=True,
             )
@@ -246,7 +246,7 @@ class OwnedContainers:
             cid = found.stdout.strip()
             if not cid:
                 continue
-            if not CONTAINER_ID.fullmatch(cid):
+            if not FULL_CONTAINER_ID.fullmatch(cid):
                 errors.append("owned test container ID verification failed")
                 self.cleanup_failures.append(name)
                 continue
@@ -279,7 +279,8 @@ class OwnedContainers:
                     (str(intent["worker"]), "/fixture_worker.py", False),
                 }
                 owned = (
-                    item["Id"] == cid
+                    FULL_CONTAINER_ID.fullmatch(item.get("Id", "")) is not None
+                    and item["Id"] == cid
                     and item["Name"] == f"/{name}"
                     and item["Image"] == intent["image_id"]
                     and labels.get(LABEL) == self.run_id
@@ -299,7 +300,7 @@ class OwnedContainers:
                 self.cleanup_failures.append(name)
                 continue
             absent = docker(
-                ["ps", "-aq", "--filter", f"id={cid}"],
+                ["ps", "-aq", "--no-trunc", "--filter", f"id={cid}"],
                 timeout=15,
                 capture=True,
             )
@@ -308,7 +309,7 @@ class OwnedContainers:
                 self.cleanup_failures.append(name)
         for name in self.names:
             remaining = docker(
-                ["ps", "-aq", "--filter", f"name=^/{name}$"],
+                ["ps", "-aq", "--no-trunc", "--filter", f"name=^/{name}$"],
                 timeout=15,
                 capture=True,
             )

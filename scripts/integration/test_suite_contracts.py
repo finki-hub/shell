@@ -16,7 +16,8 @@ from scripts.integration import run_suite
 
 
 def running_inspector(run_id: str):
-    return lambda _container_id: {
+    return lambda container_id: {
+        "Id": container_id,
         "State": {"Running": True},
         "Config": {"Labels": {run_suite.RUN_LABEL: run_id}},
     }
@@ -200,6 +201,123 @@ class SuiteContractTests(unittest.TestCase):
             suite.normalize_old_baseline()
         self.assertEqual(calls, ["compose", "ready", "mode", "probe", "record"])
 
+    def test_old_and_candidate_compose_overrides_label_web_and_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run"
+            pool = run_root / "pool"
+            source = run_root / "source" / "candidate"
+            pool.mkdir(parents=True)
+            source.mkdir(parents=True)
+            (source / "compose.yaml").write_text("name: fixture\n", encoding="utf-8")
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.run_root = run_root
+            suite.pool = pool
+            suite.image_refs.update(
+                {
+                    "old_hub": "registry/old-hub@sha256:" + "a" * 64,
+                    "old_lab": "registry/old-lab@sha256:" + "b" * 64,
+                    "candidate_hub": "registry/new-hub@sha256:" + "c" * 64,
+                    "candidate_lab": "registry/new-lab@sha256:" + "d" * 64,
+                    "web": "registry/web@sha256:" + "e" * 64,
+                    "proxy": "registry/proxy@sha256:" + "f" * 64,
+                }
+            )
+            suite.write_compose_fixture()
+            self.assertIsNotNone(suite.initial_override)
+            self.assertIsNotNone(suite.candidate_override)
+            old = json.loads(suite.initial_override.read_text(encoding="utf-8"))
+            candidate = json.loads(suite.candidate_override.read_text(encoding="utf-8"))
+            for config in (old, candidate):
+                for service in ("web", "proxy"):
+                    self.assertEqual(
+                        config["services"][service]["labels"][run_suite.RUN_LABEL],
+                        suite.run_id,
+                    )
+
+    def test_updater_receives_fixture_project_and_refusal_preserves_all_old_ids(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run"
+            project = root / "project"
+            run_root.mkdir()
+            project.mkdir()
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.run_root = run_root
+            suite.project_dir = project
+            suite.project_name = "fixture-" + suite.run_id
+            old_ids = {
+                "web": "web-full-id",
+                "proxy": "proxy-full-id",
+                "hub": "hub-full-id",
+            }
+            captured: dict = {}
+
+            def updater_call(_argv, **kwargs):
+                captured.update(kwargs)
+                return subprocess.CompletedProcess(
+                    [], 1, b"Hub version change 5.5.1 -> 6.0.1", b""
+                )
+
+            with (
+                patch.object(suite, "snapshot_service_ids", return_value=old_ids),
+                patch.object(suite, "wait_ready") as wait_ready,
+                patch.object(run_suite, "safe_call", side_effect=updater_call),
+            ):
+                suite.run_updater_refusal()
+            self.assertEqual(
+                captured["env"]["COMPOSE_PROJECT_NAME"], suite.project_name
+            )
+            self.assertEqual(
+                captured["env"]["UPDATE_LOCK_FILE"], str(run_root / "update.lock")
+            )
+            wait_ready.assert_called_once_with()
+            self.assertEqual(
+                suite.results["cases"]["routine-updater-refusal-old-stack-usable"][
+                    "status"
+                ],
+                "pass",
+            )
+
+    def test_updater_refusal_rejects_missing_or_replaced_old_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run"
+            run_root.mkdir()
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.run_root = run_root
+            suite.project_dir = root / "project"
+            old_ids = {
+                "web": "web-full-id",
+                "proxy": "proxy-full-id",
+                "hub": "hub-full-id",
+            }
+            changed_ids = {
+                "web": "web-full-id",
+                "proxy": "missing",
+                "hub": "hub-full-id",
+            }
+            with (
+                patch.object(
+                    suite,
+                    "snapshot_service_ids",
+                    side_effect=[old_ids, changed_ids],
+                ),
+                patch.object(
+                    run_suite,
+                    "safe_call",
+                    return_value=subprocess.CompletedProcess(
+                        [], 1, b"Hub version change 5.5.1 -> 6.0.1", b""
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "changed old service identities"
+                ),
+            ):
+                suite.run_updater_refusal()
+
     def test_compose_cleanup_failure_preserves_labs_pool_and_run_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run-root"
@@ -245,8 +363,10 @@ class SuiteContractTests(unittest.TestCase):
             suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
             suite.pool = pool
             suite.run_id = "a" * 12
-            suite.docker = lambda *_args, **_kwargs: b"container-a\n"
+            container_id = "a" * 64
+            suite.docker = lambda *_args, **_kwargs: (container_id + "\n").encode()
             suite.inspect_container = lambda _cid: {
+                "Id": container_id,
                 "Image": "sha256:" + "b" * 64,
                 "Name": "/lab-user-a",
                 "Config": {
@@ -280,11 +400,11 @@ class SuiteContractTests(unittest.TestCase):
                 )
 
     def test_wrong_inode_project_id_fails_even_when_mapping_has_an_id(self) -> None:
-        with patch.object(run_suite.Suite, "inode_project_id", return_value=1002):
-            with self.assertRaisesRegex(
-                run_suite.HarnessFailure, "inode XFS project ID"
-            ):
-                run_suite.Suite.verify_inode_project_id(Path("/fixture/home"), 1001)
+        with (
+            patch.object(run_suite.Suite, "inode_project_id", return_value=1002),
+            self.assertRaisesRegex(run_suite.HarnessFailure, "inode XFS project ID"),
+        ):
+            run_suite.Suite.verify_inode_project_id(Path("/fixture/home"), 1001)
 
     def test_partial_container_create_timeout_reconciles_exact_owned_name(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
@@ -300,7 +420,11 @@ class SuiteContractTests(unittest.TestCase):
             raise AssertionError("unexpected Docker call")
 
         suite.docker = fake_docker
+        suite.docker_result = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, (container_id + "\n").encode(), b""
+        )
         suite.inspect_container = lambda _cid: {
+            "Id": container_id,
             "Image": content_id,
             "Name": "/probe-owned-name",
             "HostConfig": {"NetworkMode": "none"},
@@ -322,6 +446,94 @@ class SuiteContractTests(unittest.TestCase):
         intent = suite.manifest["resources"]["containers"][0]
         self.assertEqual(intent["id"], container_id)
         self.assertFalse(intent["intent"])
+
+    def test_create_timeout_and_failed_empty_inventory_keeps_intent_owned(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        suite.image_id = lambda _reference: "sha256:" + "b" * 64
+        suite.docker = lambda *args, **_kwargs: (_ for _ in ()).throw(
+            run_suite.HarnessFailure("create timed out")
+        )
+        suite.docker_result = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, b"", b"Cannot connect to the Docker daemon"
+        )
+        with self.assertRaisesRegex(run_suite.HarnessFailure, "inventory"):
+            suite.own_container(
+                "probe-after-timeout",
+                "sha256:" + "b" * 64,
+                ["python", "probe.py"],
+                kind="probe-tool",
+            )
+        intent = suite.manifest["resources"]["containers"][0]
+        self.assertTrue(intent["intent"])
+        self.assertFalse(intent["removed"])
+
+    def test_create_timeout_and_successful_empty_inventory_confirms_absence(
+        self,
+    ) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        suite.image_id = lambda _reference: "sha256:" + "b" * 64
+        suite.docker = lambda *args, **_kwargs: (_ for _ in ()).throw(
+            run_suite.HarnessFailure("create timed out")
+        )
+        suite.docker_result = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, b"", b""
+        )
+        with self.assertRaisesRegex(run_suite.HarnessFailure, "create timed out"):
+            suite.own_container(
+                "probe-absent-after-timeout",
+                "sha256:" + "b" * 64,
+                ["python", "probe.py"],
+                kind="probe-tool",
+            )
+        intent = suite.manifest["resources"]["containers"][0]
+        self.assertFalse(intent["intent"])
+        self.assertTrue(intent["removed"])
+
+    def test_lab_inspect_transport_failure_preserves_resource_and_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool = root / "pool"
+            pool.mkdir()
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.pool = pool
+            resource = {
+                "id": "a" * 64,
+                "kind": "fixture-lab",
+                "removed": False,
+            }
+            failure = subprocess.CompletedProcess(
+                [], 1, b"", b"Cannot connect to the Docker daemon"
+            )
+            with (
+                patch.object(run_suite, "safe_call", return_value=failure),
+                self.assertRaisesRegex(run_suite.HarnessFailure, "verify fixture Lab"),
+            ):
+                suite.reconcile_helper_lab_presence(resource)
+            self.assertFalse(resource["removed"])
+            self.assertTrue(pool.is_dir())
+
+    def test_lab_inspect_exact_not_found_confirms_removal(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        resource = {"id": "a" * 64, "kind": "fixture-lab", "removed": False}
+        failure = subprocess.CompletedProcess(
+            [], 1, b"", f"Error: No such object: {resource['id']}".encode()
+        )
+        with patch.object(run_suite, "safe_call", return_value=failure):
+            suite.reconcile_helper_lab_presence(resource)
+        self.assertTrue(resource["removed"])
+
+    def test_lab_inspect_unrelated_error_is_not_absence(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        resource = {"id": "a" * 64, "kind": "fixture-lab", "removed": False}
+        failure = subprocess.CompletedProcess(
+            [], 1, b"", b"Error: Docker daemon is unavailable"
+        )
+        with (
+            patch.object(run_suite, "safe_call", return_value=failure),
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.reconcile_helper_lab_presence(resource)
+        self.assertFalse(resource["removed"])
 
     def test_partial_compose_startup_is_reconciled_from_full_fixture_intent(
         self,
@@ -349,9 +561,12 @@ class SuiteContractTests(unittest.TestCase):
             }
             suite.manifest["resources"]["containers"].append(intent)
             suite.docker = lambda *args, **_kwargs: (
-                f"{container_id}\n".encode() if args == ("ps", "-aq") else b""
+                f"{container_id}\n".encode()
+                if args == ("ps", "-aq", "--no-trunc")
+                else b""
             )
             suite.inspect_container = lambda _cid: {
+                "Id": container_id,
                 "Image": image_id,
                 "Name": "/fixture-project-web-1",
                 "State": {"Running": False},
@@ -447,6 +662,7 @@ class SuiteContractTests(unittest.TestCase):
                         "Name": f"/{suite.project_name}-hub-1",
                         "State": {"Running": False},
                         "Mounts": mounts,
+                        "Id": container_id,
                         "Config": {
                             "Labels": {
                                 "com.docker.compose.project": suite.project_name,
@@ -462,11 +678,15 @@ class SuiteContractTests(unittest.TestCase):
                     "bounded helper failure after Hub replacement"
                 )
 
-            with patch.object(run_suite, "safe_call", side_effect=failed_helper):
-                with self.assertRaisesRegex(run_suite.HarnessFailure, "helper failure"):
-                    suite.run_helper("migrate", backup)
+            with (
+                patch.object(run_suite, "safe_call", side_effect=failed_helper),
+                self.assertRaisesRegex(run_suite.HarnessFailure, "helper failure"),
+            ):
+                suite.run_helper("migrate", backup)
             suite.docker = lambda *args, **_kwargs: (
-                f"{container_id}\n".encode() if args == ("ps", "-aq") else b""
+                f"{container_id}\n".encode()
+                if args == ("ps", "-aq", "--no-trunc")
+                else b""
             )
             suite.inspect_container = lambda _cid: actual
             with patch.object(

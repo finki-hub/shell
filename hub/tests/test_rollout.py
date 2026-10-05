@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from docker.client import DockerClient
 
 from shell_hub.rollout import verify_rollout
 
@@ -50,6 +51,10 @@ class FakeDocker:
         return self.containers_to_return
 
 
+def _as_docker_client(client: FakeDocker) -> DockerClient:
+    return cast(DockerClient, client)
+
+
 def test_returns_immutable_image_after_version_and_owned_lab_checks(
     tmp_path: Any,
 ) -> None:
@@ -67,7 +72,7 @@ def test_returns_immutable_image_after_version_and_owned_lab_checks(
             lab_image="candidate",
             pool_dir=pool,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
         == "sha256:immutable-lab"
@@ -85,7 +90,7 @@ def test_unverifiable_or_mismatched_candidate_image_fails_closed(
             lab_image="candidate",
             pool_dir=tmp_path,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
 
@@ -107,7 +112,7 @@ def test_incompatible_retained_lab_fails_even_when_stopped(
             lab_image="candidate",
             pool_dir=pool,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
 
@@ -121,7 +126,7 @@ def test_incomplete_canonical_lab_identity_fails_closed(tmp_path: Any) -> None:
             lab_image="candidate",
             pool_dir=tmp_path,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
 
@@ -135,7 +140,7 @@ def test_unrelated_role_labelled_container_is_not_adopted(tmp_path: Any) -> None
             lab_image="candidate",
             pool_dir=tmp_path,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
         == "sha256:immutable-lab"
@@ -164,7 +169,7 @@ def test_owned_lab_home_target_uses_configured_lab_user(tmp_path: Any) -> None:
             lab_image="candidate",
             pool_dir=pool,
             lab_user="sandbox",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )
         == "sha256:immutable-lab"
@@ -183,6 +188,6 @@ def test_renamed_container_with_user_label_is_rejected(tmp_path: Any) -> None:
             lab_image="candidate",
             pool_dir=pool,
             lab_user="ubuntu",
-            docker_client=client,
+            docker_client=_as_docker_client(client),
             hub_version="6.0.1",
         )

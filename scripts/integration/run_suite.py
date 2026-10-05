@@ -46,6 +46,7 @@ STAGE_TIMEOUT = 1800
 OVERALL_TEST_TIMEOUT = 4800
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+FULL_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 FS_IOC_FSGETXATTR = 0x801C581F
 
 
@@ -206,16 +207,17 @@ class Suite:
         if time.monotonic() + seconds > self.stage_deadline:
             raise HarnessFailure("bounded integration-suite deadline exceeded")
 
-    def docker(
-        self, *args: str, timeout: int = 30, capture: bool = False, check: bool = True
-    ) -> bytes:
-        self.require_time(min(timeout, 120))
-        result = safe_call(["docker", *args], timeout=timeout, capture=capture)
-        if check and result.returncode:
+    def docker(self, *args: str, timeout: int = 30, capture: bool = False) -> bytes:
+        result = self.docker_result(*args, timeout=timeout, capture=capture)
+        if result.returncode:
             raise HarnessFailure("bounded Docker operation failed")
-        if not check and result.returncode == 0:
-            return result.stdout or b""
         return result.stdout or b""
+
+    def docker_result(
+        self, *args: str, timeout: int = 30, capture: bool = False
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.require_time(min(timeout, 120))
+        return safe_call(["docker", *args], timeout=timeout, capture=capture)
 
     def docker_json(self, *args: str, timeout: int = 30) -> Any:
         try:
@@ -329,7 +331,7 @@ class Suite:
         except Exception:
             self.reconcile_container_intent(resource)
             raise
-        if not re.fullmatch(r"[0-9a-f]{12,64}", output):
+        if not FULL_CONTAINER_ID_RE.fullmatch(output):
             self.reconcile_container_intent(resource)
             raise HarnessFailure("Docker did not return a container ID")
         resource["id"] = output
@@ -362,24 +364,24 @@ class Suite:
         return signature
 
     def reconcile_container_intent(self, resource: dict[str, Any]) -> None:
-        found = (
-            self.docker(
-                "ps",
-                "-aq",
-                "--filter",
-                f"name=^/{resource['name']}$",
-                capture=True,
-                check=False,
-            )
-            .decode()
-            .splitlines()
+        inventory = self.docker_result(
+            "ps",
+            "-aq",
+            "--no-trunc",
+            "--filter",
+            f"name=^/{resource['name']}$",
+            capture=True,
         )
+        if inventory.returncode:
+            raise HarnessFailure("could not reconcile container creation inventory")
+        found = (inventory.stdout or b"").decode().splitlines()
         ids = [item.strip() for item in found if item.strip()]
         if not ids:
+            resource["intent"] = False
             resource["removed"] = True
             self.save_manifest()
             return
-        if len(ids) != 1 or not re.fullmatch(r"[0-9a-f]{12,64}", ids[0]):
+        if len(ids) != 1 or not FULL_CONTAINER_ID_RE.fullmatch(ids[0]):
             raise HarnessFailure("creation intent matched ambiguous Docker resources")
         resource["id"] = ids[0]
         resource["intent"] = False
@@ -388,14 +390,15 @@ class Suite:
 
     def verify_container_record(self, resource: dict[str, Any]) -> dict[str, Any]:
         container_id = resource.get("id")
-        if not isinstance(container_id, str) or not re.fullmatch(
-            r"[0-9a-f]{12,64}", container_id
+        if not isinstance(container_id, str) or not FULL_CONTAINER_ID_RE.fullmatch(
+            container_id
         ):
             raise HarnessFailure("owned container record has no verified ID")
         item = self.inspect_container(container_id)
         labels = (item.get("Config") or {}).get("Labels") or {}
         if (
-            labels.get(RUN_LABEL) != self.run_id
+            item.get("Id") != container_id
+            or labels.get(RUN_LABEL) != self.run_id
             or labels.get("shell.integration.purpose") != resource.get("purpose")
             or (item.get("Name") or "").lstrip("/") != resource.get("name")
             or item.get("Image") != resource.get("image_id")
@@ -432,6 +435,8 @@ class Suite:
             raise HarnessFailure("Docker removal could not be verified")
 
     def remove_owned_container(self, container_id: str, *, force: bool = False) -> None:
+        if not FULL_CONTAINER_ID_RE.fullmatch(container_id):
+            raise HarnessFailure("container cleanup requires a full immutable ID")
         resource = next(
             (
                 entry
@@ -446,6 +451,8 @@ class Suite:
             item = self.verify_container_record(resource)
         else:
             item = self.inspect_container(container_id)
+        if item.get("Id") != container_id:
+            raise HarnessFailure("inspected container ID differed from cleanup target")
         labels = (item.get("Config") or {}).get("Labels") or {}
         if labels.get(RUN_LABEL) != self.run_id:
             raise HarnessFailure(
@@ -466,9 +473,7 @@ class Suite:
                         "owned container did not exit after bounded TERM"
                     )
             else:
-                self.docker(
-                    "kill", "--signal=TERM", container_id, timeout=15, check=False
-                )
+                self.docker("kill", "--signal=TERM", container_id, timeout=15)
                 self.docker("rm", "--force", container_id, timeout=20)
                 self.verify_container_absent(container_id)
                 for resource in self.manifest["resources"]["containers"]:
@@ -1223,19 +1228,17 @@ class Suite:
         self.record_stage("private-users-network-ready", network_id=cid)
 
     def reconcile_network_intent(self, resource: dict[str, Any]) -> None:
-        candidates = (
-            self.docker(
-                "network",
-                "ls",
-                "-q",
-                "--filter",
-                f"name=^{NETWORK_NAME}$",
-                capture=True,
-                check=False,
-            )
-            .decode()
-            .splitlines()
+        inventory = self.docker_result(
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            f"name=^{NETWORK_NAME}$",
+            capture=True,
         )
+        if inventory.returncode:
+            raise HarnessFailure("could not reconcile network creation inventory")
+        candidates = (inventory.stdout or b"").decode().splitlines()
         ids = [candidate.strip() for candidate in candidates if candidate.strip()]
         if not ids:
             resource["removed"] = True
@@ -1366,6 +1369,16 @@ class Suite:
                             "SHELL_INTEGRATION_RUN_ID": self.run_id,
                         },
                     },
+                    "web": {
+                        "image": self.image_refs["web"],
+                        "restart": "no",
+                        "labels": {RUN_LABEL: self.run_id},
+                    },
+                    "proxy": {
+                        "image": self.image_refs["proxy"],
+                        "restart": "no",
+                        "labels": {RUN_LABEL: self.run_id},
+                    },
                     "lab": {"image": self.image_refs["old_lab"]},
                 }
             },
@@ -1481,7 +1494,13 @@ class Suite:
     def compose_ids(self, service: str, override: Path | None = None) -> list[str]:
         output = (
             self.compose_command(
-                "ps", "-aq", service, override=override, timeout=30, capture=True
+                "ps",
+                "-aq",
+                "--no-trunc",
+                service,
+                override=override,
+                timeout=30,
+                capture=True,
             )
             .decode()
             .splitlines()
@@ -1490,10 +1509,13 @@ class Suite:
         if len(ids) > 1:
             raise HarnessFailure("fixture Compose service has ambiguous containers")
         for cid in ids:
+            if not FULL_CONTAINER_ID_RE.fullmatch(cid):
+                raise HarnessFailure("Compose returned a truncated container ID")
             item = self.inspect_container(cid)
             labels = (item.get("Config") or {}).get("Labels") or {}
             if (
-                labels.get("com.docker.compose.project") != self.project_name
+                item.get("Id") != cid
+                or labels.get("com.docker.compose.project") != self.project_name
                 or labels.get("com.docker.compose.service") != service
                 or labels.get("com.docker.compose.project.working_dir")
                 != str(self.project_dir)
@@ -1629,8 +1651,10 @@ class Suite:
 
     def capture_lab_ids(self, usernames: set[str], expected_image: str) -> None:
         assert self.pool is not None
-        ids = self.docker("ps", "-aq", capture=True).decode().splitlines()
+        ids = self.docker("ps", "-aq", "--no-trunc", capture=True).decode().splitlines()
         for cid in filter(None, (item.strip() for item in ids)):
+            if not FULL_CONTAINER_ID_RE.fullmatch(cid):
+                raise HarnessFailure("Lab inventory returned a truncated container ID")
             item = self.inspect_container(cid)
             labels = (item.get("Config") or {}).get("Labels") or {}
             if labels.get(RUN_LABEL) != self.run_id:
@@ -1984,13 +2008,39 @@ class Suite:
             for resource in self.manifest["resources"]["containers"]:
                 if resource.get("kind") != "fixture-lab" or resource.get("removed"):
                     continue
-                inspected = safe_call(
-                    ["docker", "inspect", resource["id"]], timeout=20, capture=True
-                )
-                if inspected.returncode:
-                    resource["removed"] = True
+                self.reconcile_helper_lab_presence(resource)
             self.save_manifest()
         return output
+
+    @staticmethod
+    def docker_inspect_not_found(
+        result: subprocess.CompletedProcess[bytes], container_id: str
+    ) -> bool:
+        if result.returncode == 0 or (result.stdout or b"").strip():
+            return False
+        message = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        return message in {
+            f"Error: No such object: {container_id}",
+            f"Error: No such container: {container_id}",
+            f"Error response from daemon: No such container: {container_id}",
+        }
+
+    def reconcile_helper_lab_presence(self, resource: dict[str, Any]) -> None:
+        container_id = resource.get("id")
+        if not isinstance(container_id, str) or not container_id:
+            raise HarnessFailure("fixture Lab record has no container ID")
+        inspected = safe_call(
+            ["docker", "inspect", container_id], timeout=20, capture=True
+        )
+        if inspected.returncode == 0:
+            return
+        if self.docker_inspect_not_found(inspected, container_id):
+            resource["removed"] = True
+            self.save_manifest()
+            return
+        raise HarnessFailure(
+            "could not verify fixture Lab presence after helper execution"
+        )
 
     def verify_acceptance_paths(
         self, backup: Path, output: dict[str, Any]
@@ -2104,6 +2154,8 @@ class Suite:
         updater = self.workspace / "scripts" / "update.sh"
         env = os.environ.copy()
         env["UPDATE_LOCK_FILE"] = str(self.run_root / "update.lock")
+        env["COMPOSE_PROJECT_NAME"] = self.project_name
+        old_service_ids = self.snapshot_service_ids()
         result = safe_call(
             ["/bin/sh", str(updater), str(self.project_dir)],
             timeout=UPDATE_TIMEOUT,
@@ -2122,12 +2174,9 @@ class Suite:
             raise HarnessFailure(
                 "routine updater did not refuse before replacing the old stack"
             )
-        if (
-            self.compose_ids("hub") != [self.service_id("hub")]
-            or self.compose_ids("proxy") == []
-        ):
+        if self.snapshot_service_ids() != old_service_ids:
             raise HarnessFailure(
-                "routine updater refusal changed or removed old services"
+                "routine updater refusal changed old service identities"
             )
         self.wait_ready()
         self.add_case(
@@ -2441,8 +2490,12 @@ class Suite:
 
     def cleanup_dynamic_labs(self, usernames: set[str]) -> None:
         assert self.pool is not None
-        ids = self.docker("ps", "-aq", capture=True).decode().splitlines()
+        ids = self.docker("ps", "-aq", "--no-trunc", capture=True).decode().splitlines()
         for cid in filter(None, (x.strip() for x in ids)):
+            if not FULL_CONTAINER_ID_RE.fullmatch(cid):
+                raise HarnessFailure(
+                    "cleanup inventory returned a truncated container ID"
+                )
             item = self.inspect_container(cid)
             labels = (item.get("Config") or {}).get("Labels") or {}
             if (
@@ -2497,12 +2550,18 @@ class Suite:
     def cleanup_compose(self) -> None:
         # Operate only on recorded project containers after rechecking project
         # and service labels. TERM and exact-ID rm avoid Compose down/global cleanup.
-        ids = self.docker("ps", "-aq", capture=True).decode().splitlines()
+        ids = self.docker("ps", "-aq", "--no-trunc", capture=True).decode().splitlines()
         inspected: list[tuple[int, str, dict[str, Any]]] = []
         order = {"web": 0, "proxy": 1, "hub": 2}
         for cid in filter(None, (x.strip() for x in ids)):
+            if not FULL_CONTAINER_ID_RE.fullmatch(cid):
+                raise HarnessFailure(
+                    "cleanup inventory returned a truncated container ID"
+                )
             item = self.inspect_container(cid)
             labels = (item.get("Config") or {}).get("Labels") or {}
+            if item.get("Id") != cid:
+                raise HarnessFailure("inspected Compose ID differed from inventory ID")
             if labels.get("com.docker.compose.project") != self.project_name:
                 continue
             service = labels.get("com.docker.compose.service")

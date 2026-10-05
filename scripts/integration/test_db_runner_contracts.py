@@ -146,13 +146,140 @@ class DatabaseRunnerContracts(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 1, "", "rm failed")
             raise AssertionError("unexpected Docker boundary call")
 
+        with (
+            patch(
+                "scripts.integration.test_db_migration.docker", side_effect=fake_docker
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            owner.cleanup()
+        self.assertIs(owner.cleanup_verified, False)
+        self.assertEqual(owner.cleanup_failures, [name])
+
+    @staticmethod
+    def _owner_with_container(container_id: str) -> tuple[OwnedContainers, str, dict]:
+        owner = OwnedContainers("a" * 12)
+        name = f"jh6db-{owner.run_id}-0"
+        fixture_path = "/tmp/fixture"
+        worker_path = "/tmp/worker.py"
+        intent = {
+            "run_id": owner.run_id,
+            "image_id": "sha256:" + "c" * 64,
+            "purpose": "snapshot",
+            "fixture": fixture_path,
+            "worker": worker_path,
+        }
+        owner.names.append(name)
+        owner.intents[name] = intent
+        owner.ids_by_name[name] = container_id
+        owner.containers.append(container_id)
+        inspect = {
+            "Id": container_id,
+            "Name": "/" + name,
+            "Image": intent["image_id"],
+            "Config": {"Labels": {"shell.integration.db-test": owner.run_id}},
+            "HostConfig": {"NetworkMode": "none"},
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": fixture_path,
+                    "Destination": "/fixture",
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": worker_path,
+                    "Destination": "/fixture_worker.py",
+                    "RW": False,
+                },
+            ],
+        }
+        return owner, name, inspect
+
+    def test_db_cleanup_uses_full_ps_ids_and_removes_exact_inspected_id(self) -> None:
+        full_id = "d" * 64
+        owner, name, inspected_item = self._owner_with_container(full_id)
+        calls: list[list[str]] = []
+        name_lookups = 0
+
+        def fake_ps_id(args: list[str]) -> str:
+            # Docker's default list output is abbreviated; --no-trunc exposes
+            # the same container's immutable ID for comparison with inspect.
+            return full_id if "--no-trunc" in args else full_id[:12]
+
+        self.assertEqual(fake_ps_id(["ps", "-aq"]), full_id[:12])
+        self.assertEqual(fake_ps_id(["ps", "-aq", "--no-trunc"]), full_id)
+
+        def fake_docker(args, *, timeout, capture=False):
+            nonlocal name_lookups
+            calls.append(args)
+            if args[:2] == ["ps", "-aq"]:
+                self.assertIn("--no-trunc", args)
+                filter_value = args[args.index("--filter") + 1]
+                if filter_value.startswith("name="):
+                    name_lookups += 1
+                    return subprocess.CompletedProcess(
+                        args, 0, fake_ps_id(args) if name_lookups == 1 else "", ""
+                    )
+                if filter_value == f"id={full_id}":
+                    return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "inspect":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps(inspected_item), ""
+                )
+            if args[:2] == ["rm", "--force"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            raise AssertionError(f"unexpected Docker call: {args[0]}")
+
         with patch(
             "scripts.integration.test_db_migration.docker", side_effect=fake_docker
         ):
-            with self.assertRaises(RuntimeError):
-                owner.cleanup()
+            owner.cleanup()
+
+        self.assertIs(owner.cleanup_verified, True)
+        self.assertEqual(
+            next(call[-1] for call in calls if call[:2] == ["rm", "--force"]),
+            full_id,
+        )
+        self.assertTrue(any(call[:3] == ["ps", "-aq", "--no-trunc"] for call in calls))
+        self.assertEqual(owner.cleanup_failures, [])
+        self.assertEqual(owner.ids_by_name[name], full_id)
+
+    def test_db_cleanup_refuses_different_full_inspect_id_without_removal(self) -> None:
+        listed_id = "e" * 64
+        different_id = "f" * 64
+        owner, name, inspected_item = self._owner_with_container(different_id)
+        rm_calls: list[list[str]] = []
+        lookup_count = 0
+
+        def fake_docker(args, *, timeout, capture=False):
+            nonlocal lookup_count
+            if args[:2] == ["ps", "-aq"]:
+                self.assertIn("--no-trunc", args)
+                filter_value = args[args.index("--filter") + 1]
+                if filter_value.startswith("name="):
+                    lookup_count += 1
+                    return subprocess.CompletedProcess(args, 0, listed_id, "")
+            if args[0] == "inspect":
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps(inspected_item), ""
+                )
+            if args[:2] == ["rm", "--force"]:
+                rm_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+            raise AssertionError(f"unexpected Docker call: {args[0]}")
+
+        with (
+            patch(
+                "scripts.integration.test_db_migration.docker", side_effect=fake_docker
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            owner.cleanup()
+
         self.assertIs(owner.cleanup_verified, False)
         self.assertEqual(owner.cleanup_failures, [name])
+        self.assertEqual(rm_calls, [])
 
 
 if __name__ == "__main__":

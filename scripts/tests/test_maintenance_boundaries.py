@@ -194,6 +194,7 @@ class MaintenanceBoundaryTests(unittest.TestCase):
             name = ""
             label_key = ""
             label_value = ""
+            probe_full_id = "a" * 64
             events: list[tuple[str, ...]] = []
 
             def command(args: Any, _timeout: float, _check: bool = True) -> str:
@@ -209,12 +210,12 @@ class MaintenanceBoundaryTests(unittest.TestCase):
                         "bounded external command timed out"
                     )
                 if call[:3] == ("docker", "ps", "-aq"):
-                    return "probe-after-timeout"
-                if call[:3] == ("docker", "inspect", "probe-after-timeout"):
+                    return probe_full_id if "--no-trunc" in call else probe_full_id[:12]
+                if call[:3] == ("docker", "inspect", probe_full_id):
                     return json.dumps(
                         [
                             {
-                                "Id": "probe-after-timeout",
+                                "Id": probe_full_id,
                                 "Name": f"/{name}",
                                 "State": {"Running": False},
                                 "Config": {"Labels": {label_key: label_value}},
@@ -240,6 +241,8 @@ class MaintenanceBoundaryTests(unittest.TestCase):
             self.assertEqual(
                 [call[1] for call in events], ["create", "ps", "inspect", "rm"]
             )
+            self.assertIn("--no-trunc", events[1])
+            self.assertIn(probe_full_id, events[-1])
 
     def test_overlapping_hub_and_pool_paths_fail_before_daemon_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

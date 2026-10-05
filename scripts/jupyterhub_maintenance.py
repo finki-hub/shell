@@ -798,7 +798,11 @@ class Controller:
         expected_id: str | None,
     ) -> None:
         output = self._docker(
-            "ps", "-aq", "--filter", f"label={label_key}={label_value}"
+            "ps",
+            "-aq",
+            "--no-trunc",
+            "--filter",
+            f"label={label_key}={label_value}",
         )
         ids = [line.strip() for line in output.splitlines() if line.strip()]
         if not ids:
@@ -806,6 +810,8 @@ class Controller:
         if len(ids) != 1 or (expected_id is not None and ids[0] != expected_id):
             raise MaintenanceError("owned Lab probe container identity is ambiguous")
         container = self._inspect(ids[0])
+        if str(container.get("Id", "")) != ids[0]:
+            raise MaintenanceError("owned Lab probe container identity is ambiguous")
         labels = self._labels(container)
         if (
             labels.get(label_key) != label_value
