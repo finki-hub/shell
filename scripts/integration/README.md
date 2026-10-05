@@ -14,13 +14,54 @@ networks/volumes, occupied ports, missing loop/XFS support, less than 25 GiB
 free, and a missing pinned baseline object. It never loads a checkout `.env`,
 calls `pool-init.sh`, edits fstab, invokes global prune, or accesses production.
 It provisions its own one-GiB XFS loop filesystem, verifies project quota
-accounting/enforcement with a bounded EDQUOT probe, and persists resource
+accounting/enforcement with a bounded write/fsync denial-and-relief probe, and persists resource
 creation intent before Docker calls, reconciling IDs and ownership afterward.
 Cleanup removes only verified fixture resources.
 The `--xfs-only` mode uses the same runner preflight and owned loop-filesystem
 setup, then cleans up without building images or starting the migration stack.
 It reports `xfs_probe` separately and always leaves `runtime` as `not-run`; it
 is a prerequisite check, not migration-acceptance evidence.
+
+### Project-quota denial verification
+
+The XFS-only gate uses a dedicated project ID (`9999`) on a 1-GiB scratch
+filesystem. Before probing it verifies that the pool root is unprojected and has
+at least 128 MiB available plus 64 free inodes. The real scratch directory must
+have project ID 9999 and `PROJINHERIT`; the opened probe file descriptor must
+also report project ID 9999. The harness reads the exact numeric project row
+from `xfs_quota report -p -b -n` and `report -p -i -n` (default block units are
+1 KiB), requiring the configured 16-MiB block hard limit (16384 KiB), inode
+hard limit 1000, and inode usage below that hard limit. The same checks run
+after a write/fsync denial, while the original limit is still installed. For
+this one-directory/one-file fixture, reported inode usage is additionally
+required to be at most two, not merely below the 1000-inode ceiling.
+
+The denial can be `EDQUOT` or `ENOSPC`. The errno alone is not treated as quota
+proof: global free bytes and inodes must remain above the guarded thresholds,
+quota reports must be structurally valid and show the expected project limits,
+and the probe must have the expected project assignment. The harness then
+raises only project 9999's block hard limit to 32 MiB, verifies that reported
+limit, and requires an additional 1-MiB write plus fsync on the same descriptor
+to succeed. This bounded relief demonstrates that the project block limit
+caused the earlier denial without assuming usage must equal the hard limit;
+XFS reservation can deny writes below that reported limit. The aggregate write
+budget, including relief, is at most 64 MiB. The original project map, both
+limits, and scratch directory are restored/removed on every exit path.
+The report parser requires documented numeric project rows and columns;
+humanized output is intentionally not used. See the
+[xfs_quota report options](https://man7.org/linux/man-pages/man8/xfs_quota.8.html).
+
+Linux XFS project-quota reservation code can return `-ENOSPC` for a project
+quota reservation (`xfs_trans_dqresv`, project quota path with
+`XFS_QMOPT_ENOSPC`); ordinary user/group quota paths use `-EDQUOT` there. See
+the [upstream XFS source](https://github.com/torvalds/linux/blob/master/fs/xfs/xfs_trans_dquot.c).
+This is kernel-path behavior, not a universal guarantee for every kernel or
+filesystem failure; the exact Ubuntu runner kernel is not asserted here. The
+preflight therefore accepts either errno only with the assignment, quota-report,
+global-capacity, and same-file relief checks above. A global filesystem
+exhaustion, inode-limit hit, wrong project, malformed report, or failed relief
+remains a failure. This focused proof reports numeric evidence only and is not
+migration acceptance.
 The host-side runner requires Python 3.12 or newer; Hub workers use the pinned
 image interpreter (Python 3.14).
 

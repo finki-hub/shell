@@ -119,6 +119,76 @@ def quota_test_suite(root: Path) -> tuple[run_suite.Suite, Path]:
     return suite, projects
 
 
+def quota_report(*, inode: bool, block_limit: int = 16_384) -> str:
+    hard = 1000 if inode else block_limit
+    used = 1 if inode else 2048
+    return (
+        f"Project ID Used Soft Hard Warn/Grace\n#9999 {used} 0 {hard} 00 [--------]\n"
+    )
+
+
+def quota_guard_patches(suite: run_suite.Suite):
+    pool = suite.pool
+    assert pool is not None
+    scratch = pool / ".integration-quota-probe"
+
+    def attrs(path: Path):
+        return (
+            (
+                run_suite.QUOTA_PROJECT_ID,
+                run_suite.FS_XFLAG_PROJINHERIT,
+            )
+            if path == scratch
+            else (0, 0)
+        )
+
+    return (
+        patch.object(suite, "inode_xfs_attributes", side_effect=attrs),
+        patch.object(
+            suite,
+            "inode_xfs_attributes_fd",
+            return_value=(run_suite.QUOTA_PROJECT_ID, 0),
+        ),
+        patch.object(
+            suite,
+            "filesystem_capacity",
+            return_value=(1024 * 1024 * 1024, 10_000),
+        ),
+    )
+
+
+@contextlib.contextmanager
+def patch_quota_guards(suite: run_suite.Suite):
+    with contextlib.ExitStack() as stack:
+        for patcher in quota_guard_patches(suite):
+            stack.enter_context(patcher)
+        yield
+
+
+def successful_quota_commands(*, block_used: int = 2048, inode_used: int = 1):
+    block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+
+    def command(command: str, operation: str, **_kwargs):
+        nonlocal block_limit
+        if operation == "quota-limit":
+            if "bhard=32m" in command:
+                block_limit = run_suite.QUOTA_RELIEF_BLOCK_LIMIT_KIB
+            elif "bhard=16m" in command:
+                block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+        if operation == "quota-report":
+            hard = 1000 if "-i" in command else block_limit
+            used = inode_used if "-i" in command else block_used
+            return (
+                "Project ID Used Soft Hard Warn/Grace\n"
+                f"#9999 {used} 0 {hard} 00 [--------]\n"
+            )
+        if operation in {"quota-state", "quota-post-state"}:
+            return XFS_PROJECT_QUOTA_ON
+        return ""
+
+    return command
+
+
 XFS_PROJECT_QUOTA_ON = """User quota state on fixture (/dev/loop0)
 \tAccounting: ON
 \tEnforcement: ON
@@ -255,6 +325,249 @@ class SuiteContractTests(unittest.TestCase):
             "project-enforcement-disabled",
         )
 
+    def test_quota_report_parser_requires_exact_numeric_row_and_known_columns(
+        self,
+    ) -> None:
+        fixture = (
+            "Project ID Used Soft Hard Warn/Grace\n"
+            "#999 12 0 4096 00 [--------]\n"
+            "#9999 2048 0 16384 00 [--------]\n"
+        )
+        self.assertEqual(
+            run_suite.Suite.parse_quota_report(fixture, 9999), (2048, 16384)
+        )
+        invalid_reports = (
+            "Project ID Used Soft Hard Warn/Grace\n#9999xyz 2 0 16384 00 [--------]\n",
+            fixture + "9999 1 0 16384 00 [--------]\n",
+            "Project ID Used Soft Hard Warn/Grace\n#9999 2 broken 16384\n",
+            "#9999 2 0 16384\n",
+            "Project ID Used Soft Hard Warn/Grace\n#999 2 0 16384 00 [--------]\n",
+        )
+        for report in invalid_reports:
+            with self.subTest(report=report):
+                with self.assertRaises(run_suite.HarnessFailure):
+                    run_suite.Suite.parse_quota_report(report, 9999)
+
+    def test_quota_probe_rejects_root_project_and_low_filesystem_capacity(self) -> None:
+        cases = (
+            (
+                "root-project",
+                (9999, 0),
+                (1024**3, 10_000),
+                "project-assignment-mismatch",
+            ),
+            (
+                "root-inheritance",
+                (0, run_suite.FS_XFLAG_PROJINHERIT),
+                (1024**3, 10_000),
+                "project-assignment-mismatch",
+            ),
+            (
+                "low-bytes",
+                (0, 0),
+                (64 * 1024 * 1024, 10_000),
+                "filesystem-capacity-low",
+            ),
+            ("low-inodes", (0, 0), (1024**3, 10), "filesystem-capacity-low"),
+        )
+        for name, root_attrs, capacity, classification in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                with (
+                    patch.object(
+                        suite, "quota_command", return_value=XFS_PROJECT_QUOTA_ON
+                    ),
+                    patch.object(
+                        suite, "inode_xfs_attributes", return_value=root_attrs
+                    ),
+                    patch.object(suite, "filesystem_capacity", return_value=capacity),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_quota_enforcement()
+                self.assertEqual(
+                    suite.failure_context["classification"], classification
+                )
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
+    def test_quota_probe_rejects_wrong_scratch_project_or_missing_inheritance(
+        self,
+    ) -> None:
+        for attributes, expected in (
+            ((10001, run_suite.FS_XFLAG_PROJINHERIT), "project-assignment-mismatch"),
+            ((9999, 0), "project-inheritance-missing"),
+        ):
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                scratch = suite.pool / ".integration-quota-probe"
+
+                def xattrs(path, attributes=attributes, scratch=scratch):
+                    return attributes if path == scratch else (0, 0)
+
+                with (
+                    patch.object(
+                        suite, "quota_command", side_effect=successful_quota_commands()
+                    ),
+                    patch.object(suite, "inode_xfs_attributes", side_effect=xattrs),
+                    patch.object(
+                        suite, "filesystem_capacity", return_value=(1024**3, 10_000)
+                    ),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_quota_enforcement()
+                self.assertEqual(suite.failure_context["classification"], expected)
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse(scratch.exists())
+
+    def test_quota_probe_rejects_wrong_file_project_and_unsafe_usage(self) -> None:
+        cases = (
+            ("wrong-file-project", 1, 1, "project-assignment-mismatch"),
+            ("unexpected-inode-usage", 2048, 3, "quota-usage-unsafe"),
+            ("inode-hard-limit-hit", 2048, 1000, "inode-quota-exhausted"),
+            ("block-hard-limit-hit", 16384, 1, "quota-usage-unsafe"),
+        )
+        for name, block_used, inode_used, expected in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                suite, _projects = quota_test_suite(Path(directory))
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            suite,
+                            "quota_command",
+                            side_effect=successful_quota_commands(
+                                block_used=block_used, inode_used=inode_used
+                            ),
+                        )
+                    )
+                    stack.enter_context(patch_quota_guards(suite))
+                    if name == "wrong-file-project":
+                        stack.enter_context(
+                            patch.object(
+                                suite,
+                                "inode_xfs_attributes_fd",
+                                return_value=(10001, 0),
+                            )
+                        )
+                    with self.assertRaises(run_suite.HarnessFailure):
+                        suite.verify_quota_enforcement()
+                self.assertEqual(suite.failure_context["classification"], expected)
+
+    def test_quota_probe_rejects_relief_write_failure_and_preserves_cleanup(
+        self,
+    ) -> None:
+        for relief_failure in ("write", "fsync"):
+            with (
+                self.subTest(relief_failure=relief_failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                denial_sent = False
+
+                def write(_fd, payload, relief_failure=relief_failure):
+                    nonlocal denial_sent
+                    if not denial_sent:
+                        denial_sent = True
+                        raise OSError(errno.ENOSPC, "synthetic guarded quota denial")
+                    if relief_failure == "write":
+                        raise OSError(errno.ENOSPC, "synthetic relief failure")
+                    return len(payload)
+
+                def fsync(_fd, relief_failure=relief_failure):
+                    if relief_failure == "fsync":
+                        raise OSError(errno.ENOSPC, "synthetic relief failure")
+
+                with (
+                    patch.object(
+                        suite, "quota_command", side_effect=successful_quota_commands()
+                    ),
+                    patch_quota_guards(suite),
+                    patch_quota_probe_io(write, fsync),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_quota_enforcement()
+
+                self.assertEqual(
+                    suite.failure_context["classification"], "quota-relief-failed"
+                )
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
+    def test_quota_probe_counts_partial_writes_within_aggregate_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, _projects = quota_test_suite(Path(directory))
+            successful = 0
+            denial_sent = False
+
+            def write(_fd, payload):
+                nonlocal denial_sent, successful
+                if not denial_sent and successful >= 16 * 1024 * 1024:
+                    denial_sent = True
+                    raise OSError(errno.EDQUOT, "synthetic quota denial")
+                count = min(len(payload), 4096)
+                successful += count
+                return count
+
+            with (
+                patch.object(
+                    suite, "quota_command", side_effect=successful_quota_commands()
+                ),
+                patch_quota_guards(suite),
+                patch_quota_probe_io(write, lambda _fd: None),
+            ):
+                suite.verify_quota_enforcement()
+
+            self.assertEqual(successful, 17 * 1024 * 1024)
+            self.assertLessEqual(
+                suite.quota_evidence["successful_bytes_before_denial"]
+                + suite.quota_evidence["relief_bytes"],
+                run_suite.QUOTA_WRITE_BUDGET,
+            )
+
+    def test_quota_probe_rejects_zero_progress_and_wrong_reported_limit(self) -> None:
+        for case in ("zero-progress", "wrong-limit"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                suite, projects = quota_test_suite(Path(directory))
+                original = projects.read_text(encoding="utf-8")
+                commands = successful_quota_commands()
+
+                def quota(command, operation, case=case, commands=commands, **kwargs):
+                    if case == "wrong-limit" and operation == "quota-report":
+                        hard = 999 if "-i" in command else 16_383
+                        used = 1
+                        return (
+                            "Project ID Used Soft Hard Warn/Grace\n"
+                            f"#9999 {used} 0 {hard} 00 [--------]\n"
+                        )
+                    return commands(command, operation, **kwargs)
+
+                with (
+                    patch.object(suite, "quota_command", side_effect=quota),
+                    patch_quota_guards(suite),
+                    patch_quota_probe_io(
+                        (lambda _fd, _payload: 0)
+                        if case == "zero-progress"
+                        else (lambda _fd, payload: len(payload)),
+                        lambda _fd: None,
+                    ),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_quota_enforcement()
+
+                expected = (
+                    "no-write-progress"
+                    if case == "zero-progress"
+                    else "quota-limit-mismatch"
+                )
+                self.assertEqual(suite.failure_context["classification"], expected)
+                self.assertEqual(projects.read_text(encoding="utf-8"), original)
+                self.assertFalse((suite.pool / ".integration-quota-probe").exists())
+
     def test_quota_command_detects_diagnostic_even_with_zero_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             suite, _projects = quota_test_suite(Path(directory))
@@ -314,17 +627,33 @@ class SuiteContractTests(unittest.TestCase):
     def test_quota_probe_accepts_edquot_from_write_or_fsync_and_restores_fixture(
         self,
     ) -> None:
-        for edquot_location in ("write", "fsync"):
+        for edquot_location, denial_error in (
+            ("write", errno.EDQUOT),
+            ("fsync", errno.EDQUOT),
+            ("write", errno.ENOSPC),
+            ("fsync", errno.ENOSPC),
+        ):
             with (
-                self.subTest(edquot_location=edquot_location),
+                self.subTest(edquot_location=edquot_location, errno=denial_error),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 suite, projects = quota_test_suite(Path(directory))
                 original = projects.read_text(encoding="utf-8")
                 calls: list[tuple[str, str]] = []
+                block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
 
                 def quota(command, operation, calls=calls, **_kwargs):
+                    nonlocal block_limit
                     calls.append((command, operation))
+                    if operation == "quota-limit":
+                        if "bhard=32m" in command:
+                            block_limit = run_suite.QUOTA_RELIEF_BLOCK_LIMIT_KIB
+                        elif "bhard=16m" in command:
+                            block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+                    if operation == "quota-report":
+                        return quota_report(
+                            inode="-i" in command, block_limit=block_limit
+                        )
                     return (
                         XFS_PROJECT_QUOTA_ON
                         if operation
@@ -336,20 +665,38 @@ class SuiteContractTests(unittest.TestCase):
                     )
 
                 written_total = 0
+                denial_sent = False
 
-                def write(_fd, payload, edquot_location=edquot_location):
-                    nonlocal written_total
-                    if edquot_location == "write" and written_total >= 16 * 1024 * 1024:
-                        raise OSError(errno.EDQUOT, "synthetic quota denial")
+                def write(
+                    _fd,
+                    payload,
+                    edquot_location=edquot_location,
+                    denial_error=denial_error,
+                ):
+                    nonlocal denial_sent, written_total
+                    if (
+                        edquot_location == "write"
+                        and not denial_sent
+                        and written_total >= 16 * 1024 * 1024
+                    ):
+                        denial_sent = True
+                        raise OSError(denial_error, "synthetic quota denial")
                     written_total += len(payload)
                     return len(payload)
 
-                def fsync(_fd, edquot_location=edquot_location):
-                    if edquot_location == "fsync":
-                        raise OSError(errno.EDQUOT, "synthetic quota denial")
+                def fsync(
+                    _fd,
+                    edquot_location=edquot_location,
+                    denial_error=denial_error,
+                ):
+                    nonlocal denial_sent
+                    if edquot_location == "fsync" and not denial_sent:
+                        denial_sent = True
+                        raise OSError(denial_error, "synthetic quota denial")
 
                 with (
                     patch.object(suite, "quota_command", side_effect=quota),
+                    patch_quota_guards(suite),
                     patch_quota_probe_io(write, fsync),
                 ):
                     suite.verify_quota_enforcement()
@@ -358,6 +705,17 @@ class SuiteContractTests(unittest.TestCase):
                 self.assertFalse((suite.pool / ".integration-quota-probe").exists())
                 self.assertEqual(suite.failure_context, None)
                 self.assertEqual(suite.cleanup_failure_context, None)
+                self.assertEqual(
+                    suite.quota_evidence["classification"],
+                    "project-quota-enforced",
+                )
+                self.assertEqual(suite.quota_evidence["errno"], denial_error)
+                self.assertGreaterEqual(
+                    suite.quota_evidence["relief_bytes"], 1024 * 1024
+                )
+                self.assertEqual(
+                    suite.quota_evidence["relief_block_hard_kib"], 32 * 1024
+                )
                 self.assertIn(
                     ("limit -p bhard=16m ihard=1000 9999", "quota-limit"), calls
                 )
@@ -371,6 +729,8 @@ class SuiteContractTests(unittest.TestCase):
             original = projects.read_text(encoding="utf-8")
 
             def quota(_command, operation, **_kwargs):
+                if operation == "quota-report":
+                    return quota_report(inode="-i" in _command)
                 return (
                     XFS_PROJECT_QUOTA_ON
                     if operation
@@ -389,6 +749,7 @@ class SuiteContractTests(unittest.TestCase):
 
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
+                patch_quota_guards(suite),
                 patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
@@ -405,8 +766,17 @@ class SuiteContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             suite, _projects = quota_test_suite(Path(directory))
             state_calls: list[str] = []
+            block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
 
             def quota(_command, operation, **_kwargs):
+                nonlocal block_limit
+                if operation == "quota-limit":
+                    if "32m" in _command:
+                        block_limit = run_suite.QUOTA_RELIEF_BLOCK_LIMIT_KIB
+                    elif "16m" in _command:
+                        block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+                if operation == "quota-report":
+                    return quota_report(inode="-i" in _command, block_limit=block_limit)
                 if operation in {"quota-state", "quota-post-state"}:
                     state_calls.append(operation)
                     if operation == "quota-post-state":
@@ -416,14 +786,21 @@ class SuiteContractTests(unittest.TestCase):
                     return XFS_PROJECT_QUOTA_ON
                 return ""
 
-            def write(_fd, _data):
-                raise OSError(errno.EDQUOT, "synthetic quota denial")
+            denial_sent = False
+
+            def write(_fd, data):
+                nonlocal denial_sent
+                if not denial_sent:
+                    denial_sent = True
+                    raise OSError(errno.EDQUOT, "synthetic quota denial")
+                return len(data)
 
             def fsync(_fd):
                 return None
 
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
+                patch_quota_guards(suite),
                 patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
@@ -441,8 +818,17 @@ class SuiteContractTests(unittest.TestCase):
     def test_reset_only_failure_is_reported_as_the_primary_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             suite, _projects = quota_test_suite(Path(directory))
+            block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
 
             def quota(_command, operation, **_kwargs):
+                nonlocal block_limit
+                if operation == "quota-limit":
+                    if "32m" in _command:
+                        block_limit = run_suite.QUOTA_RELIEF_BLOCK_LIMIT_KIB
+                    elif "16m" in _command:
+                        block_limit = run_suite.QUOTA_BLOCK_LIMIT_KIB
+                if operation == "quota-report":
+                    return quota_report(inode="-i" in _command, block_limit=block_limit)
                 if operation in {"quota-state", "quota-post-state"}:
                     return XFS_PROJECT_QUOTA_ON
                 if operation == "quota-reset-limit":
@@ -455,14 +841,21 @@ class SuiteContractTests(unittest.TestCase):
                     raise run_suite.HarnessFailure("unreported mock detail")
                 return ""
 
-            def write(_fd, _data):
-                raise OSError(errno.EDQUOT, "synthetic quota denial")
+            denial_sent = False
+
+            def write(_fd, data):
+                nonlocal denial_sent
+                if not denial_sent:
+                    denial_sent = True
+                    raise OSError(errno.EDQUOT, "synthetic quota denial")
+                return len(data)
 
             def fsync(_fd):
                 return None
 
             with (
                 patch.object(suite, "quota_command", side_effect=quota),
+                patch_quota_guards(suite),
                 patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):
@@ -489,6 +882,8 @@ class SuiteContractTests(unittest.TestCase):
                 suite, _projects = quota_test_suite(Path(directory))
 
                 def quota(_command, quota_operation, **_kwargs):
+                    if quota_operation == "quota-report":
+                        return quota_report(inode="-i" in _command)
                     return (
                         XFS_PROJECT_QUOTA_ON
                         if quota_operation
@@ -510,6 +905,7 @@ class SuiteContractTests(unittest.TestCase):
 
                 with (
                     patch.object(suite, "quota_command", side_effect=quota),
+                    patch_quota_guards(suite),
                     patch_quota_probe_io(write, fsync),
                     self.assertRaises(run_suite.HarnessFailure),
                 ):
@@ -551,6 +947,7 @@ class SuiteContractTests(unittest.TestCase):
 
             with (
                 patch.object(run_suite, "safe_call", side_effect=safe_call),
+                patch_quota_guards(suite),
                 patch_quota_probe_io(write, fsync),
                 self.assertRaises(run_suite.HarnessFailure),
             ):

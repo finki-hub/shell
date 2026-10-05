@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
 VERSION_LABEL = "org.finki-hub.jupyterhub-version"
@@ -69,6 +69,14 @@ QuotaClassification = Literal[
     "project-enforcement-disabled",
     "quota-exceeded",
     "filesystem-full",
+    "project-assignment-mismatch",
+    "project-inheritance-missing",
+    "quota-report-invalid",
+    "quota-limit-mismatch",
+    "quota-usage-unsafe",
+    "filesystem-capacity-low",
+    "inode-quota-exhausted",
+    "quota-relief-failed",
     "io-error",
     "no-write-progress",
     "limit-not-enforced",
@@ -85,6 +93,17 @@ IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FULL_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 FS_IOC_FSGETXATTR = 0x801C581F
+FS_XFLAG_PROJINHERIT = 0x00000200
+QUOTA_PROJECT_ID = 9999
+QUOTA_BLOCK_LIMIT_KIB = 16 * 1024
+QUOTA_RELIEF_BLOCK_LIMIT_KIB = 32 * 1024
+QUOTA_INODE_LIMIT = 1000
+QUOTA_MAX_INODE_USAGE = 2
+QUOTA_WRITE_BUDGET = 64 * 1024 * 1024
+QUOTA_WRITE_CHUNK = 1024 * 1024
+QUOTA_MIN_FREE_BEFORE = 128 * 1024 * 1024
+QUOTA_MIN_FREE_AFTER = 64 * 1024 * 1024
+QUOTA_MIN_FREE_INODES = 64
 
 
 class HarnessFailure(RuntimeError):
@@ -205,6 +224,7 @@ class Suite:
         self.active_case = ""
         self.failure_context: dict[str, str | int] | None = None
         self.cleanup_failure_context: dict[str, str | int] | None = None
+        self.quota_evidence: dict[str, str | int] | None = None
         self.started = time.monotonic()
         self.stage_deadline = self.started + OVERALL_TEST_TIMEOUT
         self.project_dir: Path | None = None
@@ -949,6 +969,8 @@ class Suite:
         )
         self.active_stage = "xfs-quota-verification"
         self.verify_quota_enforcement()
+        if self.quota_evidence is not None:
+            self.results["quota_verification"] = self.quota_evidence.copy()
         self.record_stage(
             "xfs-project-quota-verified",
             pool_id_sha256=hashlib.sha256(pool_id.encode()).hexdigest(),
@@ -1089,128 +1111,366 @@ class Suite:
     def quota_state(self, operation: Literal["quota-state", "quota-post-state"]) -> str:
         return self.quota_command("state -p", operation)
 
+    @staticmethod
+    def inode_xfs_attributes_fd(fd: int) -> tuple[int, int]:
+        try:
+            import fcntl
+        except ImportError as exc:  # pragma: no cover - Linux runtime only
+            raise HarnessFailure(
+                "XFS inode attributes require Linux ioctl support"
+            ) from exc
+        attributes = bytearray(28)
+        fcntl.ioctl(fd, FS_IOC_FSGETXATTR, attributes, True)
+        xflags, projid = struct.unpack_from("=I8xI", attributes)
+        return projid, xflags
+
+    @classmethod
+    def inode_xfs_attributes(cls, path: Path) -> tuple[int, int]:
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+        )
+        fd = os.open(path, flags)
+        try:
+            return cls.inode_xfs_attributes_fd(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def filesystem_capacity(path: Path) -> tuple[int, int]:
+        stats = os.statvfs(path)
+        return stats.f_bavail * stats.f_frsize, stats.f_favail
+
+    @staticmethod
+    def parse_quota_report(report: str, projid: int) -> tuple[int, int]:
+        lines = report.splitlines()
+        headers = [
+            index
+            for index, line in enumerate(lines)
+            if line.split()[:5] == ["Project", "ID", "Used", "Soft", "Hard"]
+        ]
+        if len(headers) != 1:
+            raise HarnessFailure("XFS project quota report header is invalid")
+        matches: list[tuple[int, int]] = []
+        for line in lines[headers[0] + 1 :]:
+            fields = line.split()
+            if not fields:
+                continue
+            token = fields[0]
+            numeric_prefix = re.fullmatch(r"#?(\d+).*", token)
+            if numeric_prefix is None or int(numeric_prefix.group(1)) != projid:
+                continue
+            if not re.fullmatch(r"#?\d+", token) or len(fields) < 4:
+                raise HarnessFailure("XFS project quota report row is malformed")
+            if any(not re.fullmatch(r"\d+", value) for value in fields[1:4]):
+                raise HarnessFailure("XFS project quota report values are malformed")
+            matches.append((int(fields[1]), int(fields[3])))
+        if len(matches) != 1:
+            raise HarnessFailure(
+                "XFS project quota report row is missing or duplicated"
+            )
+        return matches[0]
+
+    def quota_project_usage(self, projid: int) -> tuple[int, int, int, int]:
+        block_used, block_hard = self.quota_hard_limit(projid, inode=False)
+        inode_used, inode_hard = self.quota_hard_limit(projid, inode=True)
+        return block_used, block_hard, inode_used, inode_hard
+
     def verify_quota_enforcement(self) -> None:
-        assert self.pool is not None
+        pool = self.pool
+        assert pool is not None
+        self.quota_evidence = None
         state = self.quota_state("quota-state")
         state_failure = self.project_quota_state_classification(state)
         if state_failure is not None:
             self.record_quota_failure("quota-state", state_failure)
-            raise HarnessFailure(
-                "XFS project quota state did not prove accounting and enforcement"
-            )
+            raise HarnessFailure("XFS project quota state is not enabled")
 
-        scratch_id = 9999
-        scratch = self.pool / ".integration-quota-probe"
-        projects = self.pool / ".projects"
+        scratch_id = QUOTA_PROJECT_ID
+        scratch = pool / ".integration-quota-probe"
+        projects = pool / ".projects"
         scratch_created = False
         project_map_may_be_modified = False
         limit_may_be_set = False
         original: str | None = None
-        primary_failure: Exception | None = None
+        primary_failure = False
+        probe_fd: int | None = None
+        successful_bytes = 0
+        denial_errno: int | None = None
+        denial_phase: str | None = None
+
+        def fail(
+            operation: QuotaOperation,
+            classification: QuotaClassification,
+            error_number: int | None = None,
+            details: dict[str, int] | None = None,
+        ) -> NoReturn:
+            self.record_quota_failure(
+                operation, classification, error_number=error_number
+            )
+            if details and self.failure_context is not None:
+                self.failure_context.update(details)
+            raise HarnessFailure("bounded XFS project quota verification failed")
+
+        def require_project(path: Path, *, inherit: bool) -> None:
+            try:
+                projid, xflags = self.inode_xfs_attributes(path)
+            except (OSError, HarnessFailure):
+                fail("quota-project", "project-assignment-mismatch")
+            if projid != scratch_id:
+                fail("quota-project", "project-assignment-mismatch")
+            if inherit and not xflags & FS_XFLAG_PROJINHERIT:
+                fail("quota-project", "project-inheritance-missing")
+
+        def capacity(*, after: bool) -> tuple[int, int]:
+            try:
+                free_bytes, free_inodes = self.filesystem_capacity(pool)
+            except OSError as exc:
+                fail(
+                    "quota-write",
+                    self.quota_os_classification(exc.errno),
+                    exc.errno if isinstance(exc.errno, int) else None,
+                )
+            minimum = QUOTA_MIN_FREE_AFTER if after else QUOTA_MIN_FREE_BEFORE
+            if free_bytes < minimum or free_inodes < QUOTA_MIN_FREE_INODES:
+                fail(
+                    "quota-write",
+                    "filesystem-capacity-low",
+                    details={"free_bytes": free_bytes, "free_inodes": free_inodes},
+                )
+            return free_bytes, free_inodes
+
         try:
             try:
-                scratch.mkdir(mode=0o700)
-                scratch_created = True
-            except OSError as exc:
-                self.record_quota_failure(
-                    "quota-write",
-                    "scratch-create-failed",
-                    error_number=exc.errno if isinstance(exc.errno, int) else None,
-                )
-                raise HarnessFailure(
-                    "bounded XFS quota probe could not create scratch"
-                ) from None
+                root_project, root_flags = self.inode_xfs_attributes(pool)
+            except (OSError, HarnessFailure):
+                fail("quota-project", "project-assignment-mismatch")
+            if root_project != 0 or root_flags & FS_XFLAG_PROJINHERIT:
+                fail("quota-project", "project-assignment-mismatch")
+            free_before, inodes_before = capacity(after=False)
+
             try:
                 original = projects.read_text(encoding="utf-8")
             except OSError as exc:
-                self.record_quota_failure(
+                fail(
                     "quota-project",
                     "project-map-read-failed",
-                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                    exc.errno if isinstance(exc.errno, int) else None,
                 )
-                raise HarnessFailure(
-                    "bounded XFS quota probe could not read project map"
-                ) from None
-
             try:
+                scratch.mkdir(mode=0o700)
+                scratch_created = True
                 project_map_may_be_modified = True
                 projects.write_text(
                     original + f"{scratch_id}:{scratch}\n", encoding="utf-8"
                 )
             except OSError as exc:
-                self.record_quota_failure(
+                fail(
                     "quota-project",
                     "project-map-write-failed",
-                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                    exc.errno if isinstance(exc.errno, int) else None,
                 )
-                raise HarnessFailure(
-                    "bounded XFS quota probe could not update project map"
-                ) from None
             self.quota_command(f"project -s -p {scratch} {scratch_id}", "quota-project")
+            require_project(scratch, inherit=True)
             limit_may_be_set = True
             self.quota_command(
                 f"limit -p bhard=16m ihard=1000 {scratch_id}", "quota-limit"
             )
+            block_used, block_hard, inode_used, inode_hard = self.quota_project_usage(
+                scratch_id
+            )
+            if block_hard != QUOTA_BLOCK_LIMIT_KIB or inode_hard != QUOTA_INODE_LIMIT:
+                fail(
+                    "quota-report",
+                    "quota-limit-mismatch",
+                    details={"block_hard_kib": block_hard, "inode_hard": inode_hard},
+                )
+            if inode_used >= QUOTA_INODE_LIMIT:
+                fail(
+                    "quota-report",
+                    "inode-quota-exhausted",
+                    details={"inode_used": inode_used, "inode_hard": inode_hard},
+                )
+            if inode_used > QUOTA_MAX_INODE_USAGE:
+                fail(
+                    "quota-report",
+                    "quota-usage-unsafe",
+                    details={"inode_used": inode_used, "inode_hard": inode_hard},
+                )
+            if block_used >= QUOTA_BLOCK_LIMIT_KIB:
+                fail(
+                    "quota-report",
+                    "quota-usage-unsafe",
+                    details={
+                        "block_used_kib": block_used,
+                        "block_hard_kib": block_hard,
+                    },
+                )
+
+            capacity(after=False)
             blob = scratch / "probe.bin"
             try:
-                fd = os.open(blob, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+                probe_fd = os.open(blob, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
             except OSError as exc:
-                self.record_quota_failure(
+                fail(
                     "quota-write",
                     self.quota_os_classification(exc.errno),
-                    error_number=exc.errno if isinstance(exc.errno, int) else None,
+                    exc.errno if isinstance(exc.errno, int) else None,
                 )
-                raise HarnessFailure(
-                    "bounded XFS quota probe could not open scratch file"
-                ) from None
-
-            saw_edquot = False
             try:
-                block = b"\0" * (1024 * 1024)
-                remaining = 64 * 1024 * 1024
-                while remaining:
+                file_project, _file_flags = self.inode_xfs_attributes_fd(probe_fd)
+            except (OSError, HarnessFailure):
+                fail("quota-write", "project-assignment-mismatch")
+            if file_project != scratch_id:
+                fail("quota-write", "project-assignment-mismatch")
+
+            initial_write_budget = QUOTA_WRITE_BUDGET - QUOTA_WRITE_CHUNK
+            while successful_bytes < initial_write_budget and denial_errno is None:
+                chunk_size = min(
+                    QUOTA_WRITE_CHUNK, initial_write_budget - successful_bytes
+                )
+                chunk = memoryview(b"\0" * chunk_size)
+                written_in_chunk = 0
+                while written_in_chunk < chunk_size:
                     try:
-                        written = os.write(fd, block[: min(len(block), remaining)])
+                        written = os.write(probe_fd, chunk[written_in_chunk:])
                     except OSError as exc:
-                        if exc.errno == errno.EDQUOT:
-                            saw_edquot = True
+                        if exc.errno in (errno.EDQUOT, errno.ENOSPC):
+                            denial_errno = exc.errno
+                            denial_phase = "quota-write"
                             break
-                        self.record_quota_failure(
+                        fail(
                             "quota-write",
                             self.quota_os_classification(exc.errno),
-                            error_number=exc.errno
-                            if isinstance(exc.errno, int)
-                            else None,
+                            exc.errno if isinstance(exc.errno, int) else None,
                         )
-                        raise HarnessFailure(
-                            "bounded XFS quota probe write failed"
-                        ) from None
                     if written <= 0:
-                        self.record_quota_failure("quota-write", "no-write-progress")
-                        raise HarnessFailure(
-                            "bounded XFS quota probe made no write progress"
-                        )
-                    remaining -= written
-                if not saw_edquot:
-                    try:
-                        os.fsync(fd)
-                    except OSError as exc:
-                        if exc.errno == errno.EDQUOT:
-                            saw_edquot = True
-                        else:
-                            self.record_quota_failure(
-                                "quota-fsync",
-                                self.quota_os_classification(exc.errno),
-                                error_number=exc.errno
-                                if isinstance(exc.errno, int)
-                                else None,
-                            )
-                            raise HarnessFailure(
-                                "bounded XFS quota probe fsync failed"
-                            ) from None
-            finally:
+                        fail("quota-write", "no-write-progress")
+                    written_in_chunk += written
+                    successful_bytes += written
+                if denial_errno is not None:
+                    break
                 try:
-                    os.close(fd)
+                    os.fsync(probe_fd)
+                except OSError as exc:
+                    if exc.errno in (errno.EDQUOT, errno.ENOSPC):
+                        denial_errno = exc.errno
+                        denial_phase = "quota-fsync"
+                        break
+                    fail(
+                        "quota-fsync",
+                        self.quota_os_classification(exc.errno),
+                        exc.errno if isinstance(exc.errno, int) else None,
+                    )
+
+            if denial_errno is None or denial_phase is None:
+                fail("quota-write", "limit-not-enforced")
+
+            require_project(scratch, inherit=True)
+            try:
+                file_project, _file_flags = self.inode_xfs_attributes_fd(probe_fd)
+            except (OSError, HarnessFailure):
+                fail("quota-write", "project-assignment-mismatch")
+            if file_project != scratch_id:
+                fail("quota-write", "project-assignment-mismatch")
+            free_after, inodes_after = capacity(after=True)
+            block_used, block_hard, inode_used, inode_hard = self.quota_project_usage(
+                scratch_id
+            )
+            if block_hard != QUOTA_BLOCK_LIMIT_KIB or inode_hard != QUOTA_INODE_LIMIT:
+                fail(
+                    "quota-report",
+                    "quota-limit-mismatch",
+                    details={"block_hard_kib": block_hard, "inode_hard": inode_hard},
+                )
+            if inode_used >= QUOTA_INODE_LIMIT:
+                fail(
+                    "quota-report",
+                    "inode-quota-exhausted",
+                    details={"inode_used": inode_used, "inode_hard": inode_hard},
+                )
+            if inode_used > QUOTA_MAX_INODE_USAGE:
+                fail(
+                    "quota-report",
+                    "quota-usage-unsafe",
+                    details={"inode_used": inode_used, "inode_hard": inode_hard},
+                )
+            if block_used >= block_hard:
+                fail(
+                    "quota-report",
+                    "quota-usage-unsafe",
+                    details={
+                        "block_used_kib": block_used,
+                        "block_hard_kib": block_hard,
+                    },
+                )
+
+            self.quota_command(
+                f"limit -p bhard=32m ihard=1000 {scratch_id}", "quota-limit"
+            )
+            (
+                block_used_relief,
+                block_hard_relief,
+                inode_used_relief,
+                inode_hard_relief,
+            ) = self.quota_project_usage(scratch_id)
+            if (
+                block_hard_relief != QUOTA_RELIEF_BLOCK_LIMIT_KIB
+                or inode_hard_relief != QUOTA_INODE_LIMIT
+                or inode_used_relief >= QUOTA_INODE_LIMIT
+                or inode_used_relief > QUOTA_MAX_INODE_USAGE
+                or block_used_relief >= block_hard_relief
+            ):
+                fail(
+                    "quota-report",
+                    "quota-limit-mismatch",
+                    details={
+                        "block_used_kib": block_used_relief,
+                        "block_hard_kib": block_hard_relief,
+                        "inode_used": inode_used_relief,
+                        "inode_hard": inode_hard_relief,
+                    },
+                )
+            relief_bytes = 0
+            try:
+                os.lseek(probe_fd, 0, os.SEEK_END)
+                relief = memoryview(b"\0" * QUOTA_WRITE_CHUNK)
+                while relief_bytes < QUOTA_WRITE_CHUNK:
+                    written = os.write(probe_fd, relief[relief_bytes:])
+                    if written <= 0:
+                        fail("quota-write", "no-write-progress")
+                    relief_bytes += written
+                os.fsync(probe_fd)
+            except OSError as exc:
+                fail(
+                    "quota-write",
+                    "quota-relief-failed",
+                    exc.errno if isinstance(exc.errno, int) else None,
+                )
+            free_after_relief, inodes_after_relief = capacity(after=True)
+            self.quota_evidence = {
+                "classification": "project-quota-enforced",
+                "phase": denial_phase,
+                "errno": denial_errno,
+                "successful_bytes_before_denial": successful_bytes,
+                "block_used_kib_before_relief": block_used,
+                "block_hard_kib_before_relief": block_hard,
+                "inode_used_before_relief": inode_used,
+                "inode_hard_before_relief": inode_hard,
+                "free_bytes_before": free_before,
+                "free_inodes_before": inodes_before,
+                "free_bytes_after_denial": free_after,
+                "free_inodes_after_denial": inodes_after,
+                "relief_block_hard_kib": block_hard_relief,
+                "relief_bytes": relief_bytes,
+                "free_bytes_after_relief": free_after_relief,
+                "free_inodes_after_relief": inodes_after_relief,
+            }
+        except Exception:
+            primary_failure = True
+        finally:
+            if probe_fd is not None:
+                try:
+                    os.close(probe_fd)
                 except OSError as exc:
                     if self.failure_context is None:
                         self.record_quota_failure(
@@ -1220,18 +1480,7 @@ class Suite:
                             if isinstance(exc.errno, int)
                             else None,
                         )
-            if self.failure_context is not None and self.failure_context.get(
-                "operation"
-            ) in {
-                "quota-write",
-                "quota-fsync",
-            }:
-                raise HarnessFailure("bounded XFS quota probe I/O failed")
-            if not saw_edquot:
-                self.record_quota_failure("quota-write", "limit-not-enforced")
-                raise HarnessFailure("XFS project quota probe did not return EDQUOT")
-        except Exception as exc:
-            primary_failure = exc
+                        primary_failure = True
 
         if limit_may_be_set:
             try:
@@ -1264,7 +1513,7 @@ class Suite:
                     cleanup_phase="project-map-restore",
                 )
 
-        if primary_failure is not None:
+        if primary_failure:
             raise HarnessFailure(
                 "bounded XFS project quota verification failed"
             ) from None
@@ -1279,9 +1528,7 @@ class Suite:
         state_failure = self.project_quota_state_classification(state)
         if state_failure is not None:
             self.record_quota_failure("quota-post-state", state_failure)
-            raise HarnessFailure(
-                "XFS project quota state changed after enforcement probe"
-            )
+            raise HarnessFailure("XFS project quota state changed after probe")
 
     def archive_source(self, revision: str, destination: Path) -> Path:
         assert self.run_root is not None
@@ -2244,38 +2491,18 @@ class Suite:
         report = self.quota_command(
             "report -p -i -n" if inode else "report -p -b -n", "quota-report"
         )
-        for line in report.splitlines():
-            fields = line.split()
-            if not fields:
-                continue
-            match = re.match(r"#?(\d+)", fields[0])
-            if not match or int(match.group(1)) != projid:
-                continue
-            numeric = [int(value) for value in fields[1:] if value.isdigit()]
-            if len(numeric) < 3:
-                continue
-            # report columns are Used, Soft, Hard; output is private and never logged.
-            return numeric[0], numeric[2]
-        raise HarnessFailure("xfs_quota did not report a fixture project")
+        try:
+            return self.parse_quota_report(report, projid)
+        except HarnessFailure:
+            self.record_quota_failure("quota-report", "quota-report-invalid")
+            raise HarnessFailure(
+                "XFS project quota report did not prove fixture limits"
+            ) from None
 
     @staticmethod
     def inode_project_id(path: Path) -> int:
-        try:
-            import fcntl
-        except ImportError as exc:  # pragma: no cover - full runtime is Linux-only
-            raise HarnessFailure(
-                "XFS inode project ID requires Linux ioctl support"
-            ) from exc
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            attributes = bytearray(28)
-            fcntl.ioctl(descriptor, FS_IOC_FSGETXATTR, attributes, True)
-            return struct.unpack_from("=I", attributes, 12)[0]
-        finally:
-            os.close(descriptor)
+        projid, _xflags = Suite.inode_xfs_attributes(path)
+        return projid
 
     @classmethod
     def verify_inode_project_id(cls, path: Path, expected: int) -> int:
