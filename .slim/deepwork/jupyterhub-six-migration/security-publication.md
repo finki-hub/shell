@@ -24,3 +24,21 @@ access, SSH, or review/comment action was performed. No Docker proof is claimed.
 Only explicitly intended source files and this publication artifact are staged.
 Local `.gitignore`, `.ignore`, integration remediation memo and all other
 ignored/local metadata are excluded and preserved.
+
+## Bounded loop diagnostics follow-up
+
+- Diagnostic source commit: `5088918cb2644e1aa310e57ae91b1c702c71aefc`
+  (`test: add sanitized XFS setup failure diagnostics`), pushed to the same PR17
+  branch without changing the workflow gate.
+- On that exact source SHA, migration `checks` passed in
+  [run 37381970039](https://github.com/finki-hub/shell/actions/runs/37381970039).
+  CodeQL and all three Analyze jobs passed; branch build, Hub test, lint, and
+  typecheck checks also passed. The migration integration job was skipped while
+  the runtime label was absent.
+- After those gates passed, the explicitly authorized disposable runtime label
+  was applied and triggered [attempt 2](https://github.com/finki-hub/shell/actions/runs/37382187949).
+  It failed at `xfs-quota-verification` before acceptance cases; the structured
+  result had no `failure_context`, so the cause remains unknown. Cleanup was
+  reported verified. See `runtime-attempt2.md` for the sanitized evidence.
+- The runtime label was removed after the terminal failure. No runtime approval,
+  migration success, or production evidence is claimed.
