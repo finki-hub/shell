@@ -319,7 +319,10 @@ class AcceptanceBoundaryTests(unittest.TestCase):
                     ],
                     "environment": {"LAB_IMAGE": "sha256:old-lab"},
                 },
-                "lab": {"image": "sha256:old-lab"},
+                "lab": {
+                    "image": "sha256:old-lab",
+                    "networks": {"users": {}},
+                },
             },
         }
 

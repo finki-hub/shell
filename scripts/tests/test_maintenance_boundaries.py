@@ -293,7 +293,7 @@ class MaintenanceBoundaryTests(unittest.TestCase):
                             },
                         ],
                     },
-                    "lab": {},
+                    "lab": {"networks": {"users": {}}},
                 },
             }
             events: list[tuple[str, ...]] = []
@@ -384,7 +384,7 @@ class MaintenanceBoundaryTests(unittest.TestCase):
                             },
                         ],
                     },
-                    "lab": {},
+                    "lab": {"networks": {"users": {}}},
                 },
             }
             foreign: dict[str, Any] = {

@@ -436,7 +436,9 @@ class Controller:
 
     def _load_config(self) -> None:
         try:
-            self.config = json.loads(self._compose("config", "--format", "json"))
+            self.config = json.loads(
+                self._compose("--profile", "images", "config", "--format", "json")
+            )
         except json.JSONDecodeError as exc:
             raise MaintenanceError(
                 "Compose returned invalid effective configuration"
@@ -458,6 +460,11 @@ class Controller:
             or users_network.get("name") != "finki-hub-shell-users"
         ):
             raise MaintenanceError("unsupported external Lab network configuration")
+        lab_networks = services["lab"].get("networks") or {}
+        if set(lab_networks) != {"users"}:
+            raise MaintenanceError(
+                "Lab service must use only the configured external users network"
+            )
         if (
             services["web"].get("network_mode") != "host"
             or services["proxy"].get("network_mode") != "host"
