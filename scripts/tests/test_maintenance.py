@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -340,6 +342,187 @@ class MaintenanceControllerTests(unittest.TestCase):
         }
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def _main_arguments(self, operation: str, root: Path) -> list[str]:
+        project = root / "project"
+        project.mkdir(parents=True, exist_ok=True)
+        env_file = root / "environment.env"
+        env_file.write_text("FIXTURE=nonsecret\n", encoding="utf-8")
+        compose_file = root / "compose.yaml"
+        compose_file.write_text("services: {}\n", encoding="utf-8")
+        return [
+            operation,
+            "--project-directory",
+            str(project),
+            "--project-name",
+            "test-project",
+            "--env-file",
+            str(env_file),
+            "--compose-file",
+            str(compose_file),
+            "--backup-dir",
+            str(root / "backup"),
+        ]
+
+    def _invoke_main(
+        self, operation: str, *, extra: tuple[str, ...] = ()
+    ) -> tuple[int, str, str]:
+        root = self.root / operation
+        root.mkdir(exist_ok=True)
+        args = self._main_arguments(operation, root)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(os.environ, {"UPDATE_LOCK_FILE": str(root / "lock")}),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = maintenance.main([*args, *extra])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_main_preflight_dispatches_bound_method_without_namespace(self) -> None:
+        with patch.object(
+            maintenance.Controller,
+            "_load_config",
+            side_effect=maintenance.MaintenanceError(
+                "Compose configuration is missing a required service"
+            ),
+        ):
+            status, stdout, stderr = self._invoke_main("preflight")
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {
+                "status": "failed",
+                "operation": "preflight",
+                "phase": "configuration",
+                "classification": "required-service-missing",
+                "error": "Compose configuration is missing a required service",
+            },
+        )
+
+    def test_main_passes_arguments_to_guarded_operations(self) -> None:
+        for operation in ("migrate", "accept", "restore"):
+            with self.subTest(operation=operation):
+                status, stdout, stderr = self._invoke_main(operation)
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                diagnostic = json.loads(stderr)
+                self.assertEqual(
+                    set(diagnostic),
+                    {"status", "operation", "phase", "classification", "error"},
+                )
+                self.assertEqual(diagnostic["status"], "failed")
+                self.assertEqual(diagnostic["operation"], operation)
+                self.assertEqual(diagnostic["phase"], "dispatch")
+                self.assertEqual(diagnostic["classification"], "maintenance-error")
+                self.assertEqual(diagnostic["error"], "maintenance operation failed")
+
+    def test_acceptance_refusal_preserves_canonical_error(self) -> None:
+        status, stdout, stderr = self._invoke_main(
+            "accept",
+            extra=(
+                "--acknowledge-interruption",
+                "--acknowledge-ingress-fenced",
+                "--acknowledge-updater-paused",
+            ),
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {
+                "status": "failed",
+                "operation": "accept",
+                "phase": "dispatch",
+                "classification": "acceptance-not-acknowledged",
+                "error": "accept requires the explicit --acceptance-passed acknowledgment",
+            },
+        )
+
+    def test_successful_preflight_output_remains_unchanged(self) -> None:
+        with patch.object(
+            maintenance.Controller, "_preflight", return_value={"ok": True}
+        ):
+            status, stdout, stderr = self._invoke_main("preflight")
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout, '{"ok": true}\n')
+        self.assertEqual(stderr, "")
+
+    def test_closed_diagnostic_classifies_only_exact_known_errors(self) -> None:
+        expected = {
+            "Compose configuration is missing a required service": "required-service-missing",
+            "unsupported external Lab network configuration": "network-topology-mismatch",
+            "Compose Hub binds or networking differ from the protected deployment": "hub-shape-mismatch",
+            "running Hub and its selected Lab image are not version-matched": "running-pair-mismatch",
+            "candidate Hub and Lab image versions do not match": "candidate-pair-mismatch",
+            "possible Lab has an unexpected or ambiguous home bind": "lab-home-mismatch",
+            "backup parent directory must already exist": "backup-parent-missing",
+            "bounded external command failed": "external-command-failed",
+            "accept requires the explicit --acceptance-passed acknowledgment": "acceptance-not-acknowledged",
+        }
+        for error, classification in expected.items():
+            with self.subTest(classification=classification):
+                diagnostic = maintenance._failure_diagnostic(
+                    maintenance.MaintenanceError(error),
+                    operation="preflight",
+                    phase="configuration",
+                )
+                self.assertEqual(diagnostic["classification"], classification)
+                self.assertEqual(diagnostic["error"], error)
+        near_match = maintenance._failure_diagnostic(
+            maintenance.MaintenanceError(
+                "prefix: Compose configuration is missing a required service"
+            ),
+            operation="preflight",
+            phase="configuration",
+        )
+        self.assertEqual(near_match["classification"], "maintenance-error")
+        self.assertEqual(near_match["error"], "maintenance operation failed")
+        invalid_context = maintenance._failure_diagnostic(
+            maintenance.MaintenanceError("synthetic private failure"),
+            operation="not-a-parser-operation",
+            phase="C:\\private\\synthetic-path",
+        )
+        self.assertEqual(invalid_context["operation"], "preflight")
+        self.assertEqual(invalid_context["phase"], "dispatch")
+        self.assertLessEqual(
+            len(json.dumps(invalid_context).encode("utf-8")), 64 * 1024
+        )
+
+    def test_unknown_failure_text_is_never_emitted(self) -> None:
+        secret = "CONFIGPROXY_AUTH_TOKEN=synthetic-diagnostic-test-secret"
+
+        class OpaqueError(Exception):
+            def __str__(self) -> str:
+                raise AssertionError("unexpected exception text must not be read")
+
+        for error, classification, safe_text in (
+            (
+                maintenance.MaintenanceError(secret),
+                "maintenance-error",
+                "maintenance operation failed",
+            ),
+            (OSError(secret), "unexpected-error", "unexpected maintenance failure"),
+            (OpaqueError(secret), "unexpected-error", "unexpected maintenance failure"),
+        ):
+            with self.subTest(classification=classification, kind=type(error).__name__):
+                with patch.object(
+                    maintenance.Controller, "__init__", side_effect=error
+                ):
+                    status, stdout, stderr = self._invoke_main("preflight")
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                self.assertNotIn(secret, stderr)
+                diagnostic = json.loads(stderr)
+                self.assertEqual(
+                    set(diagnostic),
+                    {"status", "operation", "phase", "classification", "error"},
+                )
+                self.assertEqual(diagnostic["phase"], "initialize")
+                self.assertEqual(diagnostic["classification"], classification)
+                self.assertEqual(diagnostic["error"], safe_text)
 
     def test_missing_acknowledgments_cause_no_controller_activity(self) -> None:
         controller = MigrationHarness(self.root)

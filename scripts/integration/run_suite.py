@@ -169,6 +169,49 @@ class CommandFailure(HarnessFailure):
         self.returncode = returncode
 
 
+def parse_maintenance_helper_failure(
+    stderr: bytes, *, expected_operation: str
+) -> dict[str, str]:
+    """Parse only the helper's bounded, fixed-vocabulary failure envelope."""
+    if (
+        type(stderr) is not bytes
+        or expected_operation not in MAINTENANCE_HELPER_OPERATIONS
+        or len(stderr) > MAINTENANCE_HELPER_MAX_STDERR
+    ):
+        raise HarnessFailure("helper-result-invalid")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(stderr.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise HarnessFailure("helper-result-invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"status", "operation", "phase", "classification", "error"}
+        or payload.get("status") != "failed"
+        or payload.get("operation") != expected_operation
+        or not isinstance(payload.get("phase"), str)
+        or payload["phase"] not in MAINTENANCE_HELPER_PHASES
+        or not isinstance(payload.get("classification"), str)
+        or payload["classification"] not in MAINTENANCE_HELPER_ERRORS
+        or not isinstance(payload.get("error"), str)
+        or payload["error"] != MAINTENANCE_HELPER_ERRORS[payload["classification"]]
+    ):
+        raise HarnessFailure("helper-result-invalid")
+    return {
+        "operation": payload["operation"],
+        "phase": payload["phase"],
+        "classification": payload["classification"],
+    }
+
+
 def digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as stream:
@@ -332,6 +375,36 @@ DB_CONTEXT_CLASSIFICATIONS = {
     "operation-failed",
     "owned-container-cleanup-incomplete",
     "fixture-cleanup-incomplete",
+}
+
+MAINTENANCE_HELPER_MAX_STDERR = 64 * 1024
+MAINTENANCE_HELPER_OPERATIONS = {"preflight", "migrate", "restore", "accept"}
+MAINTENANCE_HELPER_PHASES = {
+    "initialize",
+    "lock",
+    "dispatch",
+    "configuration",
+    "daemon-inventory",
+    "service-identity",
+    "runtime-environment",
+    "running-version",
+    "old-lab-version",
+    "candidate-images",
+    "lab-ownership",
+    "backup-location",
+}
+MAINTENANCE_HELPER_ERRORS = {
+    "required-service-missing": "Compose configuration is missing a required service",
+    "network-topology-mismatch": "unsupported external Lab network configuration",
+    "hub-shape-mismatch": "Compose Hub binds or networking differ from the protected deployment",
+    "running-pair-mismatch": "running Hub and its selected Lab image are not version-matched",
+    "candidate-pair-mismatch": "candidate Hub and Lab image versions do not match",
+    "lab-home-mismatch": "possible Lab has an unexpected or ambiguous home bind",
+    "backup-parent-missing": "backup parent directory must already exist",
+    "external-command-failed": "bounded external command failed",
+    "maintenance-error": "maintenance operation failed",
+    "unexpected-error": "unexpected maintenance failure",
+    "acceptance-not-acknowledged": "accept requires the explicit --acceptance-passed acknowledgment",
 }
 
 
@@ -3570,8 +3643,34 @@ class Suite:
             capture=True,
         )
         if result.returncode:
-            # helper emits sanitized JSON errors. Do not copy command output to CI logs.
-            raise HarnessFailure(f"shipping maintenance helper {verb} failed")
+            helper_operation = verb if verb in MAINTENANCE_HELPER_OPERATIONS else None
+            returncode = (
+                result.returncode
+                if type(result.returncode) is int and -255 <= result.returncode <= 255
+                else None
+            )
+            try:
+                if helper_operation is None or returncode is None:
+                    raise HarnessFailure("helper-result-invalid")
+                child = parse_maintenance_helper_failure(
+                    result.stderr or b"", expected_operation=helper_operation
+                )
+            except HarnessFailure:
+                context: dict[str, str | int] = {
+                    "operation": f"maintenance-{verb}",
+                    "classification": "helper-result-invalid",
+                }
+            else:
+                context = {
+                    "operation": f"maintenance-{verb}",
+                    "helper_operation": child["operation"],
+                    "phase": child["phase"],
+                    "classification": child["classification"],
+                }
+            if returncode is not None:
+                context["returncode"] = returncode
+            self.failure_context = context
+            raise HarnessFailure(f"shipping maintenance helper {verb} failed") from None
         try:
             output = json.loads((result.stdout or b"").decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -3702,15 +3801,36 @@ class Suite:
             env=env,
             capture=True,
         )
+        if type(result.returncode) is not int or not -255 <= result.returncode <= 255:
+            self.failure_context = {
+                "operation": "maintenance-accept",
+                "classification": "helper-result-invalid",
+            }
+            raise HarnessFailure("unasserted accept returned invalid helper result")
         try:
-            payload = json.loads((result.stderr or b"").decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
+            payload = parse_maintenance_helper_failure(
+                result.stderr or b"", expected_operation="accept"
+            )
+        except HarnessFailure:
+            self.failure_context = {
+                "operation": "maintenance-accept",
+                "classification": "helper-result-invalid",
+                "returncode": result.returncode,
+            }
             raise HarnessFailure(
-                "unasserted accept returned no sanitized refusal"
-            ) from exc
-        if result.returncode == 0 or "--acceptance-passed" not in payload.get(
-            "error", ""
+                "unasserted accept returned invalid helper result"
+            ) from None
+        if (
+            result.returncode == 0
+            or payload["classification"] != "acceptance-not-acknowledged"
         ):
+            self.failure_context = {
+                "operation": "maintenance-accept",
+                "helper_operation": payload["operation"],
+                "phase": payload["phase"],
+                "classification": payload["classification"],
+                "returncode": result.returncode,
+            }
             raise HarnessFailure("maintenance helper accepted without the gate")
         web_ids = self.compose_ids("web")
         proxy_ids = self.compose_ids("proxy")

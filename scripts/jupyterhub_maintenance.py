@@ -34,6 +34,71 @@ COMMAND_TIMEOUT = 30
 START_TIMEOUT = 180
 STOP_TIMEOUT = 60
 SERVICES = ("web", "proxy", "hub")
+FAILURE_PHASES = (
+    "initialize",
+    "lock",
+    "dispatch",
+    "configuration",
+    "daemon-inventory",
+    "service-identity",
+    "runtime-environment",
+    "running-version",
+    "old-lab-version",
+    "candidate-images",
+    "lab-ownership",
+    "backup-location",
+)
+FAILURE_CLASSIFICATIONS = (
+    "required-service-missing",
+    "network-topology-mismatch",
+    "hub-shape-mismatch",
+    "running-pair-mismatch",
+    "candidate-pair-mismatch",
+    "lab-home-mismatch",
+    "backup-parent-missing",
+    "external-command-failed",
+    "acceptance-not-acknowledged",
+    "maintenance-error",
+    "unexpected-error",
+)
+SAFE_FAILURES = {
+    "Compose configuration is missing a required service": (
+        "required-service-missing",
+        "Compose configuration is missing a required service",
+    ),
+    "unsupported external Lab network configuration": (
+        "network-topology-mismatch",
+        "unsupported external Lab network configuration",
+    ),
+    "Compose Hub binds or networking differ from the protected deployment": (
+        "hub-shape-mismatch",
+        "Compose Hub binds or networking differ from the protected deployment",
+    ),
+    "running Hub and its selected Lab image are not version-matched": (
+        "running-pair-mismatch",
+        "running Hub and its selected Lab image are not version-matched",
+    ),
+    "candidate Hub and Lab image versions do not match": (
+        "candidate-pair-mismatch",
+        "candidate Hub and Lab image versions do not match",
+    ),
+    "possible Lab has an unexpected or ambiguous home bind": (
+        "lab-home-mismatch",
+        "possible Lab has an unexpected or ambiguous home bind",
+    ),
+    "backup parent directory must already exist": (
+        "backup-parent-missing",
+        "backup parent directory must already exist",
+    ),
+    "bounded external command failed": (
+        "external-command-failed",
+        "bounded external command failed",
+    ),
+    "accept requires the explicit --acceptance-passed acknowledgment": (
+        "acceptance-not-acknowledged",
+        "accept requires the explicit --acceptance-passed acknowledgment",
+    ),
+}
 
 
 class MaintenanceError(RuntimeError):
@@ -346,6 +411,7 @@ class Controller:
         self.owned_labs: list[dict[str, Any]] = []
         self._image_config_cache: dict[str, dict[str, Any]] = {}
         self.daemon_id = ""
+        self.failure_phase = "dispatch"
 
     @staticmethod
     def _system_command(args: Sequence[str], timeout: float, check: bool = True) -> str:
@@ -946,9 +1012,12 @@ class Controller:
                     )
 
     def _record_configuration(self) -> dict[str, Any]:
+        self.failure_phase = "configuration"
         self._load_config()
+        self.failure_phase = "daemon-inventory"
         self._daemon()
         containers = self._all_containers()
+        self.failure_phase = "service-identity"
         services = {name: self._service_container(name) for name in SERVICES}
         self.service_containers = services
         hub = services["hub"]
@@ -962,7 +1031,9 @@ class Controller:
                 raise MaintenanceError(
                     f"running {service} image cannot be recorded immutably"
                 )
+        self.failure_phase = "running-version"
         hub_version = self._metadata_from_running_hub(hub)
+        self.failure_phase = "runtime-environment"
         for service, item in services.items():
             self._verify_runtime_environment(service, item, hub_version=hub_version)
         environment = self._hub_environment(hub)
@@ -972,6 +1043,7 @@ class Controller:
             raise MaintenanceError(
                 "running Hub does not expose its selected Lab reference"
             )
+        self.failure_phase = "old-lab-version"
         old_lab = self._image(old_lab_ref)
         old_lab_id = old_lab.get("Id", "")
         old_lab_version = self._probe_lab_image(old_lab_id)
@@ -979,6 +1051,7 @@ class Controller:
             raise MaintenanceError(
                 "running Hub and its selected Lab image are not version-matched"
             )
+        self.failure_phase = "candidate-images"
         candidate_hub_ref, candidate_hub_id, candidate_hub_version = (
             self._candidate_image("hub")
         )
@@ -997,6 +1070,7 @@ class Controller:
             raise MaintenanceError(
                 "Hub LAB_POOL_DIR does not match the configured pool bind"
             )
+        self.failure_phase = "lab-ownership"
         self.owned_labs = self._validate_labs(
             containers,
             pool=configured_pool,
@@ -1075,7 +1149,9 @@ class Controller:
             )
 
     def _validate_input_binding(self, marker: dict[str, Any]) -> None:
+        self.failure_phase = "configuration"
         self._load_config()
+        self.failure_phase = "daemon-inventory"
         self._daemon()
         expected = marker.get("manifest", {})
         requested_paths = [str(path) for path in (*self.compose_files, self.env_file)]
@@ -1144,10 +1220,13 @@ class Controller:
         self.manifest["configuration_snapshots"] = records
 
     def _preflight(self, *, new_backup: bool) -> dict[str, Any]:
+        self.failure_phase = "configuration"
         self._load_config()
         manifest = self._record_configuration()
         self.manifest = manifest
+        self.failure_phase = "backup-location"
         self._validate_backup_location(must_be_new=new_backup)
+        self.failure_phase = "configuration"
         # Reject unexplained bind/network/service settings instead of guessing.
         services = self.config["services"]
         if set(services) != {"web", "proxy", "hub", "lab"}:
@@ -1183,6 +1262,7 @@ class Controller:
         }
 
     def preflight(self) -> dict[str, Any]:
+        self.failure_phase = "configuration"
         marker = self._marker_state()
         if marker:
             raise MaintenanceError(
@@ -1935,6 +2015,32 @@ def _safe_failure(exc: Exception) -> str:
     return "unexpected bounded maintenance failure"
 
 
+def _failure_diagnostic(
+    exc: Exception, *, operation: str, phase: str
+) -> dict[str, str]:
+    allowed_operations = ("preflight", "migrate", "accept", "restore")
+    safe_operation = operation if operation in allowed_operations else "preflight"
+    safe_phase = phase if phase in FAILURE_PHASES else "dispatch"
+    if isinstance(exc, MaintenanceError):
+        classification, error = SAFE_FAILURES.get(
+            str(exc), ("maintenance-error", "maintenance operation failed")
+        )
+    else:
+        classification, error = (
+            "unexpected-error",
+            "unexpected maintenance failure",
+        )
+    if classification not in FAILURE_CLASSIFICATIONS:
+        classification, error = "unexpected-error", "unexpected maintenance failure"
+    return {
+        "status": "failed",
+        "operation": safe_operation,
+        "phase": safe_phase,
+        "classification": classification,
+        "error": error,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fail-closed JupyterHub maintenance")
     parser.add_argument(
@@ -1955,6 +2061,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    phase = "initialize"
+    controller: Controller | None = None
     try:
         controller = Controller(
             project_directory=args.project_directory,
@@ -1963,22 +2071,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             compose_files=args.compose_file,
             backup_dir=args.backup_dir,
         )
+        phase = "lock"
+        controller.failure_phase = phase
         lock = Path(os.environ.get("UPDATE_LOCK_FILE", LOCK_DEFAULT))
         with DeploymentLock(lock):
-            result = getattr(controller, args.command)(args)
+            phase = "dispatch"
+            controller.failure_phase = phase
+            if args.command == "preflight":
+                result = controller.preflight()
+            else:
+                result = getattr(controller, args.command)(args)
         sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
-    except MaintenanceError as exc:
-        sys.stderr.write(json.dumps({"error": str(exc)}, sort_keys=True) + "\n")
-        return 2
-    except (OSError, sqlite3.Error, subprocess.SubprocessError):  # fmt: skip
-        sys.stderr.write(
-            json.dumps({"error": "bounded maintenance operation failed"}) + "\n"
+    except Exception as exc:  # ruff: ignore[BLE001] - failures are closed and redacted
+        failure_phase = controller.failure_phase if controller is not None else phase
+        diagnostic = _failure_diagnostic(
+            exc, operation=args.command, phase=failure_phase
         )
-        return 2
-    except Exception:  # ruff: ignore[BLE001] - redact unexpected operational failures
-        sys.stderr.write(
-            json.dumps({"error": "bounded maintenance operation failed"}) + "\n"
-        )
+        encoded = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            encoded = json.dumps(
+                _failure_diagnostic(
+                    RuntimeError(), operation=args.command, phase="dispatch"
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        sys.stderr.write(encoded + "\n")
         return 2
     else:
         return 0

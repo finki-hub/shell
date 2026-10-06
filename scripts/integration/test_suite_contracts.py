@@ -2127,7 +2127,11 @@ class SuiteContractTests(unittest.TestCase):
                 [],
                 1,
                 token.encode(),
-                b'{"error":"--acceptance-passed is required"}',
+                (
+                    b'{"status":"failed","operation":"accept",'
+                    b'"phase":"dispatch","classification":"acceptance-not-acknowledged",'
+                    b'"error":"accept requires the explicit --acceptance-passed acknowledgment"}'
+                ),
             )
 
             def failed_unasserted_accept(argv, **kwargs):
@@ -2187,6 +2191,335 @@ class SuiteContractTests(unittest.TestCase):
             verify_runtime_env(updater_calls[0])
             if token in json.dumps(suite.results):
                 self.fail("suite result disclosed runtime proxy token")
+
+    def test_maintenance_helper_failure_context_is_strict_and_bounded(self) -> None:
+        valid = {
+            "status": "failed",
+            "operation": "preflight",
+            "phase": "configuration",
+            "classification": "required-service-missing",
+            "error": "Compose configuration is missing a required service",
+        }
+        malformed = [
+            (
+                b'{"status":"failed","status":"failed",'
+                b'"operation":"preflight","phase":"configuration",'
+                b'"classification":"required-service-missing",'
+                b'"error":"Compose configuration is missing a required service"}'
+            ),
+            json.dumps({**valid, "secret": "do-not-leak"}).encode(),
+            json.dumps({**valid, "operation": "migrate"}).encode(),
+            json.dumps({**valid, "phase": "secret-path"}).encode(),
+            json.dumps({**valid, "classification": "unknown-error"}).encode(),
+            json.dumps({**valid, "error": "do-not-leak-token"}).encode(),
+            b"{" + (b" " * run_suite.MAINTENANCE_HELPER_MAX_STDERR),
+            b'{"status":true,"operation":"preflight","phase":"configuration",'
+            b'"classification":"required-service-missing","error":"secret"}',
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="fixture-proxy-token",
+            ):
+                suite.write_compose_fixture()
+            assert suite.run_root
+            backup = suite.run_root / "backup"
+            for stderr in malformed:
+                child = subprocess.CompletedProcess(
+                    ["fixture-helper"], 2, b"secret-stdout", stderr
+                )
+                with patch.object(run_suite, "safe_call", return_value=child):
+                    with self.assertRaisesRegex(
+                        run_suite.HarnessFailure,
+                        "shipping maintenance helper preflight failed",
+                    ) as raised:
+                        suite.run_helper("preflight", backup, preflight=True)
+                self.assertEqual(
+                    suite.failure_context,
+                    {
+                        "operation": "maintenance-preflight",
+                        "classification": "helper-result-invalid",
+                        "returncode": 2,
+                    },
+                )
+                self.assertNotIn("secret", str(raised.exception))
+                self.assertNotIn("secret", json.dumps(suite.failure_context))
+
+            child = subprocess.CompletedProcess(
+                ["fixture-helper"], 2, b"secret-stdout", json.dumps(valid).encode()
+            )
+            with patch.object(run_suite, "safe_call", return_value=child):
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure,
+                    "shipping maintenance helper preflight failed",
+                ):
+                    suite.run_helper("preflight", backup, preflight=True)
+            self.assertEqual(
+                suite.failure_context,
+                {
+                    "operation": "maintenance-preflight",
+                    "helper_operation": "preflight",
+                    "phase": "configuration",
+                    "classification": "required-service-missing",
+                    "returncode": 2,
+                },
+            )
+
+            success_payload = {"status": "completed", "fixture": "unchanged"}
+            child = subprocess.CompletedProcess(
+                ["fixture-helper"], 0, json.dumps(success_payload).encode(), b""
+            )
+            with patch.object(run_suite, "safe_call", return_value=child):
+                self.assertEqual(
+                    suite.run_helper("preflight", backup, preflight=True),
+                    success_payload,
+                )
+
+            wrong_refusal = {
+                "status": "failed",
+                "operation": "accept",
+                "phase": "dispatch",
+                "classification": "external-command-failed",
+                "error": "bounded external command failed",
+            }
+            child = subprocess.CompletedProcess(
+                ["fixture-helper"], 2, b"", json.dumps(wrong_refusal).encode()
+            )
+            with patch.object(run_suite, "safe_call", return_value=child):
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure,
+                    "maintenance helper accepted without the gate",
+                ):
+                    suite.reject_unasserted_accept(backup)
+            self.assertEqual(
+                suite.failure_context,
+                {
+                    "operation": "maintenance-accept",
+                    "helper_operation": "accept",
+                    "phase": "dispatch",
+                    "classification": "external-command-failed",
+                    "returncode": 2,
+                },
+            )
+
+    def test_controller_emitted_failure_diagnostics_are_parent_validated(self) -> None:
+        class FailingController:
+            failure: BaseException
+
+            def __init__(self, **_kwargs: object) -> None:
+                self.failure_phase = "dispatch"
+
+            def preflight(self) -> None:
+                self.failure_phase = "configuration"
+                raise self.failure
+
+            def accept(self, _args: object) -> None:
+                self.failure_phase = "dispatch"
+                raise self.failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = configured_suite(root)
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="fixture-proxy-token",
+            ):
+                suite.write_compose_fixture()
+            assert suite.run_root
+
+            cases = (
+                (
+                    maintenance.MaintenanceError(
+                        "Compose configuration is missing a required service"
+                    ),
+                    "required-service-missing",
+                    "Compose configuration is missing a required service",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "unsupported external Lab network configuration"
+                    ),
+                    "network-topology-mismatch",
+                    "unsupported external Lab network configuration",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "Compose Hub binds or networking differ from the protected deployment"
+                    ),
+                    "hub-shape-mismatch",
+                    "Compose Hub binds or networking differ from the protected deployment",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "running Hub and its selected Lab image are not version-matched"
+                    ),
+                    "running-pair-mismatch",
+                    "running Hub and its selected Lab image are not version-matched",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "candidate Hub and Lab image versions do not match"
+                    ),
+                    "candidate-pair-mismatch",
+                    "candidate Hub and Lab image versions do not match",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "possible Lab has an unexpected or ambiguous home bind"
+                    ),
+                    "lab-home-mismatch",
+                    "possible Lab has an unexpected or ambiguous home bind",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "backup parent directory must already exist"
+                    ),
+                    "backup-parent-missing",
+                    "backup parent directory must already exist",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError("bounded external command failed"),
+                    "external-command-failed",
+                    "bounded external command failed",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "accept requires the explicit --acceptance-passed acknowledgment"
+                    ),
+                    "acceptance-not-acknowledged",
+                    "accept requires the explicit --acceptance-passed acknowledgment",
+                    None,
+                ),
+                (
+                    maintenance.MaintenanceError(
+                        "private secret token must never appear in helper output"
+                    ),
+                    "maintenance-error",
+                    "maintenance operation failed",
+                    "private secret token",
+                ),
+                (
+                    RuntimeError("opaque unexpected credential must never appear"),
+                    "unexpected-error",
+                    "unexpected maintenance failure",
+                    "opaque unexpected credential",
+                ),
+            )
+            for failure, classification, canonical_error, secret in cases:
+                FailingController.failure = failure
+                suite.failure_context = None
+                operation = (
+                    "accept"
+                    if classification == "acceptance-not-acknowledged"
+                    else "preflight"
+                )
+                phase = "dispatch" if operation == "accept" else "configuration"
+                stderr = io.StringIO()
+                argv = [
+                    operation,
+                    "--project-directory",
+                    str(root / "project"),
+                    "--project-name",
+                    "fixture-project",
+                    "--env-file",
+                    str(root / "environment"),
+                    "--compose-file",
+                    str(root / "compose.yaml"),
+                    "--backup-dir",
+                    str(root / "backup"),
+                ]
+                if operation == "accept":
+                    argv.extend(
+                        [
+                            "--acknowledge-interruption",
+                            "--acknowledge-ingress-fenced",
+                            "--acknowledge-updater-paused",
+                        ]
+                    )
+                with (
+                    patch.object(maintenance, "Controller", FailingController),
+                    patch.object(maintenance, "DeploymentLock"),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(maintenance.main(argv), 2)
+                emitted = stderr.getvalue().encode()
+                envelope = json.loads(emitted)
+                self.assertEqual(envelope["status"], "failed")
+                self.assertEqual(envelope["operation"], operation)
+                self.assertEqual(envelope["phase"], phase)
+                self.assertEqual(envelope["classification"], classification)
+                self.assertEqual(envelope["error"], canonical_error)
+                if secret:
+                    self.assertNotIn(secret.encode(), emitted)
+                validated = run_suite.parse_maintenance_helper_failure(
+                    emitted, expected_operation=operation
+                )
+                self.assertEqual(
+                    validated,
+                    {
+                        "operation": operation,
+                        "phase": phase,
+                        "classification": classification,
+                    },
+                )
+
+                child = subprocess.CompletedProcess(
+                    ["actual-controller"], 2, b"", emitted
+                )
+                if operation == "accept":
+                    with (
+                        patch.object(run_suite, "safe_call", return_value=child),
+                        patch.object(
+                            suite,
+                            "compose_ids",
+                            side_effect=lambda service: [f"{service}-id"],
+                        ),
+                        patch.object(
+                            suite,
+                            "inspect_container",
+                            side_effect=lambda cid: {
+                                "State": {"Running": cid != "web-id"}
+                            },
+                        ),
+                    ):
+                        suite.reject_unasserted_accept(suite.run_root / "backup")
+                    self.assertIsNone(suite.failure_context)
+                else:
+                    with patch.object(run_suite, "safe_call", return_value=child):
+                        with self.assertRaisesRegex(
+                            run_suite.HarnessFailure,
+                            "shipping maintenance helper preflight failed",
+                        ):
+                            suite.run_helper(
+                                "preflight",
+                                suite.run_root / "backup",
+                                preflight=True,
+                            )
+                    self.assertEqual(
+                        suite.failure_context,
+                        {
+                            "operation": "maintenance-preflight",
+                            "helper_operation": "preflight",
+                            "phase": phase,
+                            "classification": classification,
+                            "returncode": 2,
+                        },
+                    )
+                    self.assertNotIn("error", suite.failure_context)
+                if secret:
+                    self.assertNotIn(secret, emitted.decode())
+                    self.assertNotIn(secret, json.dumps(suite.failure_context))
 
     def test_uninitialized_proxy_token_fails_before_configuration_children(
         self,
