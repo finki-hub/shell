@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.integration.probe import (
     ALLOWED_DENIALS,
     HTTP_TIMEOUT,
+    HUB_API_MODEL_MAJOR_BY_STAGE,
     SPAWN_TIMEOUT,
     STOP_TIMEOUT,
     WS_TIMEOUT,
@@ -20,6 +21,9 @@ from scripts.integration.probe import (
     failure_json,
     failure_report,
     validate_origin,
+    validate_owner_model,
+    validate_short_token_expiry,
+    validate_short_token_scopes,
 )
 
 
@@ -477,6 +481,147 @@ class ProbeSafetyTests(unittest.TestCase):
         self.assertNotIn("short-url-token api-token-secret", failure)
         self.assertNotIn('"assertion"', failure)
         self.assertLessEqual(len(failure.encode("utf-8")), 64 * 1024)
+
+    def test_owner_identity_model_is_closed_and_version_specific(self) -> None:
+        self.assertEqual(
+            HUB_API_MODEL_MAJOR_BY_STAGE,
+            {
+                "baseline": 5,
+                "candidate": 6,
+                "restore": 5,
+                "updater-smoke": 6,
+                "accepted-smoke": 6,
+            },
+        )
+        owner = {
+            "kind": "user",
+            "name": "fixture-owner",
+            "admin": False,
+            "groups": [],
+        }
+        validate_owner_model(owner, "fixture-owner", 5)
+        validate_owner_model({**owner, "user_info": None}, "fixture-owner", 6)
+        validate_owner_model({**owner, "user_info": {}}, "fixture-owner", 6)
+
+        invalid_models = (
+            ({**owner, "name": "another-user"}, 5),
+            ({**owner, "admin": True}, 5),
+            ({**owner, "groups": ["admins"]}, 5),
+            ({**owner, "user_info": {}}, 5),
+            ({**owner, "user_info": {"email": "private"}}, 6),
+            ({**owner, "servers": {}}, 6),
+            ({**owner, "servers": None}, 6),
+            ({**owner, "roles": []}, 6),
+            ({**owner, "auth_state": None}, 6),
+            ({**owner, "created": None}, 6),
+            ({**owner, "last_activity": None}, 6),
+            ({**owner, "pending": None}, 6),
+            ({key: value for key, value in owner.items() if key != "admin"}, 6),
+            (owner, 7),
+        )
+        for model, major in invalid_models:
+            with (
+                self.subTest(model=model, major=major),
+                self.assertRaises(ProbeFailure) as raised,
+            ):
+                validate_owner_model(model, "fixture-owner", major)
+            self.assertEqual(
+                failure_context("terminals", raised.exception)["assertion"],
+                "url-token-no-hub-model",
+            )
+
+    def test_url_token_scope_list_is_owner_scoped_and_never_broadened(self) -> None:
+        owner = "fixture-owner"
+        access = f"access:servers!user={owner}"
+        identify_name = f"read:users:name!user={owner}"
+        identify_groups = f"read:users:groups!user={owner}"
+        validate_short_token_scopes([access], owner)
+        validate_short_token_scopes([access, identify_name], owner)
+        validate_short_token_scopes([access, identify_name, identify_groups], owner)
+
+        invalid_scopes = (
+            [],
+            ["access:servers!user=another-user"],
+            ["access:servers!user=*"],
+            ["access:servers"],
+            [access, "inherit"],
+            [access, "admin:users"],
+            [access, f"read:servers!user={owner}"],
+            [access, f"read:users:tokens!user={owner}"],
+            [access, "read:users:name!user=another-user"],
+            [access, access],
+            [access, None],
+            "all",
+            None,
+        )
+        for scopes in invalid_scopes:
+            with (
+                self.subTest(scopes=type(scopes).__name__),
+                self.assertRaises(ProbeFailure) as raised,
+            ):
+                validate_short_token_scopes(scopes, owner)
+            self.assertEqual(
+                failure_context("terminals", raised.exception)["assertion"],
+                "short-url-token",
+            )
+
+    def test_short_token_expiry_is_optional_but_bounded_when_returned(self) -> None:
+        validate_short_token_expiry({})
+        valid_expiry = (
+            (datetime.now(UTC) + timedelta(seconds=30))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        validate_short_token_expiry({"expires_at": valid_expiry})
+        for token_model in (
+            {"expires_at": None},
+            {"expires_at": "not-a-timestamp"},
+            {"expires_at": (datetime.now(UTC) + timedelta(seconds=90)).isoformat()},
+            {"expires_at": (datetime.now(UTC) - timedelta(seconds=5)).isoformat()},
+        ):
+            with self.subTest(expiry=type(token_model["expires_at"]).__name__):
+                with self.assertRaises(ProbeFailure) as raised:
+                    validate_short_token_expiry(token_model)
+                self.assertEqual(
+                    failure_context("terminals", raised.exception)["assertion"],
+                    "short-url-token",
+                )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("httpx"),
+        "httpx is installed in the locked Hub test environment",
+    )
+    def test_bearer_request_uses_minted_token_without_cookie_fallback(self) -> None:
+        import httpx
+
+        seen = []
+
+        def handler(request):
+            seen.append(
+                (
+                    request.headers.get("authorization"),
+                    request.headers.get("cookie"),
+                )
+            )
+            return httpx.Response(200, request=request)
+
+        probe = Probe(
+            "http://127.0.0.1:8000",
+            "ws://127.0.0.1:8000",
+            1,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            probe.client.cookies.set("jupyterhub-hub-login", "cookie-secret")
+            response = probe.request(
+                "GET", "/hub/api/users/fixture-owner", "minted-token-secret"
+            )
+            assert_status(response.status_code, {200}, "url-token-no-hub-model")
+            self.assertEqual(seen, [("token minted-token-secret", None)])
+            self.assertFalse(probe.client.cookies.jar)
+        finally:
+            probe.client.close()
+            probe.anonymous_client.close()
 
     def test_runtime_deadlines_are_bounded_by_the_contract(self) -> None:
         self.assertLessEqual(HTTP_TIMEOUT, 15)

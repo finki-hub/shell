@@ -67,6 +67,14 @@ DIAGNOSTIC_ASSERTIONS = frozenset(
         "terminal-cleanup",
     }
 )
+HUB_API_MODEL_MAJOR_BY_STAGE = {
+    "baseline": 5,
+    "candidate": 6,
+    "restore": 5,
+    "updater-smoke": 6,
+    "accepted-smoke": 6,
+}
+FIXTURE_GROUPS: tuple[str, ...] = ()
 
 
 def validate_origin(base: str) -> tuple[str, str]:
@@ -128,6 +136,98 @@ def assert_status(status: int, allowed: set[int], case: str) -> None:
             classification="http-status",
             http_status=status,
             assertion=case,
+        )
+
+
+def validate_short_token_scopes(scopes: object, username: str) -> None:
+    """Require this fixture's server access scope and no broader capabilities."""
+    if not isinstance(scopes, list) or any(
+        not isinstance(item, str) for item in scopes
+    ):
+        raise ProbeFailure(
+            "short-lived token scope contract mismatch",
+            classification="assertion-failed",
+            assertion="short-url-token",
+        )
+    expected_access = f"access:servers!user={username}"
+    allowed = {
+        expected_access,
+        f"read:users:name!user={username}",
+        f"read:users:groups!user={username}",
+    }
+    if (
+        len(scopes) != len(set(scopes))
+        or expected_access not in scopes
+        or not set(scopes) <= allowed
+    ):
+        raise ProbeFailure(
+            "short-lived token scope contract mismatch",
+            classification="assertion-failed",
+            assertion="short-url-token",
+        )
+
+
+def validate_short_token_expiry(token_model: dict[str, Any]) -> None:
+    """If Hub returns an expiry, require a valid timestamp within the requested TTL."""
+    if "expires_at" not in token_model:
+        return
+    raw_expiry = token_model.get("expires_at")
+    if not isinstance(raw_expiry, str):
+        raise ProbeFailure(
+            "short-lived token expiry contract mismatch",
+            classification="assertion-failed",
+            assertion="short-url-token",
+        )
+    try:
+        expires_at = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+        remaining = (expires_at - datetime.now(UTC)).total_seconds()
+    except (TypeError, ValueError):
+        raise ProbeFailure(
+            "short-lived token expiry contract mismatch",
+            classification="assertion-failed",
+            assertion="short-url-token",
+        ) from None
+    if expires_at.utcoffset() is None or not 0 < remaining <= 60:
+        raise ProbeFailure(
+            "short-lived token expiry contract mismatch",
+            classification="assertion-failed",
+            assertion="short-url-token",
+        )
+
+
+def validate_owner_model(model: object, username: str, hub_major: int) -> None:
+    """Accept only the pinned-version owner identity projection, not broad model data."""
+    allowed_fields_by_major = {
+        5: {"kind", "name", "admin", "groups"},
+        6: {"kind", "name", "admin", "groups", "user_info"},
+    }
+    allowed_fields = allowed_fields_by_major.get(hub_major)
+    if not isinstance(model, dict) or allowed_fields is None:
+        raise ProbeFailure(
+            "owner Hub model identity contract mismatch",
+            classification="assertion-failed",
+            assertion="url-token-no-hub-model",
+        )
+    required_fields = {"kind", "name", "admin", "groups"}
+    if not (
+        required_fields <= model.keys()
+        and model.keys() <= allowed_fields
+        and model.get("kind") == "user"
+        and model.get("name") == username
+        and model.get("admin") is False
+        and type(model.get("groups")) is list
+        and model.get("groups") == list(FIXTURE_GROUPS)
+        and (
+            hub_major != 6
+            or "user_info" not in model
+            or model.get("user_info") is None
+            or model.get("user_info") == {}
+        )
+    ):
+        raise ProbeFailure(
+            "owner Hub model identity contract mismatch",
+            classification="assertion-failed",
+            assertion="url-token-no-hub-model",
         )
 
 
@@ -675,7 +775,12 @@ class Probe:
         self.record("cross-user-mutation-witness")
 
     async def terminal_check(
-        self, username: str, token: str, other_username: str, other_token: str
+        self,
+        username: str,
+        token: str,
+        other_username: str,
+        other_token: str,
+        hub_major: int,
     ) -> tuple[str, str]:
         import tornado.websocket
         from tornado.httpclient import HTTPClientError, HTTPRequest
@@ -699,9 +804,29 @@ class Probe:
             },
         )
         assert_status(minted.status_code, {201}, "short-url-token")
-        url_token = self.json(minted).get("token")
+        try:
+            minted_model = self.json(minted)
+        except AssertionError:
+            raise ProbeFailure(
+                "short-lived token response shape mismatch",
+                classification="assertion-failed",
+                assertion="short-url-token",
+            ) from None
+        if not isinstance(minted_model, dict):
+            raise ProbeFailure(
+                "short-lived token response shape mismatch",
+                classification="assertion-failed",
+                assertion="short-url-token",
+            )
+        url_token = minted_model.get("token")
         if not isinstance(url_token, str) or not url_token:
-            raise AssertionError("short-lived terminal token missing")
+            raise ProbeFailure(
+                "short-lived terminal token missing",
+                classification="assertion-failed",
+                assertion="short-url-token",
+            )
+        validate_short_token_scopes(minted_model.get("scopes"), username)
+        validate_short_token_expiry(minted_model)
         forbidden = self.request(
             "GET", f"/hub/api/users/{quote(other_username, safe='')}", url_token
         )
@@ -709,7 +834,16 @@ class Probe:
         own_model = self.request(
             "GET", f"/hub/api/users/{quote(username, safe='')}", url_token
         )
-        assert_status(own_model.status_code, ALLOWED_DENIALS, "url-token-no-hub-model")
+        assert_status(own_model.status_code, {200}, "url-token-no-hub-model")
+        try:
+            owner_model = self.json(own_model)
+        except AssertionError:
+            raise ProbeFailure(
+                "owner Hub model identity contract mismatch",
+                classification="assertion-failed",
+                assertion="url-token-no-hub-model",
+            ) from None
+        validate_owner_model(owner_model, username, hub_major)
         no_escalation = self.request(
             "POST",
             f"/hub/api/users/{quote(username, safe='')}/tokens",
@@ -961,6 +1095,7 @@ class Probe:
                 identities[0]["api_token"],
                 identities[1]["username"],
                 identities[1]["api_token"],
+                HUB_API_MODEL_MAJOR_BY_STAGE[stage],
             )
         )
         self.checkpoint("reconnect")
