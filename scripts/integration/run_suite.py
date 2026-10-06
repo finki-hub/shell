@@ -2351,6 +2351,80 @@ class Suite:
         self.verify_wrapper_base_reference(base_reference, base_id, role=role)
         return wrapper_id
 
+    def prepare_hub_wrapper_contexts(self, wrapper_source: Path) -> tuple[Path, Path]:
+        assert self.run_root is not None
+        baseline_context = self.run_root / "hub-wrapper-old"
+        candidate_context = self.run_root / "hub-wrapper-new"
+        baseline_dockerfile = (
+            "ARG HUB_BASE\nFROM ${HUB_BASE}\n"
+            "RUN PYTHONDONTWRITEBYTECODE=1 /app/.venv/bin/python -c 'import importlib.metadata as m; "
+            'assert m.version("jupyterhub") == "5.5.1", m.version("jupyterhub")\'\n'
+            f'LABEL {VERSION_LABEL}="5.5.1"\n'
+            "USER root\n"
+            "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
+            "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n"
+        )
+        candidate_dockerfile = (
+            "ARG HUB_BASE\nFROM ${HUB_BASE}\n"
+            "USER root\n"
+            "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
+            "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n"
+        )
+        for role, context, dockerfile in (
+            ("baseline-wrapper", baseline_context, baseline_dockerfile),
+            ("candidate-wrapper", candidate_context, candidate_dockerfile),
+        ):
+            self.begin_image_operation("wrapper-context-create", role)
+            try:
+                context.mkdir(mode=0o700)
+                shutil.copy2(
+                    wrapper_source, context / "integration_jupyterhub_config.py"
+                )
+                (context / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+            except Exception as exc:
+                self.fail_image_operation(
+                    "wrapper-context-create", role, "operation-failed", error=exc
+                )
+                raise HarnessFailure(
+                    "could not prepare wrapper build context"
+                ) from None
+        return baseline_context, candidate_context
+
+    def build_hub_wrapper_images(
+        self,
+        wrapper_source: Path,
+        *,
+        run_tag: str,
+        baseline_base_reference: str,
+        baseline_base_id: str,
+        candidate_base_reference: str,
+        candidate_base_id: str,
+    ) -> tuple[str, str]:
+        baseline_context, candidate_context = self.prepare_hub_wrapper_contexts(
+            wrapper_source
+        )
+        baseline_image = self.build_wrapper_image(
+            baseline_context,
+            f"local/jh6/hub5:{run_tag}",
+            baseline_base_reference,
+            baseline_base_id,
+            role="baseline-wrapper",
+        )
+        candidate_image = self.build_wrapper_image(
+            candidate_context,
+            f"local/jh6/hub6:{run_tag}",
+            candidate_base_reference,
+            candidate_base_id,
+            role="candidate-wrapper",
+        )
+        self.verify_image_label(
+            baseline_image, role="baseline-wrapper", allowed=("5.5.1",)
+        )
+        self.verify_image_label(
+            candidate_image, role="candidate-wrapper", allowed=("6.0.1",)
+        )
+        return baseline_image, candidate_image
+
     def pull_image(self, reference: str, timeout: int = 300, *, role: str) -> str:
         operation = "image-pull"
         self.begin_image_operation(operation, role)
@@ -2507,24 +2581,6 @@ class Suite:
                 "wrapper-source-create", "shared", "operation-failed", error=exc
             )
             raise HarnessFailure("could not create test-only image wrapper") from None
-        dockerfile = self.run_root / "Integration.Dockerfile"
-        self.begin_image_operation("wrapper-dockerfile-create", "shared")
-        try:
-            dockerfile.write_text(
-                "ARG HUB_BASE\nFROM ${HUB_BASE}\n"
-                "RUN PYTHONDONTWRITEBYTECODE=1 /app/.venv/bin/python -c 'import importlib.metadata as m; "
-                'assert m.version("jupyterhub") == "5.5.1", m.version("jupyterhub")\'\n'
-                f'LABEL {VERSION_LABEL}="5.5.1"\n'
-                "USER root\n"
-                "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
-                "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n",
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            self.fail_image_operation(
-                "wrapper-dockerfile-create", "shared", "operation-failed", error=exc
-            )
-            raise HarnessFailure("could not create test-only Dockerfile") from None
         old_lab_context = self.run_root / "lab-wrapper-old"
         self.begin_image_operation("lab-wrapper-context-create", "baseline-lab")
         try:
@@ -2546,30 +2602,13 @@ class Suite:
             raise HarnessFailure(
                 "could not create baseline Lab version wrapper"
             ) from None
-        old_context = self.run_root / "hub-wrapper-old"
-        new_context = self.run_root / "hub-wrapper-new"
-        for role, context in (
-            ("baseline-wrapper", old_context),
-            ("candidate-wrapper", new_context),
-        ):
-            self.begin_image_operation("wrapper-context-create", role)
-            try:
-                context.mkdir(mode=0o700)
-                shutil.copy2(wrapper, context / "integration_jupyterhub_config.py")
-                shutil.copy2(dockerfile, context / "Dockerfile")
-            except Exception as exc:
-                self.fail_image_operation(
-                    "wrapper-context-create", role, "operation-failed", error=exc
-                )
-                raise HarnessFailure(
-                    "could not prepare wrapper build context"
-                ) from None
-        old_hub = self.build_wrapper_image(
-            old_context,
-            f"local/jh6/hub5:{run_tag}",
-            old_hub_base_tag,
-            old_hub_base,
-            role="baseline-wrapper",
+        old_hub, new_hub = self.build_hub_wrapper_images(
+            wrapper,
+            run_tag=run_tag,
+            baseline_base_reference=old_hub_base_tag,
+            baseline_base_id=old_hub_base,
+            candidate_base_reference=candidate_hub_base_tag,
+            candidate_base_id=candidate_hub_base,
         )
         old_lab = self.build_wrapper_image(
             old_lab_context,
@@ -2579,15 +2618,6 @@ class Suite:
             role="baseline-lab-wrapper",
             base_argument="LAB_BASE",
         )
-        new_hub = self.build_wrapper_image(
-            new_context,
-            f"local/jh6/hub6:{run_tag}",
-            candidate_hub_base_tag,
-            candidate_hub_base,
-            role="candidate-wrapper",
-        )
-        self.verify_image_label(new_hub, role="candidate-wrapper", allowed=("6.0.1",))
-        self.verify_image_label(old_hub, role="baseline-wrapper", allowed=("5.5.1",))
         self.verify_image_label(
             old_lab, role="baseline-lab-wrapper", allowed=("5.5.1",)
         )

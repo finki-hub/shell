@@ -1632,6 +1632,120 @@ class SuiteContractTests(unittest.TestCase):
         self.assertEqual(inspect_mock.call_count, 2)
         self.assertEqual(build_mock.call_count, 1)
 
+    def test_baseline_and_candidate_hub_wrapper_contexts_preserve_versions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run"
+            run_root.mkdir()
+            wrapper_source = root / "integration_jupyterhub_config.py"
+            wrapper_source.write_text("# fixture wrapper\n", encoding="utf-8")
+            suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+            suite.run_root = run_root
+            run_tag = suite.run_id
+            baseline_ref = f"local/jh6/base-hub5:{run_tag}"
+            candidate_ref = f"local/jh6/base-hub6:{run_tag}"
+            baseline_id = "sha256:" + "a" * 64
+            candidate_id = "sha256:" + "b" * 64
+            baseline_wrapper_id = "sha256:" + "c" * 64
+            candidate_wrapper_id = "sha256:" + "d" * 64
+            suite.owned_image_refs.update(
+                {baseline_ref: baseline_id, candidate_ref: candidate_id}
+            )
+            base_ids = {baseline_ref: baseline_id, candidate_ref: candidate_id}
+            wrapper_ids = {
+                f"local/jh6/hub5:{run_tag}": baseline_wrapper_id,
+                f"local/jh6/hub6:{run_tag}": candidate_wrapper_id,
+            }
+            image_labels = {
+                baseline_wrapper_id: "5.5.1",
+                candidate_wrapper_id: "6.0.1",
+            }
+            inspect_calls: list[str] = []
+            build_calls: list[tuple[Path, str, str, dict[str, str], bool]] = []
+
+            def inspect(reference: str, **_kwargs: object) -> str:
+                inspect_calls.append(reference)
+                return base_ids[reference]
+
+            def build(
+                context: Path,
+                dockerfile: str,
+                tag: str,
+                *,
+                role: str,
+                args: dict[str, str],
+                pull: bool,
+            ) -> str:
+                self.assertEqual(dockerfile, "Dockerfile")
+                self.assertTrue((context / dockerfile).is_file())
+                self.assertEqual(
+                    (context / "integration_jupyterhub_config.py").read_text(
+                        encoding="utf-8"
+                    ),
+                    "# fixture wrapper\n",
+                )
+                build_calls.append((context, role, tag, args, pull))
+                suite.owned_image_refs[tag] = wrapper_ids[tag]
+                return wrapper_ids[tag]
+
+            def image_label(image: str, label: str) -> str:
+                self.assertEqual(label, run_suite.VERSION_LABEL)
+                return image_labels[image]
+
+            with (
+                patch.object(suite, "operation_image_id", side_effect=inspect),
+                patch.object(suite, "build", side_effect=build),
+                patch.object(suite, "image_label", side_effect=image_label),
+            ):
+                self.assertEqual(
+                    suite.build_hub_wrapper_images(
+                        wrapper_source,
+                        run_tag=run_tag,
+                        baseline_base_reference=baseline_ref,
+                        baseline_base_id=baseline_id,
+                        candidate_base_reference=candidate_ref,
+                        candidate_base_id=candidate_id,
+                    ),
+                    (baseline_wrapper_id, candidate_wrapper_id),
+                )
+
+            self.assertEqual(
+                inspect_calls,
+                [baseline_ref, baseline_ref, candidate_ref, candidate_ref],
+            )
+            self.assertEqual(
+                [entry[1:] for entry in build_calls],
+                [
+                    (
+                        "baseline-wrapper",
+                        f"local/jh6/hub5:{run_tag}",
+                        {"HUB_BASE": baseline_ref},
+                        False,
+                    ),
+                    (
+                        "candidate-wrapper",
+                        f"local/jh6/hub6:{run_tag}",
+                        {"HUB_BASE": candidate_ref},
+                        False,
+                    ),
+                ],
+            )
+            baseline_dockerfile = (build_calls[0][0] / "Dockerfile").read_text(
+                encoding="utf-8"
+            )
+            candidate_dockerfile = (build_calls[1][0] / "Dockerfile").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('m.version("jupyterhub") == "5.5.1"', baseline_dockerfile)
+            self.assertIn(
+                f'LABEL {run_suite.VERSION_LABEL}="5.5.1"', baseline_dockerfile
+            )
+            self.assertNotIn("5.5.1", candidate_dockerfile)
+            self.assertNotIn("LABEL", candidate_dockerfile)
+            self.assertIn("FROM ${HUB_BASE}", candidate_dockerfile)
+
     def test_wrapper_build_stops_before_build_if_base_tag_identity_changed(
         self,
     ) -> None:
