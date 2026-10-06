@@ -28,12 +28,46 @@ NEW_VERSION = "6.0.1"
 FULL_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 IMAGE_DIGEST = re.compile(r"^[^@]+@sha256:[0-9a-f]{64}$")
+DB_OPERATIONS = frozenset(
+    {
+        "version-old",
+        "version-candidate",
+        "initialize-old",
+        "seed-old",
+        "reject-old-schema",
+        "upgrade-candidate",
+        "idempotence",
+        "restore-old",
+    }
+)
+DB_IMAGE_ROLES = frozenset({"baseline-hub", "candidate-hub", "shared"})
+DB_FAILURE_CLASSIFICATIONS = frozenset(
+    {
+        "worker-failed",
+        "timeout",
+        "version-mismatch",
+        "image-identity-mismatch",
+        "fixture-seed-mismatch",
+        "schema-rejection-mismatch",
+        "schema-extension-mismatch",
+        "snapshot-change",
+        "operation-failed",
+        "owned-container-cleanup-incomplete",
+        "fixture-cleanup-incomplete",
+    }
+)
 _SUITE_DEADLINE: float | None = None
 
 # This worker runs only inside an immutable Hub image and uses that image's ORM.
 # Its JSON artifacts are mode 0600 in a mode 0700 temporary directory; token
 # hashes and OAuth client secret never go to stdout or published evidence.
-WORKER = r"""
+SPAWNER_SHARED_SELECT = (
+    "SELECT u.name AS user,s.name,s.state,s.user_options,s.oauth_client_id "
+    "FROM spawners s JOIN users u ON u.id=s.user_id ORDER BY u.name,s.name"
+)
+DISPLAY_NAME_COUNT_QUERY = "SELECT COUNT(*), COUNT(display_name) FROM spawners"
+
+WORKER_TEMPLATE = r"""
 import json, os, secrets, sqlite3, sys
 from pathlib import Path
 from jupyterhub import orm
@@ -73,7 +107,7 @@ def snapshot():
           "schema": schema,
           "users": rows("SELECT name, admin FROM users ORDER BY name"),
           "tokens": rows("SELECT u.name AS user, t.hashed, t.prefix, t.note, t.scopes, t.client_id FROM api_tokens t JOIN users u ON u.id=t.user_id ORDER BY u.name,t.note"),
-          "spawners": rows("SELECT u.name AS user,s.name,s.display_name,s.state,s.user_options,s.oauth_client_id FROM spawners s JOIN users u ON u.id=s.user_id ORDER BY u.name,s.name"),
+          "spawners": rows(__SPAWNER_SHARED_SELECT__),
           "roles": rows("SELECT name,scopes FROM roles ORDER BY name"),
           "user_roles": rows("SELECT u.name AS user,r.name AS role FROM user_role_map m JOIN users u ON u.id=m.user_id JOIN roles r ON r.id=m.role_id ORDER BY u.name,r.name"),
           "oauth_clients": rows("SELECT identifier,redirect_uri,allowed_scopes FROM oauth_clients ORDER BY identifier"),
@@ -109,7 +143,7 @@ elif mode == "seed":
             user.roles.append(role)
             db.add(user)
             db.flush()
-            spawner = orm.Spawner(name="", display_name="", state={"fixture": "migration-state-v1"}, user_options={"fixture": "preserve"}, oauth_client_id="integration-fixture")
+            spawner = orm.Spawner(name="", state={"fixture": "migration-state-v1"}, user_options={"fixture": "preserve"}, oauth_client_id="integration-fixture")
             spawner.user = user
             db.add(spawner)
             token = orm.APIToken(generated=True, note="integration-spa", client_id="jupyterhub", scopes=["access:servers!user=" + name, "read:users!user=" + name])
@@ -126,9 +160,36 @@ elif mode == "snapshot":
     data = snapshot()
     output.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     os.chmod(output, 0o600)
+elif mode == "verify-display-name":
+    con = sqlite3.connect("/fixture/jupyterhub.sqlite")
+    try:
+        display_column = next(
+            (row for row in con.execute("PRAGMA table_info(spawners)") if row[1] == "display_name"),
+            None,
+        )
+        if display_column is None or display_column[3] != 0:
+            result = {"status": "fail", "classification": "schema-extension-mismatch"}
+        else:
+            total, populated = con.execute(__DISPLAY_NAME_COUNT_QUERY__).fetchone()
+            result = {
+                "status": "pass" if total == 2 and populated == 0 else "fail",
+                "classification": "schema-extension-mismatch"
+                if total != 2 or populated != 0
+                else "verified",
+                "spawner_count": total,
+                "non_null_display_name_count": populated,
+            }
+    finally:
+        con.close()
+    output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    os.chmod(output, 0o600)
 else:
     raise RuntimeError("unknown worker mode")
 """
+
+WORKER = WORKER_TEMPLATE.replace(
+    "__SPAWNER_SHARED_SELECT__", repr(SPAWNER_SHARED_SELECT)
+).replace("__DISPLAY_NAME_COUNT_QUERY__", repr(DISPLAY_NAME_COUNT_QUERY))
 
 
 def docker(
@@ -159,6 +220,29 @@ class OwnedContainers:
         self.ids_by_name: dict[str, str] = {}
         self.cleanup_failures: list[str] = []
         self.cleanup_verified: bool | None = None
+        self.active_operation = "initialize-old"
+        self.active_image_role = "baseline-hub"
+        self.failure_context: dict[str, str | int] | None = None
+
+    def set_operation(self, operation: str, image_role: str) -> None:
+        if operation not in DB_OPERATIONS or image_role not in DB_IMAGE_ROLES:
+            raise ValueError("invalid bounded DB fixture operation")
+        self.active_operation = operation
+        self.active_image_role = image_role
+
+    def record_failure(
+        self, classification: str, *, returncode: int | None = None
+    ) -> None:
+        if classification not in DB_FAILURE_CLASSIFICATIONS:
+            classification = "operation-failed"
+        context: dict[str, str | int] = {
+            "operation": self.active_operation,
+            "image_role": self.active_image_role,
+            "classification": classification,
+        }
+        if returncode is not None:
+            context["returncode"] = returncode
+        self.failure_context = context
 
     def run(
         self,
@@ -168,7 +252,11 @@ class OwnedContainers:
         mode: str,
         artifact: Path,
         timeout: int,
+        *,
+        operation: str,
+        image_role: str,
     ) -> str:
+        self.set_operation(operation, image_role)
         name = f"jh6db-{self.run_id}-{len(self.containers)}"
         self.names.append(name)
         self.intents[name] = {
@@ -185,46 +273,59 @@ class OwnedContainers:
             if mode == "startup-disabled"
             else ["python", "/fixture_worker.py", mode, f"/fixture/{artifact.name}"]
         )
-        created = docker(
-            [
-                "create",
-                "--name",
-                name,
-                "--label",
-                f"{LABEL}={self.run_id}",
-                "--network",
-                "none",
-                "--read-only",
-                "--cap-drop=ALL",
-                "--security-opt=no-new-privileges:true",
-                "--pids-limit=64",
-                "--memory=1g",
-                "--cpus=1",
-                "--log-driver=none",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,size=64m",
-                "-v",
-                f"{fixture}:/fixture:rw",
-                "-v",
-                f"{worker}:/fixture_worker.py:ro",
-                image_id,
-                *command,
-            ],
-            timeout=20,
-            capture=True,
-        )
+        try:
+            created = docker(
+                [
+                    "create",
+                    "--name",
+                    name,
+                    "--label",
+                    f"{LABEL}={self.run_id}",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges:true",
+                    "--pids-limit=64",
+                    "--memory=1g",
+                    "--cpus=1",
+                    "--log-driver=none",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=64m",
+                    "-v",
+                    f"{fixture}:/fixture:rw",
+                    "-v",
+                    f"{worker}:/fixture_worker.py:ro",
+                    image_id,
+                    *command,
+                ],
+                timeout=20,
+                capture=True,
+            )
+        except subprocess.TimeoutExpired:
+            self.record_failure("timeout")
+            raise
         cid = created.stdout.strip()
         if created.returncode or not FULL_CONTAINER_ID.fullmatch(cid):
+            self.record_failure(
+                "worker-failed",
+                returncode=created.returncode if created.returncode else None,
+            )
             raise RuntimeError("could not create owned Hub migration test container")
         self.containers.append(cid)
         self.ids_by_name[name] = cid
         expect_failure = mode == "startup-disabled"
-        started = docker(
-            ["start", "--attach", cid],
-            timeout=timeout,
-            capture=expect_failure,
-        )
+        try:
+            started = docker(
+                ["start", "--attach", cid],
+                timeout=timeout,
+                capture=expect_failure or mode not in {"upgrade", "startup-disabled"},
+            )
+        except subprocess.TimeoutExpired:
+            self.record_failure("timeout")
+            raise
         if bool(started.returncode) != expect_failure:
+            self.record_failure("worker-failed", returncode=started.returncode)
             raise RuntimeError(
                 "Hub migration/startup fixture returned an unexpected exit status"
             )
@@ -348,8 +449,20 @@ def run_image(
     mode: str,
     artifact: Path,
     timeout: int,
+    *,
+    operation: str,
+    image_role: str,
 ) -> str:
-    return owner.run(image_id, fixture, worker, mode, artifact, timeout)
+    return owner.run(
+        image_id,
+        fixture,
+        worker,
+        mode,
+        artifact,
+        timeout,
+        operation=operation,
+        image_role=image_role,
+    )
 
 
 def assert_seeded_fixture(snapshot: dict) -> None:
@@ -398,6 +511,26 @@ def assert_seeded_fixture(snapshot: dict) -> None:
     clients = {row.get("identifier") for row in snapshot.get("oauth_clients", [])}
     if not {"jupyterhub", "integration-fixture"} <= clients:
         raise RuntimeError("upstream ORM fixture OAuth client association mismatch")
+
+
+def read_fixture_json(
+    path: Path,
+    owner: OwnedContainers,
+    *,
+    operation: str,
+    image_role: str,
+    classification: str,
+) -> dict:
+    owner.set_operation(operation, image_role)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        owner.record_failure(classification)
+        raise RuntimeError("bounded DB fixture evidence was invalid") from None
+    if not isinstance(value, dict):
+        owner.record_failure(classification)
+        raise RuntimeError("bounded DB fixture evidence was invalid")
+    return value
 
 
 def assert_cold_sqlite(path: Path) -> None:
@@ -485,10 +618,20 @@ def main() -> int:
             # `docker run` is never used: all commands have recorded IDs and
             # bounded container cleanup in OwnedContainers.
             image_ids = []
-            for index, (ref, expected) in enumerate(
-                ((args.old_image, OLD_VERSION), (args.new_image, NEW_VERSION))
+            for index, (ref, expected, operation, image_role) in enumerate(
+                (
+                    (args.old_image, OLD_VERSION, "version-old", "baseline-hub"),
+                    (
+                        args.new_image,
+                        NEW_VERSION,
+                        "version-candidate",
+                        "candidate-hub",
+                    ),
+                )
             ):
+                owner.set_operation(operation, image_role)
                 if not (IMAGE_ID.fullmatch(ref) or IMAGE_DIGEST.fullmatch(ref)):
+                    owner.record_failure("image-identity-mismatch")
                     raise RuntimeError(
                         "image arguments must be immutable IDs or digest references"
                     )
@@ -498,25 +641,50 @@ def main() -> int:
                     capture=True,
                 )
                 image_id = inspect.stdout.strip()
-                if inspect.returncode or not image_id.startswith("sha256:"):
+                if inspect.returncode:
+                    owner.record_failure("worker-failed", returncode=inspect.returncode)
+                    raise RuntimeError("requested Hub image could not be inspected")
+                if not IMAGE_ID.fullmatch(image_id):
+                    owner.record_failure("image-identity-mismatch")
                     raise RuntimeError(
                         "requested Hub image unavailable or not immutable"
                     )
                 image_ids.append(image_id)
                 version_file = fixture / f"version-{index}.json"
-                run_image(owner, image_id, fixture, worker, "version", version_file, 30)
+                run_image(
+                    owner,
+                    image_id,
+                    fixture,
+                    worker,
+                    "version",
+                    version_file,
+                    30,
+                    operation=operation,
+                    image_role=image_role,
+                )
                 # The image writes the version response to a file rather than stdout.
-                version_raw = version_file.read_text(encoding="utf-8")
-                if json.loads(version_raw) != {"jupyterhub": expected}:
+                version_facts = read_fixture_json(
+                    version_file,
+                    owner,
+                    operation=operation,
+                    image_role=image_role,
+                    classification="version-mismatch",
+                )
+                if version_facts != {"jupyterhub": expected}:
+                    owner.set_operation(operation, image_role)
+                    owner.record_failure("version-mismatch")
                     raise RuntimeError(
                         "Hub image installed version does not match expected major baseline"
                     )
             old_id, new_id = image_ids
             if old_id == new_id:
+                owner.set_operation("version-candidate", "candidate-hub")
+                owner.record_failure("image-identity-mismatch")
                 raise RuntimeError(
                     "old and candidate Hub images resolved to the same image ID"
                 )
             # Initialize and seed entirely with the actual old upstream image.
+            owner.set_operation("initialize-old", "baseline-hub")
             run_image(
                 owner,
                 old_id,
@@ -525,7 +693,10 @@ def main() -> int:
                 "upgrade",
                 fixture / "unused.json",
                 args.timeout,
+                operation="initialize-old",
+                image_role="baseline-hub",
             )
+            owner.set_operation("seed-old", "baseline-hub")
             run_image(
                 owner,
                 old_id,
@@ -534,16 +705,31 @@ def main() -> int:
                 "seed",
                 fixture / "baseline.json",
                 args.timeout,
+                operation="seed-old",
+                image_role="baseline-hub",
             )
-            baseline = json.loads(
-                (fixture / "baseline.json").read_text(encoding="utf-8")
+            baseline = read_fixture_json(
+                fixture / "baseline.json",
+                owner,
+                operation="seed-old",
+                image_role="baseline-hub",
+                classification="fixture-seed-mismatch",
             )
-            assert_seeded_fixture(baseline)
+            try:
+                assert_seeded_fixture(baseline)
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                owner.set_operation("seed-old", "baseline-hub")
+                owner.record_failure("fixture-seed-mismatch")
+                raise RuntimeError(
+                    "old ORM fixture evidence did not match contract"
+                ) from None
             if (
                 len(baseline["users"]) != 2
                 or len(baseline["tokens"]) != 2
                 or len(baseline["spawners"]) != 2
             ):
+                owner.set_operation("seed-old", "baseline-hub")
+                owner.record_failure("fixture-seed-mismatch")
                 raise RuntimeError(
                     "old Hub ORM did not create expected two-user fixture"
                 )
@@ -572,6 +758,7 @@ def main() -> int:
                 encoding="utf-8",
             )
             os.chmod(startup_config, 0o600)
+            owner.set_operation("reject-old-schema", "candidate-hub")
             rejection_log = run_image(
                 owner,
                 new_id,
@@ -580,11 +767,14 @@ def main() -> int:
                 "startup-disabled",
                 startup_fixture / "unused.json",
                 args.timeout,
+                operation="reject-old-schema",
+                image_role="candidate-hub",
             )
             normalized_log = rejection_log.lower()
             if "schema" not in normalized_log or not any(
                 marker in normalized_log for marker in ("upgrade", "migration")
             ):
+                owner.record_failure("schema-rejection-mismatch")
                 raise RuntimeError(
                     "Hub 6 did not report a migration-disabled cold-schema rejection"
                 )
@@ -596,11 +786,18 @@ def main() -> int:
                 "snapshot",
                 startup_fixture / "after-rejection.json",
                 30,
+                operation="reject-old-schema",
+                image_role="candidate-hub",
             )
-            after_rejection = json.loads(
-                (startup_fixture / "after-rejection.json").read_text(encoding="utf-8")
+            after_rejection = read_fixture_json(
+                startup_fixture / "after-rejection.json",
+                owner,
+                operation="reject-old-schema",
+                image_role="candidate-hub",
+                classification="snapshot-change",
             )
             if after_rejection != baseline:
+                owner.record_failure("snapshot-change")
                 raise RuntimeError(
                     "migration-disabled Hub 6 startup changed the cold schema or fixture identities"
                 )
@@ -614,6 +811,8 @@ def main() -> int:
                 "upgrade",
                 fixture / "unused.json",
                 args.timeout,
+                operation="upgrade-candidate",
+                image_role="candidate-hub",
             )
             run_image(
                 owner,
@@ -623,15 +822,53 @@ def main() -> int:
                 "snapshot",
                 fixture / "migrated.json",
                 30,
+                operation="upgrade-candidate",
+                image_role="candidate-hub",
             )
-            migrated = json.loads(
-                (fixture / "migrated.json").read_text(encoding="utf-8")
+            migrated = read_fixture_json(
+                fixture / "migrated.json",
+                owner,
+                operation="upgrade-candidate",
+                image_role="candidate-hub",
+                classification="snapshot-change",
             )
             if {k: v for k, v in migrated.items() if k != "schema"} != {
                 k: v for k, v in baseline.items() if k != "schema"
             }:
+                owner.set_operation("upgrade-candidate", "candidate-hub")
+                owner.record_failure("snapshot-change")
                 raise RuntimeError(
                     "Hub 6 migration changed seeded identities or associations"
+                )
+            extension_file = fixture / "display-name-extension.json"
+            run_image(
+                owner,
+                new_id,
+                fixture,
+                worker,
+                "verify-display-name",
+                extension_file,
+                30,
+                operation="upgrade-candidate",
+                image_role="candidate-hub",
+            )
+            extension = read_fixture_json(
+                extension_file,
+                owner,
+                operation="upgrade-candidate",
+                image_role="candidate-hub",
+                classification="schema-extension-mismatch",
+            )
+            if extension != {
+                "status": "pass",
+                "classification": "verified",
+                "spawner_count": 2,
+                "non_null_display_name_count": 0,
+            }:
+                owner.set_operation("upgrade-candidate", "candidate-hub")
+                owner.record_failure("schema-extension-mismatch")
+                raise RuntimeError(
+                    "candidate migration did not add nullable display_name"
                 )
             # This is schema-idempotence, NOT a claim that Hub server startup ran.
             run_image(
@@ -642,6 +879,8 @@ def main() -> int:
                 "upgrade",
                 fixture / "unused.json",
                 args.timeout,
+                operation="idempotence",
+                image_role="candidate-hub",
             )
             run_image(
                 owner,
@@ -651,11 +890,19 @@ def main() -> int:
                 "snapshot",
                 fixture / "repeated.json",
                 30,
+                operation="idempotence",
+                image_role="candidate-hub",
             )
-            repeated = json.loads(
-                (fixture / "repeated.json").read_text(encoding="utf-8")
+            repeated = read_fixture_json(
+                fixture / "repeated.json",
+                owner,
+                operation="idempotence",
+                image_role="candidate-hub",
+                classification="snapshot-change",
             )
             if repeated != migrated:
+                owner.set_operation("idempotence", "candidate-hub")
+                owner.record_failure("snapshot-change")
                 raise RuntimeError("repeated Hub 6 schema migration was not idempotent")
             # Cold whole-fixture restore, including original DB; no new sidecars.
             for suffix in ("-wal", "-shm", "-journal"):
@@ -672,6 +919,8 @@ def main() -> int:
                 "upgrade",
                 fixture / "unused.json",
                 args.timeout,
+                operation="restore-old",
+                image_role="baseline-hub",
             )
             run_image(
                 owner,
@@ -681,11 +930,19 @@ def main() -> int:
                 "snapshot",
                 fixture / "restored.json",
                 30,
+                operation="restore-old",
+                image_role="baseline-hub",
             )
-            restored = json.loads(
-                (fixture / "restored.json").read_text(encoding="utf-8")
+            restored = read_fixture_json(
+                fixture / "restored.json",
+                owner,
+                operation="restore-old",
+                image_role="baseline-hub",
+                classification="snapshot-change",
             )
             if restored != baseline:
+                owner.set_operation("restore-old", "baseline-hub")
+                owner.record_failure("snapshot-change")
                 raise RuntimeError(
                     "cold pre-migration restore failed old Hub ORM compatibility"
                 )
@@ -697,18 +954,13 @@ def main() -> int:
                 "positive_server_startup": "not-tested-by-db-fixture",
                 "schema_idempotence": "pass",
                 "old_orm_cold_restore_compatibility": "pass",
-                "owned_container_cleanup": "pending",
-                "old_image_id": old_id,
-                "new_image_id": new_id,
-                "old_version": OLD_VERSION,
-                "new_version": NEW_VERSION,
-                "schema_before": baseline["schema"],
-                "schema_after": migrated["schema"],
             }
             temp_directory.preserve = True
         _SUITE_DEADLINE = time.monotonic() + 120
         owner.cleanup()
         if owner.cleanup_verified is not True:
+            owner.set_operation("restore-old", "baseline-hub")
+            owner.record_failure("owned-container-cleanup-incomplete")
             raise RuntimeError("owned DB runner container cleanup was unverified")
         safe_result["owned_container_cleanup"] = "verified"
         if temp_directory is not None:
@@ -716,18 +968,16 @@ def main() -> int:
                 shutil.rmtree(temp_directory.path)
             except OSError:
                 fixture_cleanup = "incomplete"
+                owner.set_operation("restore-old", "baseline-hub")
+                owner.record_failure("fixture-cleanup-incomplete")
                 raise
             fixture_cleanup = "verified"
         safe_result["fixture_cleanup"] = fixture_cleanup
+        safe_result["owned_container_count"] = len(owner.names)
+        safe_result["remaining_owned_container_count"] = 0
         print(json.dumps(safe_result, sort_keys=True))
         return 0
-    except (
-        OSError,
-        sqlite3.Error,
-        subprocess.SubprocessError,
-        RuntimeError,
-        ValueError,
-    ):
+    except Exception as exc:
         _SUITE_DEADLINE = time.monotonic() + 120
         cleanup_exception = False
         try:
@@ -745,27 +995,42 @@ def main() -> int:
         elif temp_directory is not None:
             temp_directory.preserve = True
             fixture_cleanup = "preserved-owned-containers-unverified"
+        primary_context = owner.failure_context
+        if primary_context is None:
+            owner.record_failure(
+                "timeout"
+                if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))
+                else "operation-failed"
+            )
+            primary_context = owner.failure_context
+        cleanup_context = None
+        if not cleanup_verified:
+            cleanup_context = {
+                "operation": "db-owned-cleanup",
+                "image_role": "shared",
+                "classification": "owned-container-cleanup-incomplete",
+            }
+        elif fixture_cleanup != "verified" and temp_directory is not None:
+            cleanup_context = {
+                "operation": "db-fixture-cleanup",
+                "image_role": "shared",
+                "classification": "fixture-cleanup-incomplete",
+            }
         print(
             json.dumps(
                 {
                     "status": "fail",
-                    "reason": "migration-fixture-or-cleanup-error",
+                    "failure_context": primary_context,
+                    "cleanup_failure_context": cleanup_context,
                     "owned_container_cleanup": "verified"
                     if cleanup_verified
                     else "incomplete-or-unknown",
-                    "fixture_preserved": fixture_cleanup != "verified",
                     "fixture_cleanup": fixture_cleanup,
                     "failed_cleanup_stages": []
                     if cleanup_verified
                     else ["db-owned-container-cleanup"],
-                    "remaining_owned_names": owner.cleanup_failures,
-                    "remaining_owned_resources": [
-                        {
-                            "name": name,
-                            "id": owner.ids_by_name.get(name, "unknown"),
-                        }
-                        for name in owner.cleanup_failures
-                    ],
+                    "owned_container_count": len(owner.names),
+                    "remaining_owned_container_count": len(owner.cleanup_failures),
                 },
                 sort_keys=True,
             )

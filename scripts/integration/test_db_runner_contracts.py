@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
+import sqlite3
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.integration.test_db_migration import (
+    DISPLAY_NAME_COUNT_QUERY,
     IMAGE_DIGEST,
     IMAGE_ID,
+    SPAWNER_SHARED_SELECT,
     WORKER,
     OwnedContainers,
     assert_seeded_fixture,
@@ -67,6 +72,78 @@ def fixture() -> dict:
 class DatabaseRunnerContracts(unittest.TestCase):
     def test_worker_source_is_syntactically_valid(self) -> None:
         compile(WORKER, "fixture_worker.py", "exec")
+
+    def test_old_orm_seed_uses_only_old_spawner_constructor_fields(self) -> None:
+        seed_line = next(
+            line.strip()
+            for line in WORKER.splitlines()
+            if "spawner = orm.Spawner(" in line
+        )
+        expression = ast.parse(seed_line).body[0].value
+        self.assertEqual(
+            {keyword.arg for keyword in expression.keywords},
+            {"name", "state", "user_options", "oauth_client_id"},
+        )
+
+        class StrictOldSpawner:
+            def __init__(self, name, state, user_options, oauth_client_id):
+                self.values = (name, state, user_options, oauth_client_id)
+
+        namespace = {"orm": SimpleNamespace(Spawner=StrictOldSpawner)}
+        exec(seed_line, namespace)
+        self.assertIsInstance(namespace["spawner"], StrictOldSpawner)
+
+    def test_shared_spawner_snapshot_query_runs_on_actual_old_sqlite_shape(
+        self,
+    ) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+            "CREATE TABLE spawners ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL, "
+            "state TEXT, user_options TEXT, oauth_client_id TEXT);"
+            "INSERT INTO users VALUES (1, 'fixture-user');"
+            "INSERT INTO spawners VALUES (1, 1, '', '{}', '{}', 'fixture-client');"
+        )
+        try:
+            rows = [dict(row) for row in connection.execute(SPAWNER_SHARED_SELECT)]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["user"], "fixture-user")
+            self.assertEqual(rows[0]["oauth_client_id"], "fixture-client")
+            self.assertNotIn("display_name", rows[0])
+        finally:
+            connection.close()
+
+    def test_candidate_display_name_extension_requires_nullable_migrated_rows(
+        self,
+    ) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE spawners (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute(DISPLAY_NAME_COUNT_QUERY)
+            connection.execute("ALTER TABLE spawners ADD COLUMN display_name TEXT")
+            connection.execute(
+                "INSERT INTO spawners (id, name) VALUES (1, ''), (2, 'named')"
+            )
+            display_column = next(
+                row
+                for row in connection.execute("PRAGMA table_info(spawners)")
+                if row[1] == "display_name"
+            )
+            self.assertEqual(display_column[3], 0)
+            self.assertEqual(
+                connection.execute(DISPLAY_NAME_COUNT_QUERY).fetchone(), (2, 0)
+            )
+            connection.execute("UPDATE spawners SET display_name='changed' WHERE id=1")
+            self.assertEqual(
+                connection.execute(DISPLAY_NAME_COUNT_QUERY).fetchone(), (2, 1)
+            )
+        finally:
+            connection.close()
 
     def test_fixture_requires_both_user_scoped_token_and_spawner_associations(
         self,

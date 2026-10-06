@@ -1362,6 +1362,139 @@ class SuiteContractTests(unittest.TestCase):
         with self.assertRaises(run_suite.HarnessFailure):
             run_suite.validate_db_evidence(facts)
 
+    def test_db_runner_pass_parser_requires_verified_inner_cleanup(self) -> None:
+        evidence = {
+            "status": "pass",
+            "test": "upstream-db-migration-and-cold-orm-restore",
+            "migration_disabled_cold_startup_rejection": "pass",
+            "migration_disabled_startup_preserved_schema_and_identities": "pass",
+            "positive_server_startup": "not-tested-by-db-fixture",
+            "schema_idempotence": "pass",
+            "old_orm_cold_restore_compatibility": "pass",
+            "owned_container_cleanup": "verified",
+            "fixture_cleanup": "verified",
+            "owned_container_count": 9,
+            "remaining_owned_container_count": 0,
+        }
+        parsed = run_suite.parse_db_runner_evidence(
+            json.dumps(evidence).encode(), returncode=0
+        )
+        self.assertEqual(parsed["owned_container_cleanup"], "verified")
+        evidence["owned_container_cleanup"] = "incomplete-or-unknown"
+        with self.assertRaises(run_suite.HarnessFailure):
+            run_suite.parse_db_runner_evidence(json.dumps(evidence).encode(), 0)
+
+    def test_db_runner_failure_parser_keeps_child_cleanup_separate_and_safe(
+        self,
+    ) -> None:
+        evidence = {
+            "status": "fail",
+            "failure_context": {
+                "operation": "seed-old",
+                "image_role": "baseline-hub",
+                "classification": "worker-failed",
+                "returncode": 1,
+            },
+            "cleanup_failure_context": None,
+            "owned_container_cleanup": "verified",
+            "fixture_cleanup": "verified",
+            "owned_container_count": 4,
+            "remaining_owned_container_count": 0,
+            "failed_cleanup_stages": [],
+        }
+        parsed = run_suite.parse_db_runner_evidence(
+            json.dumps(evidence).encode(), returncode=1
+        )
+        self.assertEqual(parsed["failure_context"]["operation"], "seed-old")
+        self.assertEqual(parsed["owned_container_cleanup"], "verified")
+        self.assertEqual(parsed["fixture_cleanup"], "verified")
+        self.assertEqual(parsed["remaining_owned_container_count"], 0)
+
+    def test_db_runner_failure_forwards_only_bounded_context_and_cleanup(self) -> None:
+        evidence = {
+            "status": "fail",
+            "failure_context": {
+                "operation": "seed-old",
+                "image_role": "baseline-hub",
+                "classification": "worker-failed",
+                "returncode": 1,
+            },
+            "cleanup_failure_context": {
+                "operation": "db-owned-cleanup",
+                "image_role": "shared",
+                "classification": "owned-container-cleanup-incomplete",
+            },
+            "owned_container_cleanup": "incomplete-or-unknown",
+            "fixture_cleanup": "preserved-owned-containers-unverified",
+            "owned_container_count": 2,
+            "remaining_owned_container_count": 1,
+            "failed_cleanup_stages": ["db-owned-container-cleanup"],
+        }
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        suite.run_root = Path.cwd()
+        suite.image_ids.update(
+            {"old_hub": "sha256:" + "a" * 64, "candidate_hub": "sha256:" + "b" * 64}
+        )
+        completed = subprocess.CompletedProcess(
+            [], 1, json.dumps(evidence).encode(), b"private stderr token-secret"
+        )
+        with (
+            patch.object(run_suite, "safe_call", return_value=completed),
+            self.assertRaises(run_suite.HarnessFailure),
+        ):
+            suite.test_db_runner()
+        self.assertEqual(
+            suite.failure_context,
+            {
+                "operation": "seed-old",
+                "image_role": "baseline-hub",
+                "classification": "worker-failed",
+                "returncode": 1,
+            },
+        )
+        self.assertEqual(
+            suite.cleanup_failure_context,
+            {
+                "operation": "db-owned-cleanup",
+                "image_role": "shared",
+                "classification": "owned-container-cleanup-incomplete",
+            },
+        )
+        self.assertEqual(
+            suite.results["db_runner_cleanup"]["remaining_owned_container_count"], 1
+        )
+        self.assertNotIn("token-secret", json.dumps(suite.results))
+
+    def test_db_runner_parser_rejects_unknown_or_oversized_output_safely(self) -> None:
+        evidence = {
+            "status": "fail",
+            "failure_context": {
+                "operation": "seed-old",
+                "image_role": "baseline-hub",
+                "classification": "worker-failed",
+            },
+            "cleanup_failure_context": None,
+            "owned_container_cleanup": "verified",
+            "fixture_cleanup": "verified",
+            "owned_container_count": 1,
+            "remaining_owned_container_count": 0,
+            "failed_cleanup_stages": [],
+            "exception": "token-secret-must-not-be-forwarded",
+        }
+        with self.assertRaisesRegex(
+            run_suite.HarnessFailure, "invalid sanitized evidence"
+        ) as raised:
+            run_suite.parse_db_runner_evidence(
+                json.dumps(evidence).encode(), returncode=1
+            )
+        self.assertNotIn("token-secret", str(raised.exception))
+        with self.assertRaisesRegex(
+            run_suite.HarnessFailure, "invalid sanitized evidence"
+        ):
+            run_suite.parse_db_runner_evidence(
+                b" " * (run_suite.DB_RESULT_MAX_BYTES + 1), returncode=1
+            )
+
     def test_source_archive_creates_owned_source_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

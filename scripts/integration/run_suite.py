@@ -41,6 +41,7 @@ MIN_FREE = 25 * 1024**3
 BUILD_TIMEOUT = 1200
 UPDATE_TIMEOUT = 600
 DB_TIMEOUT = 1800
+DB_RESULT_MAX_BYTES = 64 * 1024
 PROBE_TIMEOUT = 1230
 STAGE_TIMEOUT = 1800
 OVERALL_TEST_TIMEOUT = 4800
@@ -147,6 +148,172 @@ def validate_db_evidence(facts: dict[str, Any]) -> None:
         or facts.get("positive_server_startup") != "not-tested-by-db-fixture"
     ):
         raise HarnessFailure("DB runner did not prove its declared migration contract")
+
+
+DB_CONTEXT_OPERATIONS = {
+    "version-old",
+    "version-candidate",
+    "initialize-old",
+    "seed-old",
+    "reject-old-schema",
+    "upgrade-candidate",
+    "idempotence",
+    "restore-old",
+    "db-owned-cleanup",
+    "db-fixture-cleanup",
+}
+DB_CONTEXT_ROLES = {"baseline-hub", "candidate-hub", "shared"}
+DB_CONTEXT_CLASSIFICATIONS = {
+    "worker-failed",
+    "timeout",
+    "version-mismatch",
+    "image-identity-mismatch",
+    "fixture-seed-mismatch",
+    "schema-rejection-mismatch",
+    "schema-extension-mismatch",
+    "snapshot-change",
+    "operation-failed",
+    "owned-container-cleanup-incomplete",
+    "fixture-cleanup-incomplete",
+}
+
+
+def parse_db_runner_evidence(output: bytes, returncode: int) -> dict[str, Any]:
+    if len(output) > DB_RESULT_MAX_BYTES:
+        raise HarnessFailure("DB runner returned invalid sanitized evidence")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        facts = json.loads(output.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError):
+        raise HarnessFailure("DB runner returned invalid sanitized evidence") from None
+    if not isinstance(facts, dict) or facts.get("status") not in {"pass", "fail"}:
+        raise HarnessFailure("DB runner returned invalid sanitized evidence")
+
+    common_cleanup = {
+        "owned_container_cleanup",
+        "fixture_cleanup",
+        "owned_container_count",
+        "remaining_owned_container_count",
+    }
+
+    def valid_counts() -> bool:
+        count = facts.get("owned_container_count")
+        remaining = facts.get("remaining_owned_container_count")
+        return (
+            type(count) is int
+            and count >= 0
+            and type(remaining) is int
+            and 0 <= remaining <= count
+        )
+
+    if facts["status"] == "pass":
+        expected = common_cleanup | {
+            "status",
+            "test",
+            "migration_disabled_cold_startup_rejection",
+            "migration_disabled_startup_preserved_schema_and_identities",
+            "positive_server_startup",
+            "schema_idempotence",
+            "old_orm_cold_restore_compatibility",
+        }
+        if (
+            returncode != 0
+            or set(facts) != expected
+            or facts.get("test") != "upstream-db-migration-and-cold-orm-restore"
+            or facts.get("owned_container_cleanup") != "verified"
+            or facts.get("fixture_cleanup") != "verified"
+            or not valid_counts()
+            or facts.get("remaining_owned_container_count") != 0
+        ):
+            raise HarnessFailure("DB runner returned invalid sanitized evidence")
+        validate_db_evidence(facts)
+        return facts
+
+    expected = common_cleanup | {
+        "status",
+        "failure_context",
+        "cleanup_failure_context",
+        "failed_cleanup_stages",
+    }
+    if (
+        returncode == 0
+        or set(facts) != expected
+        or facts.get("owned_container_cleanup")
+        not in {"verified", "incomplete-or-unknown"}
+        or facts.get("fixture_cleanup")
+        not in {
+            "verified",
+            "incomplete",
+            "not-attempted",
+            "preserved-owned-containers-unverified",
+        }
+        or not valid_counts()
+        or facts.get("remaining_owned_container_count") != 0
+        and facts.get("owned_container_cleanup") == "verified"
+    ):
+        raise HarnessFailure("DB runner returned invalid sanitized evidence")
+
+    def valid_context(value: Any, *, cleanup: bool = False) -> bool:
+        if value is None:
+            return cleanup
+        if not isinstance(value, dict):
+            return False
+        keys = set(value)
+        if not {"operation", "image_role", "classification"} <= keys or not keys <= {
+            "operation",
+            "image_role",
+            "classification",
+            "returncode",
+        }:
+            return False
+        if (
+            value.get("operation") not in DB_CONTEXT_OPERATIONS
+            or value.get("image_role") not in DB_CONTEXT_ROLES
+            or value.get("classification") not in DB_CONTEXT_CLASSIFICATIONS
+        ):
+            return False
+        return "returncode" not in value or (
+            type(value["returncode"]) is int and -255 <= value["returncode"] <= 255
+        )
+
+    cleanup_stages = facts.get("failed_cleanup_stages")
+    cleanup_context = facts.get("cleanup_failure_context")
+    container_cleanup_failed = facts["owned_container_cleanup"] != "verified"
+    fixture_cleanup_failed = facts["fixture_cleanup"] == "incomplete"
+    if (
+        not valid_context(facts.get("failure_context"))
+        or not valid_context(cleanup_context, cleanup=True)
+        or not isinstance(cleanup_stages, list)
+        or any(stage != "db-owned-container-cleanup" for stage in cleanup_stages)
+        or len(cleanup_stages) > 1
+        or (facts["owned_container_cleanup"] == "verified" and cleanup_stages)
+        or (facts["owned_container_cleanup"] != "verified" and not cleanup_stages)
+        or (
+            container_cleanup_failed
+            and (
+                not isinstance(cleanup_context, dict)
+                or cleanup_context.get("classification")
+                != "owned-container-cleanup-incomplete"
+            )
+        )
+        or (
+            fixture_cleanup_failed
+            and (
+                not isinstance(cleanup_context, dict)
+                or cleanup_context.get("classification") != "fixture-cleanup-incomplete"
+            )
+        )
+    ):
+        raise HarnessFailure("DB runner returned invalid sanitized evidence")
+    return facts
 
 
 def atomic_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
@@ -2074,43 +2241,100 @@ class Suite:
         self.active_case = "actual-upstream-db-migration"
         assert self.run_root is not None
         script = self.workspace / "scripts" / "integration" / "test_db_migration.py"
-        result = safe_call(
-            [
-                sys.executable,
-                str(script),
-                "--acknowledge-disposable",
-                "--old-image",
-                self.image_ids["old_hub"],
-                "--new-image",
-                self.image_ids["candidate_hub"],
-                "--timeout",
-                "120",
-                "--suite-timeout",
-                str(DB_TIMEOUT),
-            ],
-            # The DB runner may need its bounded 120s ownership cleanup after
-            # its acceptance deadline; leave that cleanup alive in this parent.
-            timeout=DB_TIMEOUT + 180,
-            cwd=self.workspace,
-            capture=True,
-        )
-        if result.returncode:
-            raise HarnessFailure("actual Hub 5-to-6 database migration runner failed")
         try:
-            facts = json.loads((result.stdout or b"").decode())
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise HarnessFailure(
-                "DB runner returned invalid sanitized evidence"
-            ) from exc
-        validate_db_evidence(facts)
+            result = safe_call(
+                [
+                    sys.executable,
+                    str(script),
+                    "--acknowledge-disposable",
+                    "--old-image",
+                    self.image_ids["old_hub"],
+                    "--new-image",
+                    self.image_ids["candidate_hub"],
+                    "--timeout",
+                    "120",
+                    "--suite-timeout",
+                    str(DB_TIMEOUT),
+                ],
+                # The DB runner may need its bounded 120s ownership cleanup after
+                # its acceptance deadline; leave that cleanup alive in this parent.
+                timeout=DB_TIMEOUT + 180,
+                cwd=self.workspace,
+                capture=True,
+            )
+        except HarnessFailure:
+            self.failure_context = {
+                "operation": "db-runner-output",
+                "image_role": "shared",
+                "classification": "db-runner-output-invalid",
+            }
+            self.results["db_runner_cleanup"] = {
+                "owned_container_cleanup": "unknown",
+                "fixture_cleanup": "unknown",
+                "owned_container_count": None,
+                "remaining_owned_container_count": None,
+                "failed_cleanup_stages": [],
+            }
+            raise HarnessFailure("DB runner did not return bounded evidence") from None
+        try:
+            facts = parse_db_runner_evidence(result.stdout or b"", result.returncode)
+        except HarnessFailure:
+            self.failure_context = {
+                "operation": "db-runner-output",
+                "image_role": "shared",
+                "classification": "db-runner-output-invalid",
+                "returncode": result.returncode,
+            }
+            self.results["db_runner_cleanup"] = {
+                "owned_container_cleanup": "unknown",
+                "fixture_cleanup": "unknown",
+                "owned_container_count": None,
+                "remaining_owned_container_count": None,
+                "failed_cleanup_stages": [],
+            }
+            raise HarnessFailure("DB runner did not return bounded evidence") from None
+        self.results["db_runner_cleanup"] = {
+            key: facts[key]
+            for key in (
+                "owned_container_cleanup",
+                "fixture_cleanup",
+                "owned_container_count",
+                "remaining_owned_container_count",
+            )
+        }
+        self.results["db_runner_cleanup"]["failed_cleanup_stages"] = facts.get(
+            "failed_cleanup_stages", []
+        )
+        if facts["status"] != "pass":
+            child_context = facts["failure_context"]
+            self.failure_context = {
+                "operation": child_context["operation"],
+                "image_role": child_context["image_role"],
+                "classification": child_context["classification"],
+            }
+            if "returncode" in child_context:
+                self.failure_context["returncode"] = child_context["returncode"]
+            cleanup_context = facts["cleanup_failure_context"]
+            if cleanup_context is not None:
+                self.cleanup_failure_context = {
+                    "operation": cleanup_context["operation"],
+                    "image_role": cleanup_context["image_role"],
+                    "classification": cleanup_context["classification"],
+                }
+                if "returncode" in cleanup_context:
+                    self.cleanup_failure_context["returncode"] = cleanup_context[
+                        "returncode"
+                    ]
+            raise HarnessFailure("actual Hub 5-to-6 database migration runner failed")
         self.add_case(
             "actual-upstream-db-migration",
-            schema_before=facts.get("schema_before"),
-            schema_after=facts.get("schema_after"),
             schema_idempotence=facts["schema_idempotence"],
             old_orm_cold_restore=facts["old_orm_cold_restore_compatibility"],
             migration_disabled_startup=facts[
                 "migration_disabled_cold_startup_rejection"
+            ],
+            migration_disabled_preserved_schema_and_identities=facts[
+                "migration_disabled_startup_preserved_schema_and_identities"
             ],
         )
 
