@@ -1,4 +1,4 @@
-name: JupyterHub 5 to 6 isolated integration
+name: LEAN application validation via test-only reference controller
 
 on:
   pull_request:
@@ -31,18 +31,32 @@ on:
 permissions:
   contents: read
 
+env:
+  FINKI_HUB_LEAN_SOURCE_REF: c05128bf581ff8c57f5dff9e216c00639e430416
+
 jobs:
   checks:
+    # Never enables runtime or changes gates for original PR17/other branches.
+    if: github.head_ref == 'jupyterhub-6-validation' || github.ref == 'refs/heads/jupyterhub-6-validation'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout the exact PR revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify frozen application Git objects before setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 60s git fetch --no-tags origin "$FINKI_HUB_LEAN_SOURCE_REF"
+          timeout 60s python3 -m scripts.integration.source_binding --workspace "$GITHUB_WORKSPACE"
 
       - name: Set up project Python and uv
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.14'
 
@@ -64,19 +78,19 @@ jobs:
             "import pathlib,py_compile; [py_compile.compile(str(p), doraise=True) for p in pathlib.Path('scripts/integration').glob('*.py')]"
           timeout 180s uv run --project hub --frozen --group dev python -m unittest discover -s scripts/tests -p 'test_*.py'
           timeout 180s uv run --project hub --frozen --group dev python -m unittest \
-            scripts.integration.test_probe_contracts \
-            scripts.integration.test_db_runner_contracts \
-            scripts.integration.test_suite_contracts
+             scripts.integration.test_probe_contracts \
+             scripts.integration.test_db_runner_contracts \
+             scripts.integration.test_suite_contracts \
+             scripts.integration.test_source_binding
           bash -n scripts/integration/jupyterhub-migration.sh
 
-      - name: Ruff-check controller, integration runner, probes, and contracts
+      - name: Ruff-check external test tooling without changing shipping Hub config
         working-directory: .
         shell: bash
         run: |
           set -euo pipefail
           timeout 180s uv run --project hub --frozen --group dev ruff check \
-            --config hub/pyproject.toml \
-            --select E,F,I,UP,B --ignore E501 \
+            --config scripts/integration/ruff-validation.toml \
             scripts/jupyterhub_maintenance.py \
             scripts/jupyterhub_maintenance_config.py \
             scripts/integration/probe.py \
@@ -84,7 +98,9 @@ jobs:
             scripts/integration/test_db_migration.py \
             scripts/integration/test_probe_contracts.py \
             scripts/integration/test_db_runner_contracts.py \
-            scripts/integration/test_suite_contracts.py
+            scripts/integration/test_suite_contracts.py \
+            scripts/integration/source_binding.py \
+            scripts/integration/test_source_binding.py
 
       - name: Mypy-check the maintenance controller and integration probes on Linux
         working-directory: .
@@ -94,25 +110,36 @@ jobs:
           timeout 180s uv run --project hub --frozen --group dev mypy \
             --config-file hub/pyproject.toml \
             --platform linux \
-            scripts/jupyterhub_maintenance.py \
-            scripts/integration/probe.py \
-            scripts/integration/run_suite.py
+            --explicit-package-bases \
+             scripts/jupyterhub_maintenance.py \
+             scripts/integration/probe.py \
+             scripts/integration/run_suite.py \
+             scripts/integration/source_binding.py
 
   xfs-preflight:
     needs: checks
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/jupyterhub-6-validation' && inputs.disposable_runner_approved == 'APPROVED') ||
+      (github.event_name == 'pull_request' && github.head_ref == 'jupyterhub-6-validation' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-6-validation-runtime-approved'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout exact PR revision and pinned baseline object
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify frozen application Git objects before privileged setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 60s git fetch --no-tags origin "$FINKI_HUB_LEAN_SOURCE_REF"
+          timeout 60s python3 -m scripts.integration.source_binding --workspace "$GITHUB_WORKSPACE"
 
       - name: Set up project Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.14'
 
@@ -134,7 +161,7 @@ jobs:
         run: |
           set -euo pipefail
           result="$RUNNER_TEMP/jupyterhub-xfs-preflight.json"
-          if sudo -n env RUNNER_TEMP="$RUNNER_TEMP" bash scripts/integration/jupyterhub-migration.sh run \
+          if timeout 780s sudo -n env RUNNER_TEMP="$RUNNER_TEMP" FINKI_HUB_LEAN_SOURCE_REF="$FINKI_HUB_LEAN_SOURCE_REF" bash scripts/integration/jupyterhub-migration.sh run \
             --workspace "$GITHUB_WORKSPACE" \
             --acknowledge-disposable \
             --acknowledge-interruption \
@@ -176,19 +203,28 @@ jobs:
     if: >-
       needs.xfs-preflight.result == 'success' &&
       (
-      (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/jupyterhub-6-validation' && inputs.disposable_runner_approved == 'APPROVED') ||
+      (github.event_name == 'pull_request' && github.head_ref == 'jupyterhub-6-validation' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-6-validation-runtime-approved'))
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout exact PR revision and pinned baseline object
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify frozen application Git objects before privileged setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 60s git fetch --no-tags origin "$FINKI_HUB_LEAN_SOURCE_REF"
+          timeout 60s python3 -m scripts.integration.source_binding --workspace "$GITHUB_WORKSPACE"
 
       - name: Set up project Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.14'
 
@@ -202,13 +238,13 @@ jobs:
           command -v xfs_quota
           sudo -n docker info >/dev/null
 
-      - name: Run full disposable XFS/Docker migration and restore suite
+      - name: Run preserved two-cycle suite (NOT manual README rehearsal)
         shell: bash
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          sudo -n env RUNNER_TEMP="$RUNNER_TEMP" bash scripts/integration/jupyterhub-migration.sh run \
+          timeout 5100s sudo -n env RUNNER_TEMP="$RUNNER_TEMP" FINKI_HUB_LEAN_SOURCE_REF="$FINKI_HUB_LEAN_SOURCE_REF" bash scripts/integration/jupyterhub-migration.sh run \
             --workspace "$GITHUB_WORKSPACE" \
             --acknowledge-disposable \
             --acknowledge-interruption \

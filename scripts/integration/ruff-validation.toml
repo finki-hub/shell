@@ -1,0 +1,7 @@
+# External reference controller and fixture contracts, not shipping Hub config.
+target-version = "py314"
+line-length = 88
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

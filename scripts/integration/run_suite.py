@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end PR17 acceptance on one empty ephemeral rootful Linux Docker VM.
+"""LEAN application validation via preserved test-only reference orchestration.
+
+This two-cycle suite does not rehearse the manual shipping README procedure.
+It runs on one empty ephemeral rootful Linux Docker VM only after source binding.
 
 All Docker/filesystem work is scoped to a private run root with an ownership
 manifest. This program intentionally refuses shared/nonempty Docker daemons.
@@ -29,6 +32,11 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
+
+# Support the existing direct-script entry point and namespace-package tests
+# with one import identity (also used by the Linux mypy check).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.integration.source_binding import SOURCE_ENV, bind_source
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
 VERSION_LABEL = "org.finki-hub.jupyterhub-version"
@@ -726,6 +734,8 @@ class Suite:
         self.project_name = f"{PROJECT}-{self.run_id}"
         self.update_env: dict[str, str] = {}
         self.created_run_root = False
+        self.lean_ref = os.environ.get(SOURCE_ENV)
+        self.source_binding: dict[str, Any] = {}
 
     def record_stage(self, name: str, **details: Any) -> None:
         self.active_stage = name
@@ -1354,6 +1364,11 @@ class Suite:
             raise HarnessFailure("image version label did not match its role")
 
     def preflight(self) -> None:
+        # Read-only gate precedes even daemon inspection, and therefore every
+        # Docker/XFS mutation. HEAD, not unstaged copies, is the build source.
+        self.source_binding = bind_source(self.workspace, self.lean_ref)
+        self.manifest["source_binding"] = self.source_binding
+        self.results["source_binding"] = self.source_binding
         if sys.platform != "linux" or os.geteuid() != 0:
             raise HarnessFailure("full acceptance requires root on Linux")
         for tool in (
@@ -1480,6 +1495,8 @@ class Suite:
         )
         if not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha):
             raise HarnessFailure("candidate source identity unavailable")
+        if self.candidate_sha != self.source_binding["validation"]:
+            raise HarnessFailure("validation HEAD changed after source binding")
         if self.candidate_sha == self.baseline_sha:
             raise HarnessFailure("candidate revision equals the pinned old baseline")
         self.record_stage(
@@ -2481,6 +2498,9 @@ class Suite:
             raise HarnessFailure("could not record image tag ownership") from None
 
     def build_images(self) -> None:
+        # Recheck immediately before archiving/building, including worktree dirt.
+        if bind_source(self.workspace, self.lean_ref) != self.source_binding:
+            raise HarnessFailure("source binding changed before image build")
         assert self.run_root is not None
         source_root = self.run_root / "source"
         old_source = self.archive_source(
@@ -2564,6 +2584,15 @@ class Suite:
             role="baseline-lab-base",
             allowed=("", "<no value>"),
         )
+        # Raw identities are distinct from the later test-only ownership and
+        # package-proven baseline-label wrappers. No shipping-image equivalence.
+        self.manifest["raw_shipping_images"] = {
+            "baseline_hub": old_hub_base,
+            "baseline_lab": old_lab_base,
+            "candidate_hub": candidate_hub_base,
+            "candidate_lab": candidate_lab,
+        }
+        self.results["raw_shipping_images"] = self.manifest["raw_shipping_images"]
         # A test-only Hub image wrapper adds only a run label to DockerSpawner.
         wrapper = self.run_root / "integration_jupyterhub_config.py"
         self.begin_image_operation("wrapper-source-create", "shared")
@@ -3136,7 +3165,10 @@ class Suite:
                     "labels": {RUN_LABEL: self.run_id},
                     "environment": {"SHELL_INTEGRATION_RUN_ID": self.run_id},
                 },
-                "lab": {"image": self.image_refs["candidate_lab"]},
+                "lab": {
+                    "image": self.image_refs["candidate_lab"],
+                    "networks": ["users"],
+                },
             }
         }
         atomic_json(self.candidate_override, override)
@@ -3164,7 +3196,10 @@ class Suite:
                         "restart": "no",
                         "labels": {RUN_LABEL: self.run_id},
                     },
-                    "lab": {"image": self.image_refs["old_lab"]},
+                    "lab": {
+                        "image": self.image_refs["old_lab"],
+                        "networks": ["users"],
+                    },
                 }
             },
         )
@@ -3173,6 +3208,7 @@ class Suite:
         data_dir.mkdir(parents=True, mode=0o700)
         self.record_stage(
             "explicit-fixture-configuration",
+            lab_profile_network="test-only-controller-shape; image-only-service-never-started",
             env_sha256=digest(self.env_file),
             compose_sha256=digest(self.compose),
             compose_project=self.project_name,
@@ -5224,6 +5260,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--baseline-revision", default=BASELINE_SHA)
+    parser.add_argument("--lean-ref", default=os.environ.get(SOURCE_ENV))
     parser.add_argument("--acknowledge-disposable", action="store_true")
     parser.add_argument("--acknowledge-interruption", action="store_true")
     parser.add_argument("--acknowledge-ingress-fenced", action="store_true")
@@ -5249,6 +5286,7 @@ def main() -> int:
         parser.error("only the accepted exact pre-PR baseline is supported")
     try:
         suite = Suite(args.workspace, args.baseline_revision)
+        suite.lean_ref = args.lean_ref
         return suite.run_xfs_only() if args.xfs_only else suite.run()
     except Exception:
         if args.xfs_only:

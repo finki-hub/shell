@@ -58,6 +58,11 @@ class MaintenanceComposeConfigTests(unittest.TestCase):
             assert suite.initial_override and suite.candidate_override
 
             self.assertTrue(suite.compose.is_file())
+            self.assertTrue(
+                suite.compose.read_bytes()
+                == (repository / "compose.yaml").read_bytes(),
+                "shipping Compose must remain unchanged by fixture adaptation",
+            )
             self.assertTrue(suite.initial_override.is_file())
             self.assertTrue(suite.candidate_override.is_file())
             environment_file = suite.env_file.read_text(encoding="utf-8")
@@ -80,6 +85,11 @@ class MaintenanceComposeConfigTests(unittest.TestCase):
             candidate_override = json.loads(
                 suite.candidate_override.read_text(encoding="utf-8")
             )
+            for override in (old_override, candidate_override):
+                self.assertEqual(override["services"]["lab"]["networks"], ["users"])
+                self.assertNotIn("networks", override["services"]["hub"])
+                self.assertNotIn("networks", override["services"]["web"])
+                self.assertNotIn("networks", override["services"]["proxy"])
             self.assertTrue(
                 old_override["services"]["hub"]["image"] == suite.image_refs["old_hub"],
                 "old Hub override differs",

@@ -450,7 +450,7 @@ class SuiteContractTests(unittest.TestCase):
         self.assertIn("jupyterhub-xfs-preflight.json", workflow)
         self.assertEqual(
             workflow.count(
-                "contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime')"
+                "contains(github.event.pull_request.labels.*.name, 'jupyterhub-6-validation-runtime-approved')"
             ),
             2,
         )

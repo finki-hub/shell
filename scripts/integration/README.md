@@ -6,6 +6,23 @@ restricted to an ephemeral GitHub-hosted Ubuntu runner with an exclusive rootful
 Docker daemon and verified XFS project-quota accounting and enforcement. The
 production SSH host, its Docker daemon, local WSL, and Docker Desktop are forbidden.
 
+In the validation branch, the preserved controller is **external test-only
+orchestration**, not shipping LEAN tooling. Its two-cycle migration/rollback
+scenario does **not** rehearse or validate the manual commands/overlays in the
+shipping README. `source_binding.py` requires the frozen LEAN commit
+`c05128bf581ff8c57f5dff9e216c00639e430416` via `--lean-ref` or
+`FINKI_HUB_LEAN_SOURCE_REF`, and checks complete application Git trees/root blobs
+before daemon inspection and again before builds. V HEAD must contain the
+parent's checkpoint; matching unstaged copies are insufficient. Results record
+V, LEAN, baseline, raw image IDs and distinct ownership-wrapper IDs.
+
+The shipping Compose copy is unchanged. Generated old/candidate overrides attach
+only the image-pull-only `lab` profile entry to `users`, satisfying the reference
+controller's stricter config parser. That service is never started; actual
+DockerSpawner Lab networking and Hub/Web/proxy topology are not changed. The
+controller's private config/culler fixture and package-proven baseline labels
+are disclosed instrumentation, not shipping-image or manual-overlay equivalence.
+
 ## Safety boundary
 
 `run_suite.py` requires all four transient runner/maintenance acknowledgments.
@@ -82,14 +99,16 @@ that daemon is explicitly inside the disposable runner trust boundary.
 ```sh
 sudo env RUNNER_TEMP="$RUNNER_TEMP" python3 scripts/integration/run_suite.py \
   --workspace "$GITHUB_WORKSPACE" \
+  --lean-ref c05128bf581ff8c57f5dff9e216c00639e430416 \
   --acknowledge-disposable --acknowledge-interruption \
   --acknowledge-ingress-fenced --acknowledge-updater-paused
 ```
 
-The workflow runs on relevant pull requests using read-only repository
+The workflow runs only for `jupyterhub-6-validation` using read-only repository
 permissions, and offers a separately acknowledged manual run. It does not use
 `pull_request_target`, secrets, or production deployment. The Linux
-nonprivileged checks run on each relevant PR. After the explicit runtime label
+nonprivileged checks run on that validation branch/PR. After the distinct
+`jupyterhub-6-validation-runtime-approved` label
 (or acknowledged manual input), a focused XFS/quota preflight runs on a fresh
 ephemeral runner and uploads only its sanitized JSON result. It does not upload
 raw logs, environments, DB files, or fixture credentials. The 90-minute
@@ -124,7 +143,7 @@ and `/user/*`; its `/hub/*` fallback returns 404. Therefore public Caddy
 browser-login/OAuth redirect routing is not claimed or tested, and the harness
 does not add a source-auth rewrite. The full suite separately verifies real XFS
 ownership and quota enforcement, installed Hub/Lab versions, and
-shipping-helper behavior. The probe accepts only `http://127.0.0.1:8000`. Output is case/status only; credentials,
+reference-controller behavior. The probe accepts only `http://127.0.0.1:8000`. Output is case/status only; credentials,
 response bodies, environments, DB snapshots, and token-bearing URLs are not
 published.
 
@@ -167,7 +186,7 @@ schema-migration success are not treated as server-startup evidence.
    and stop/respawn. Then prove the routine updater refuses the old image's
     unknown build label (without synthesizing a baseline label) and the old
     service IDs remain usable.
-4. Call the shipping helper for preflight, migration, acceptance-failure
+4. Call the preserved test-only reference helper for preflight, migration, acceptance-failure
    rollback, and a separate successful candidate acceptance. Keep `web` fenced
    while private proxy acceptance probes run. Verify user/home/project/quota
    identity and repeat API/WebSocket checks after restore.

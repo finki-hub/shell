@@ -100,7 +100,6 @@ services:
   lab:
     image: ${LAB_IMAGE:-ghcr.io/finki-hub/shell-lab:latest}
     profiles: ["images"]
-    networks: [users]
     command: ["true"]
     restart: "no"
 
