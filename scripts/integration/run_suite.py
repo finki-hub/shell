@@ -3461,13 +3461,12 @@ class Suite:
         }
 
     def scenario(self) -> None:
-        assert (
-            self.run_root is not None
-            and self.project_dir is not None
-            and self.pool is not None
-        )
+        self.active_stage = "scenario-setup"
+        self.active_case = "scenario-setup"
+        assert self.run_root is not None and self.pool is not None
         self.setup_network()
         self.write_compose_fixture()
+        assert self.project_dir is not None
         self.start_old_stack()
         self.run_probe("baseline")
         users = self.lab_names()

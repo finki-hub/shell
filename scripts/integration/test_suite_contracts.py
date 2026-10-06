@@ -1658,6 +1658,49 @@ class SuiteContractTests(unittest.TestCase):
         self.assertEqual(suite.image_ids["proxy"], content_id)
         self.assertEqual(suite.image_refs["proxy"], "local/proxy:run")
 
+    def test_scenario_creates_project_before_asserting_and_starting_old_stack(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            self.assertIsNone(suite.project_dir)
+            calls: list[str] = []
+
+            def setup_network() -> None:
+                self.assertIsNone(suite.project_dir)
+                calls.append("network")
+
+            def start_old_stack() -> None:
+                self.assertIsNotNone(suite.project_dir)
+                calls.append("old-stack")
+                raise RuntimeError("stop after startup-order assertion")
+
+            write_fixture = suite.write_compose_fixture
+
+            def write_fixture_and_record_order() -> None:
+                write_fixture()
+                self.assertIsNotNone(suite.project_dir)
+                calls.append("fixture")
+
+            with (
+                patch.object(suite, "setup_network", side_effect=setup_network),
+                patch.object(
+                    suite,
+                    "write_compose_fixture",
+                    side_effect=write_fixture_and_record_order,
+                ),
+                patch.object(suite, "start_old_stack", side_effect=start_old_stack),
+                self.assertRaisesRegex(
+                    RuntimeError, "stop after startup-order assertion"
+                ),
+            ):
+                suite.scenario()
+
+            self.assertIsNotNone(suite.project_dir)
+            self.assertEqual(calls, ["network", "fixture", "old-stack"])
+            self.assertEqual(suite.active_stage, "explicit-fixture-configuration")
+            self.assertEqual(suite.active_case, "scenario-setup")
+
     def test_second_scenario_normalizes_old_hub_before_preflight(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
         suite.initial_override = Path("old.override.json")
