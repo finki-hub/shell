@@ -92,7 +92,15 @@ class MaintenanceComposeConfigTests(unittest.TestCase):
                 ) -> str:
                     call = tuple(args)
                     calls.append(call)
-                    self.assertEqual(call[:2], (docker, "compose"))
+                    actual_executable = shutil.which(call[0])
+                    if actual_executable is None:
+                        raise AssertionError(
+                            "Compose command executable is unavailable"
+                        )
+                    self.assertEqual(
+                        Path(actual_executable).resolve(), Path(docker).resolve()
+                    )
+                    self.assertEqual(call[1], "compose")
                     profile_index = call.index("--profile")
                     self.assertEqual(
                         call[profile_index : profile_index + 2], ("--profile", "images")
