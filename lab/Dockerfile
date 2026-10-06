@@ -21,8 +21,11 @@ COPY extension/ ./
 # Install non-editably so runtime does not depend on this stage's source tree;
 # the extension config installs under /opt/jupyter/etc/jupyter for startup.
 RUN uv sync --frozen --no-dev --no-editable
+RUN /opt/jupyter/bin/python -c 'import importlib.metadata as m; assert m.version("jupyterhub") == "6.0.1", m.version("jupyterhub")'
 
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+
+LABEL org.finki-hub.jupyterhub-version="6.0.1"
 
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \

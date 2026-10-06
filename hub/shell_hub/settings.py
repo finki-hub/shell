@@ -44,6 +44,9 @@ class Settings(BaseSettings):
 
     lab_image: str = "ghcr.io/finki-hub/shell-lab:latest"
 
+    # Set only through a temporary, explicitly acknowledged maintenance override.
+    jupyterhub_allow_db_upgrade: bool = False
+
     lab_user: str = "ubuntu"
     lab_uid: Annotated[int, Field(ge=0)] = 1000
     lab_gid: Annotated[int, Field(ge=0)] = 1000

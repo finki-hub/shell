@@ -87,6 +87,7 @@ commonly changed for a deployment are:
 | `CONFIGPROXY_AUTH_TOKEN` | required | Internal shared secret; use at least 32 hexadecimal characters. |
 | `HOST_PORT` | `8080` | Host-loopback port used to access Shell. |
 | `LAB_POOL_DIR` | `/var/lib/finki-hub-shell/pool` | XFS storage pool created during setup. |
+| `HUB_IMAGE` | `ghcr.io/finki-hub/shell-hub:latest` | Hub image; keep its JupyterHub version matched to `LAB_IMAGE`. |
 | `LAB_ENV_QUOTA_MB` | `100` | Home-directory quota for each environment, in megabytes. |
 | `LAB_ENV_MAX_INODES` | `20000` | Inode limit for each environment. |
 | `LAB_MEMORY_MB` | `384` | Memory limit for each user container, in megabytes. |
@@ -121,14 +122,120 @@ Run a one-time image update from the repository checkout:
 ./scripts/update.sh
 ```
 
-The updater pulls every Compose image, including the user-environment image, recreates only
-Compose services whose image changed, and removes dangling images. Running user environments
-are not Compose services and remain running. The updater does not modify the repository checkout
-or `.env`.
+The updater serializes with a deployment-local lock, pulls candidates before replacing services,
+and checks build-verified Hub/Lab JupyterHub versions plus retained Lab containers. It resolves
+all four service images to immutable IDs before activation and refuses Hub version changes or
+incompatible/unverifiable retained Labs; it never drains users or prunes images. A refused update
+leaves the existing services untouched. Schema-changing Hub upgrades require the explicit
+cold-backup/drain/migrate/accept/restore command below.
+
+`HUB_IMAGE` and `LAB_IMAGE` may be digest-pinned together for a deployment. Keep rollback image
+references available; no global image cleanup is performed.
+
+### Explicit Hub database maintenance
+
+Hub major/schema upgrades are an acknowledged interruption, not a timer operation. Unsaved
+terminal processes and in-memory work will be lost; homes and quota metadata are not drained by
+deleting users. The maintenance command requires the exact Compose project directory, project
+name, environment file, ordered Compose files, and one protected backup destination. Use the
+same path for preflight and migrate; migrate requires it to be new and creates it. Reuse that
+same existing path for accept and restore. It never loads an implicit `.env` or pulls candidate images.
+The standalone maintenance helper requires Python 3.10 or newer and the Docker Compose plugin.
+
+```sh
+sudo sh scripts/jupyterhub-maintenance.sh preflight \
+  --project-directory /absolute/path/to/shell \
+  --project-name finki-hub-shell \
+  --env-file /absolute/path/to/shell/.env \
+  --compose-file /absolute/path/to/shell/compose.yaml \
+  --backup-dir /var/backups/finki-hub-shell/jh6-unique
+```
+
+Before `migrate`, suspend **every** installed timer/updater/reconciler and confirm stopping the
+Compose `web` service closes every external route; do not proceed if another proxy/router can
+reach the Hub, proxy, or Labs directly. The acknowledgment flags are transient command-line
+arguments, never durable `.env` settings:
+
+```sh
+sudo sh scripts/jupyterhub-maintenance.sh migrate \
+  --project-directory /absolute/path/to/shell \
+  --project-name finki-hub-shell \
+  --env-file /absolute/path/to/shell/.env \
+  --compose-file /absolute/path/to/shell/compose.yaml \
+  --backup-dir /var/backups/finki-hub-shell/jh6-unique \
+  --acknowledge-interruption --acknowledge-ingress-fenced --acknowledge-updater-paused
+```
+
+`migrate` leaves web stopped, keeps proxy loopback-only, starts Hub privately with cullers
+suppressed, performs upstream migration, then restarts with database upgrades explicitly off.
+Run the separate acceptance harness/probes through `http://127.0.0.1:8000`; the helper does not
+claim it ran HTTP, file, terminal-WebSocket, identity, or quota acceptance. If acceptance fails,
+keep the marker and ingress fence and use `restore` with `--acknowledge-restore`; restore can be
+repeated from the same cold backup and never restores homes or quota files. Only after all
+acceptance checks pass may an operator explicitly authorize public traffic:
+
+```sh
+sudo sh scripts/jupyterhub-maintenance.sh accept \
+  --project-directory /absolute/path/to/shell \
+  --project-name finki-hub-shell \
+  --env-file /absolute/path/to/shell/.env \
+  --compose-file /absolute/path/to/shell/compose.yaml \
+  --backup-dir /var/backups/finki-hub-shell/jh6-unique \
+  --acknowledge-interruption --acknowledge-ingress-fenced --acknowledge-updater-paused \
+  --acceptance-passed
+```
+
+For layered Compose deployments, repeat `--compose-file` for **every** file in the original
+order on each command. `restore` additionally requires `--acknowledge-restore`. Failures after
+the maintenance marker is written intentionally do not reopen web, resume a timer, roll back
+automatically, or retry migration. Diagnose only with ingress still fenced.
+
+To restore privately after a failed acceptance, use the same paths and acknowledgments:
+
+```sh
+sudo sh scripts/jupyterhub-maintenance.sh restore \
+  --project-directory /absolute/path/to/shell \
+  --project-name finki-hub-shell \
+  --env-file /absolute/path/to/shell/.env \
+  --compose-file /absolute/path/to/shell/compose.yaml \
+  --backup-dir /var/backups/finki-hub-shell/jh6-unique \
+  --acknowledge-interruption --acknowledge-ingress-fenced --acknowledge-updater-paused \
+  --acknowledge-restore
+```
+
+`restore` returns a protected `private-<id>.json` override path. If you need to re-apply the
+restored private configuration, append that file after the original ordered Compose files and
+target only `proxy hub`:
+
+```sh
+PRIVATE_OVERRIDE=/var/backups/finki-hub-shell/jh6-unique/private-REPLACE-WITH-RETURNED-ID.json
+sudo docker compose \
+  --project-directory /absolute/path/to/shell \
+  --project-name finki-hub-shell \
+  --env-file /absolute/path/to/shell/.env \
+  -f /absolute/path/to/shell/compose.yaml \
+  -f "$PRIVATE_OVERRIDE" \
+  up -d proxy hub
+```
+
+Repeat every original `--compose-file` in its original order before the private override. Do not
+run unrestricted `docker compose up`: it would start `web` and reopen ingress. The private
+override keeps the restored old Hub migration-disabled and cullers suppressed. A successful
+`accept` returns either the versioned
+`activation-candidate-v1.override.json` or `activation-restored-v1.override.json`; use the returned
+path after the original ordered Compose files for subsequent normal Compose operations. These
+activation files are immutable and safely reused on retries only when their contents match.
+Keep the backup directory until equivalent immutable images and (for restored old images) the
+`upgrade_db=False` wrapper configuration have been adopted durably. The maintenance marker
+intentionally continues to block routine updates. Clear only the exact
+`<project-directory>/.jupyterhub-maintenance.json` interlock after verifying the durable
+configuration is equivalent and all updaters remain paused; the helper never clears it or
+resumes timers automatically. The installed production updater wrapper is separate from this
+repository script and must be handled explicitly before any deployment.
 
 ### Automatic Image Updates
 
-The supplied systemd units can run the updater automatically. The service runs as root and
+The repository's supplied systemd units can run the repository updater automatically. The service runs as root and
 expects the checkout at `/opt/finki-hub-shell` by default:
 
 ```sh
@@ -188,7 +295,11 @@ sudo systemctl start finki-hub-shell-update.service
 sudo journalctl -u finki-hub-shell-update.service -n 50 --no-pager
 ```
 
-`Persistent=true` causes one missed update to run after the host starts again.
+`Persistent=true` causes one missed update to run after the host starts again. Updating this
+repository does not update an already-installed custom updater wrapper: verify the actual
+`ExecStart` and explicitly update the deployed checkout/wrapper before relying on these safeguards.
+Do not enable an automatic timer for a schema-changing Hub release; use the approved maintenance
+procedure after it is implemented and independently validated.
 
 Stop the Compose-managed services:
 

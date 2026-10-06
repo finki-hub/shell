@@ -1,0 +1,216 @@
+name: JupyterHub 5 to 6 isolated integration
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - '.github/workflows/jupyterhub-migration.yaml'
+      - 'scripts/integration/**'
+      - 'scripts/tests/**'
+      - 'scripts/jupyterhub-maintenance.sh'
+      - 'scripts/jupyterhub_maintenance.py'
+      - 'scripts/jupyterhub_maintenance_config.py'
+      - 'scripts/update.sh'
+      - 'compose.yaml'
+      - 'hub/**'
+      - 'lab/**'
+      - 'web/**'
+      - 'extension/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.dockerignore'
+      - 'uv.lock'
+      - 'pyproject.toml'
+  workflow_dispatch:
+    inputs:
+      disposable_runner_approved:
+        description: 'Type APPROVED only after explicit parent authorization of this isolated ephemeral run'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the exact PR revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up project Python and uv
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.11.21'
+
+      - name: Install the Hub project's locked lint/typecheck tools
+        working-directory: .
+        shell: bash
+        run: timeout 240s uv sync --project hub --frozen --group dev --python 3.14
+
+      - name: Run discovered root tests and integration contracts
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s uv run --project hub --frozen --group dev python -c \
+            "import pathlib,py_compile; [py_compile.compile(str(p), doraise=True) for p in pathlib.Path('scripts/integration').glob('*.py')]"
+          timeout 180s uv run --project hub --frozen --group dev python -m unittest discover -s scripts/tests -p 'test_*.py'
+          timeout 180s uv run --project hub --frozen --group dev python -m unittest \
+            scripts.integration.test_probe_contracts \
+            scripts.integration.test_db_runner_contracts \
+            scripts.integration.test_suite_contracts
+          bash -n scripts/integration/jupyterhub-migration.sh
+
+      - name: Ruff-check controller, integration runner, probes, and contracts
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s uv run --project hub --frozen --group dev ruff check \
+            --config hub/pyproject.toml \
+            --select E,F,I,UP,B --ignore E501 \
+            scripts/jupyterhub_maintenance.py \
+            scripts/jupyterhub_maintenance_config.py \
+            scripts/integration/probe.py \
+            scripts/integration/run_suite.py \
+            scripts/integration/test_db_migration.py \
+            scripts/integration/test_probe_contracts.py \
+            scripts/integration/test_db_runner_contracts.py \
+            scripts/integration/test_suite_contracts.py
+
+      - name: Mypy-check the maintenance controller and integration probes on Linux
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s uv run --project hub --frozen --group dev mypy \
+            --config-file hub/pyproject.toml \
+            --platform linux \
+            scripts/jupyterhub_maintenance.py \
+            scripts/integration/probe.py \
+            scripts/integration/run_suite.py
+
+  xfs-preflight:
+    needs: checks
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact PR revision and pinned baseline object
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up project Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install XFS tools on the approved ephemeral runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s sudo -n apt-get update
+          timeout 300s sudo -n apt-get install --no-install-recommends -y xfsprogs
+          command -v mkfs.xfs
+          command -v xfs_quota
+          sudo -n docker info >/dev/null
+
+      - name: Run owned XFS quota preflight only
+        id: xfs_probe
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/jupyterhub-xfs-preflight.json"
+          if sudo -n env RUNNER_TEMP="$RUNNER_TEMP" bash scripts/integration/jupyterhub-migration.sh run \
+            --workspace "$GITHUB_WORKSPACE" \
+            --acknowledge-disposable \
+            --acknowledge-interruption \
+            --acknowledge-ingress-fenced \
+            --acknowledge-updater-paused \
+            --xfs-only | tee "$result" >/dev/null; then
+            exit_code=0
+          else
+            exit_code=$?
+          fi
+          if [[ ! -s "$result" ]]; then
+            printf '%s\n' '{"failure":"xfs-preflight-result-missing","phase":"xfs-only","runtime":"not-run","xfs_probe":"fail"}' > "$result"
+            exit_code=1
+          fi
+          printf 'exit_code=%s\n' "$exit_code" >> "$GITHUB_OUTPUT"
+          {
+            printf '%s\n\n' '## Sanitized XFS preflight result'
+            cat "$result"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload only the sanitized XFS result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jupyterhub-xfs-preflight-${{ github.run_id }}
+          path: ${{ runner.temp }}/jupyterhub-xfs-preflight.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require focused XFS verification and cleanup to pass
+        if: always()
+        shell: bash
+        env:
+          XFS_PREFLIGHT_EXIT_CODE: ${{ steps.xfs_probe.outputs.exit_code }}
+        run: test "$XFS_PREFLIGHT_EXIT_CODE" = 0
+
+  integration:
+    needs: [checks, xfs-preflight]
+    if: >-
+      needs.xfs-preflight.result == 'success' &&
+      (
+      (github.event_name == 'workflow_dispatch' && inputs.disposable_runner_approved == 'APPROVED') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'jupyterhub-migration-runtime'))
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact PR revision and pinned baseline object
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up project Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install XFS tools on the approved ephemeral runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s sudo -n apt-get update
+          timeout 300s sudo -n apt-get install --no-install-recommends -y xfsprogs
+          command -v mkfs.xfs
+          command -v xfs_quota
+          sudo -n docker info >/dev/null
+
+      - name: Run full disposable XFS/Docker migration and restore suite
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          sudo -n env RUNNER_TEMP="$RUNNER_TEMP" bash scripts/integration/jupyterhub-migration.sh run \
+            --workspace "$GITHUB_WORKSPACE" \
+            --acknowledge-disposable \
+            --acknowledge-interruption \
+            --acknowledge-ingress-fenced \
+            --acknowledge-updater-paused
