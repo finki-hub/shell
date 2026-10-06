@@ -35,6 +35,8 @@ class MaintenanceBoundaryTests(unittest.TestCase):
         wrapper.write_text("# fixture\n", encoding="utf-8")
         services = {
             "hub": {
+                "network_mode": "host",
+                "privileged": True,
                 "volumes": [
                     {"source": str(hub), "target": "/srv/hub"},
                     {"source": str(pool), "target": "/srv/pool"},
@@ -42,7 +44,7 @@ class MaintenanceBoundaryTests(unittest.TestCase):
                         "source": "/var/run/docker.sock",
                         "target": "/var/run/docker.sock",
                     },
-                ]
+                ],
             }
         }
         inspected = container or {
@@ -126,7 +128,129 @@ class MaintenanceBoundaryTests(unittest.TestCase):
             "/var/run/docker.sock": Path("/var/run/docker.sock").resolve(),
         }
         controller.boundary_events = events  # type: ignore[attr-defined]
+        controller.boundary_container = inspected  # type: ignore[attr-defined]
         return controller
+
+    def test_hub_service_shape_accepts_only_privileged_security_normalizations(
+        self,
+    ) -> None:
+        for options in (None, [], ["label=disable"]):
+            with self.subTest(options=options):
+                with tempfile.TemporaryDirectory() as directory:
+                    controller = self.make_controller(Path(directory))
+                    inspected = controller.boundary_container  # type: ignore[attr-defined]
+                    if options is not None:
+                        inspected["HostConfig"]["SecurityOpt"] = options
+                    controller._verify_service_shape(inspected, "hub")
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self.make_controller(Path(directory))
+            controller.config["services"]["hub"]["security_opt"] = []
+            inspected = controller.boundary_container  # type: ignore[attr-defined]
+            controller._verify_service_shape(inspected, "hub")
+
+        for invalid_options in (
+            None,
+            "label=disable",
+            {"option": "label=disable"},
+            ["no-new-privileges"],
+            ["label=disable", "no-new-privileges"],
+            ["label=disable", "label=disable"],
+        ):
+            with self.subTest(invalid_inspected_options=invalid_options):
+                with tempfile.TemporaryDirectory() as directory:
+                    controller = self.make_controller(Path(directory))
+                    inspected = controller.boundary_container  # type: ignore[attr-defined]
+                    inspected["HostConfig"]["SecurityOpt"] = invalid_options
+                    with self.assertRaisesRegex(
+                        maintenance.MaintenanceError,
+                        "Compose Hub binds or networking differ from the protected deployment",
+                    ):
+                        controller._verify_service_shape(inspected, "hub")
+
+        for configured_options in (["label=disable"], "label=disable", None):
+            with self.subTest(configured_security_options=configured_options):
+                with tempfile.TemporaryDirectory() as directory:
+                    controller = self.make_controller(Path(directory))
+                    controller.config["services"]["hub"]["security_opt"] = (
+                        configured_options
+                    )
+                    inspected = controller.boundary_container  # type: ignore[attr-defined]
+                    with self.assertRaisesRegex(
+                        maintenance.MaintenanceError,
+                        "Compose Hub binds or networking differ from the protected deployment",
+                    ):
+                        controller._verify_service_shape(inspected, "hub")
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self.make_controller(Path(directory))
+            controller.config["services"]["hub"]["privileged"] = False
+            inspected = controller.boundary_container  # type: ignore[attr-defined]
+            with self.assertRaisesRegex(
+                maintenance.MaintenanceError,
+                "Compose Hub binds or networking differ from the protected deployment",
+            ):
+                controller._verify_service_shape(inspected, "hub")
+
+        for privileged in (False, None):
+            with self.subTest(inspected_privileged=privileged):
+                with tempfile.TemporaryDirectory() as directory:
+                    controller = self.make_controller(Path(directory))
+                    inspected = controller.boundary_container  # type: ignore[attr-defined]
+                    inspected["HostConfig"]["Privileged"] = privileged
+                    with self.assertRaisesRegex(
+                        maintenance.MaintenanceError,
+                        "Compose Hub binds or networking differ from the protected deployment",
+                    ):
+                        controller._verify_service_shape(inspected, "hub")
+
+    def test_hub_service_shape_rejects_bind_network_capability_and_namespace_drift(
+        self,
+    ) -> None:
+        mutations = (
+            ("bind-source", lambda item: item["Mounts"][0].update(Source="/other")),
+            (
+                "bind-target",
+                lambda item: item["Mounts"][0].update(Destination="/other"),
+            ),
+            ("bind-readonly", lambda item: item["Mounts"][0].update(RW=False)),
+            (
+                "extra-bind",
+                lambda item: item["Mounts"].append(
+                    {
+                        "Type": "bind",
+                        "Source": "/other",
+                        "Destination": "/extra",
+                        "RW": True,
+                    }
+                ),
+            ),
+            (
+                "bridge-network",
+                lambda item: item["HostConfig"].update(NetworkMode="bridge"),
+            ),
+            ("cap-add", lambda item: item["HostConfig"].update(CapAdd=["SYS_ADMIN"])),
+            ("cap-drop", lambda item: item["HostConfig"].update(CapDrop=["ALL"])),
+            (
+                "device",
+                lambda item: item["HostConfig"].update(
+                    Devices=[{"PathOnHost": "/dev/null"}]
+                ),
+            ),
+            ("pid-namespace", lambda item: item["HostConfig"].update(PidMode="host")),
+            ("ipc-namespace", lambda item: item["HostConfig"].update(IpcMode="host")),
+        )
+        for name, mutate in mutations:
+            with self.subTest(drift=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    controller = self.make_controller(Path(directory))
+                    inspected = controller.boundary_container  # type: ignore[attr-defined]
+                    mutate(inspected)
+                    with self.assertRaisesRegex(
+                        maintenance.MaintenanceError,
+                        "Compose Hub binds or networking differ from the protected deployment",
+                    ):
+                        controller._verify_service_shape(inspected, "hub")
 
     def test_private_hub_start_uses_real_stage_aware_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

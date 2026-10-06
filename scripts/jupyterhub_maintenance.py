@@ -531,11 +531,14 @@ class Controller:
             raise MaintenanceError(
                 "Lab service must use only the configured external users network"
             )
+        configured_security_options = services["hub"].get("security_opt", [])
         if (
             services["web"].get("network_mode") != "host"
             or services["proxy"].get("network_mode") != "host"
             or services["hub"].get("network_mode") != "host"
             or services["hub"].get("privileged") is not True
+            or type(configured_security_options) is not list
+            or configured_security_options
         ):
             raise MaintenanceError(
                 "unsupported web/proxy/Hub network or privilege topology"
@@ -734,7 +737,18 @@ class Controller:
         actual = {
             (source, target) for target, (source, _read_write) in actual_mounts.items()
         }
-        host_config = item.get("HostConfig") or {}
+        host_config_value = item.get("HostConfig")
+        host_config = host_config_value if isinstance(host_config_value, dict) else {}
+        configured_security_options = compose_service.get("security_opt", [])
+        inspected_security_options_present = "SecurityOpt" in host_config
+        inspected_security_options = host_config.get("SecurityOpt")
+        inspected_security_options_supported = (
+            not inspected_security_options_present
+            or (
+                type(inspected_security_options) is list
+                and inspected_security_options in ([], ["label=disable"])
+            )
+        )
         if (
             actual != expected
             or {
@@ -743,10 +757,13 @@ class Controller:
             }
             != expected_modes
             or host_config.get("NetworkMode") != "host"
+            or compose_service.get("privileged") is not True
+            or type(configured_security_options) is not list
+            or configured_security_options
             or host_config.get("Privileged") is not True
             or host_config.get("CapAdd")
             or host_config.get("CapDrop")
-            or host_config.get("SecurityOpt")
+            or not inspected_security_options_supported
             or host_config.get("Devices")
             or host_config.get("PidMode")
             or host_config.get("IpcMode") not in (None, "", "private")
