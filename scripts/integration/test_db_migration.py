@@ -533,6 +533,20 @@ def read_fixture_json(
     return value
 
 
+def write_cookie_secret(path: Path, secret: bytes) -> None:
+    if len(secret) != 32:
+        raise ValueError("fixture cookie secret must be exactly 32 bytes")
+    path.write_text(secret.hex() + "\n", encoding="ascii")
+    path.chmod(0o600)
+
+
+def is_schema_migration_rejection(output: str) -> bool:
+    normalized = output.lower()
+    return "schema" in normalized and any(
+        marker in normalized for marker in ("upgrade", "migration")
+    )
+
+
 def assert_cold_sqlite(path: Path) -> None:
     sidecars = [Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")]
     if any(sidecar.exists() for sidecar in sidecars):
@@ -746,8 +760,7 @@ def main() -> int:
                 startup_fixture / "jupyterhub.sqlite",
             )
             os.chmod(startup_fixture / "jupyterhub.sqlite", 0o600)
-            (startup_fixture / "cookie_secret").write_bytes(os.urandom(32))
-            os.chmod(startup_fixture / "cookie_secret", 0o600)
+            write_cookie_secret(startup_fixture / "cookie_secret", os.urandom(32))
             startup_config = startup_fixture / "startup_config.py"
             startup_config.write_text(
                 'c.JupyterHub.db_url = "sqlite:////fixture/jupyterhub.sqlite"\n'
@@ -770,10 +783,7 @@ def main() -> int:
                 operation="reject-old-schema",
                 image_role="candidate-hub",
             )
-            normalized_log = rejection_log.lower()
-            if "schema" not in normalized_log or not any(
-                marker in normalized_log for marker in ("upgrade", "migration")
-            ):
+            if not is_schema_migration_rejection(rejection_log):
                 owner.record_failure("schema-rejection-mismatch")
                 raise RuntimeError(
                     "Hub 6 did not report a migration-disabled cold-schema rejection"

@@ -5,9 +5,13 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 import sqlite3
+import stat
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,7 +23,9 @@ from scripts.integration.test_db_migration import (
     WORKER,
     OwnedContainers,
     assert_seeded_fixture,
+    is_schema_migration_rejection,
     main,
+    write_cookie_secret,
 )
 
 
@@ -144,6 +150,29 @@ class DatabaseRunnerContracts(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_startup_cookie_secret_is_hex_encoded_32_byte_secret_and_private(self):
+        secret = bytes(range(32))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cookie_secret"
+            write_cookie_secret(path, secret)
+            encoded = path.read_text(encoding="ascii")
+            self.assertRegex(encoded, r"^[0-9a-f]{64}\n$")
+            self.assertEqual(bytes.fromhex(encoded.strip()), secret)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_invalid_cookie_secret_output_is_not_schema_migration_rejection(self):
+        self.assertFalse(
+            is_schema_migration_rejection(
+                "Cookie secret file contains invalid encoded secret data"
+            )
+        )
+        self.assertTrue(
+            is_schema_migration_rejection(
+                "Found database schema version inconsistent; run upgrade-db"
+            )
+        )
 
     def test_fixture_requires_both_user_scoped_token_and_spawner_associations(
         self,
