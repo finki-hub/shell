@@ -4140,6 +4140,17 @@ class Suite:
         self.add_case("restored-old-baseline-normalized", status="pass")
         self.record_stage("second-transaction-baseline-normalized")
 
+    def verify_accepted_candidate(self) -> None:
+        self.active_stage = "verify-accepted-candidate-normal-mode"
+        self.active_case = "verify-accepted-candidate-normal-mode"
+        self.verify_hub_mode(
+            expected_image=self.image_ids["candidate_hub"],
+            upgrade_db=False,
+            suppress_cullers=False,
+            accepted_candidate=True,
+        )
+        self.record_stage("accepted-candidate-normal-mode-verified")
+
     def clear_disposable_interlock(
         self, backup: Path, accepted: dict[str, Any]
     ) -> None:
@@ -4290,11 +4301,7 @@ class Suite:
         accepted = self.run_helper("accept", backup2, acceptance=True)
         if accepted.get("stage") != "accepted" or accepted.get("web") != "started":
             raise HarnessFailure("candidate maintenance acceptance did not complete")
-        self.verify_hub_mode(
-            expected_image=self.image_ids["candidate_hub"],
-            upgrade_db=False,
-            suppress_cullers=False,
-        )
+        self.verify_accepted_candidate()
         self.web_probe()
         self.run_probe("accepted-smoke")
         final_facts = self.assert_pool_preserved(
@@ -4361,7 +4368,10 @@ class Suite:
         upgrade_db: bool,
         suppress_cullers: bool,
         normalized_baseline: bool = False,
+        accepted_candidate: bool = False,
     ) -> None:
+        if normalized_baseline and accepted_candidate:
+            raise HarnessFailure("Hub normal-mode verification selector is ambiguous")
         if normalized_baseline and (
             expected_image != self.image_ids.get("old_hub")
             or upgrade_db
@@ -4370,6 +4380,12 @@ class Suite:
             raise HarnessFailure(
                 "normalized baseline mode is limited to ordinary Hub 5"
             )
+        if accepted_candidate and (
+            expected_image != self.image_ids.get("candidate_hub")
+            or upgrade_db
+            or suppress_cullers
+        ):
+            raise HarnessFailure("accepted candidate mode is limited to ordinary Hub 6")
         ids = self.compose_ids("hub")
         if len(ids) != 1:
             raise HarnessFailure("private Hub container is missing")
@@ -4401,10 +4417,10 @@ class Suite:
             "JUPYTERHUB_MAINTENANCE_UPGRADE_DB" in env
             or "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS" in env
         )
-        if normalized_baseline:
+        if normalized_baseline or accepted_candidate:
             if private_mode or helper_mounts:
                 raise HarnessFailure(
-                    "normalized baseline still has private maintenance mode"
+                    "normal Hub mode still has private maintenance configuration"
                 )
             if config.get("Cmd") != [
                 "jupyterhub",
@@ -4412,7 +4428,7 @@ class Suite:
                 "/app/jupyterhub_config.py",
             ]:
                 raise HarnessFailure(
-                    "normalized baseline is not using the original fixture config"
+                    "normal Hub mode is not using the original fixture config"
                 )
             return
 

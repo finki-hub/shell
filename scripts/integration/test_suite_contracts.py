@@ -63,6 +63,8 @@ def configured_suite(root: Path) -> run_suite.Suite:
             "proxy": "sha256:" + "b" * 64,
             "old_hub": "sha256:" + "c" * 64,
             "candidate_hub": "sha256:" + "d" * 64,
+            "old_lab": "sha256:" + "e" * 64,
+            "candidate_lab": "sha256:" + "f" * 64,
         }
     )
     return suite
@@ -2225,11 +2227,186 @@ class SuiteContractTests(unittest.TestCase):
             )
             self.assertTrue(wrapper.is_file())
 
-    def test_normalized_baseline_mode_rejects_private_or_changed_fixture_shapes(
+    def test_hub_mode_verifier_accepts_the_six_intended_runtime_modes(self) -> None:
+        modes = (
+            (
+                "private candidate upgrade",
+                "candidate_hub",
+                True,
+                True,
+                True,
+                False,
+                False,
+            ),
+            (
+                "private candidate normal boot",
+                "candidate_hub",
+                True,
+                False,
+                True,
+                False,
+                False,
+            ),
+            ("private restored old", "old_hub", True, False, True, False, False),
+            ("accepted restored old", "old_hub", True, False, False, False, False),
+            ("normalized baseline old", "old_hub", False, False, False, True, False),
+            (
+                "accepted candidate normal",
+                "candidate_hub",
+                False,
+                False,
+                False,
+                False,
+                True,
+            ),
+        )
+        for (
+            label,
+            image_key,
+            private,
+            upgrade,
+            cullers,
+            normalized,
+            accepted_candidate,
+        ) in modes:
+            with self.subTest(mode=label), tempfile.TemporaryDirectory() as directory:
+                suite, item, container_id, _backup, _wrapper = hub_mode_fixture(
+                    Path(directory), private=private
+                )
+                expected_image = suite.image_ids[image_key]
+                item["Image"] = expected_image
+                environment = ["JUPYTERHUB_ALLOW_DB_UPGRADE=false"]
+                if private:
+                    environment.extend(
+                        [
+                            "JUPYTERHUB_MAINTENANCE_UPGRADE_DB="
+                            + ("true" if upgrade else "false"),
+                            "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS="
+                            + ("true" if cullers else "false"),
+                        ]
+                    )
+                item["Config"]["Env"] = environment
+                with (
+                    patch.object(
+                        suite,
+                        "compose_command",
+                        return_value=f"{container_id}\n".encode(),
+                    ),
+                    patch.object(suite, "inspect_container", return_value=item),
+                ):
+                    if accepted_candidate:
+                        suite.verify_accepted_candidate()
+                    else:
+                        suite.verify_hub_mode(
+                            expected_image=expected_image,
+                            upgrade_db=upgrade,
+                            suppress_cullers=cullers,
+                            normalized_baseline=normalized,
+                        )
+
+    def test_accepted_candidate_normal_verification_uses_acceptance_override(
         self,
     ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite, item, container_id, backup, _wrapper = hub_mode_fixture(
+                Path(directory), private=False
+            )
+            assert suite.project_dir is not None
+            suite.backups["candidate"] = backup
+            runtime = backup / "activation-candidate-v1.override.json"
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "services": {
+                            "hub": {
+                                "image": suite.image_ids["candidate_hub"],
+                                "restart": "no",
+                                "environment": {
+                                    "JUPYTERHUB_ALLOW_DB_UPGRADE": "false",
+                                    "LAB_IMAGE": suite.image_ids["candidate_lab"],
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime.chmod(0o600)
+            marker = suite.project_dir / ".jupyterhub-maintenance.json"
+            marker.write_text(
+                json.dumps({"backup_directory": str(backup)}), encoding="utf-8"
+            )
+            marker.chmod(0o600)
+            (backup / "state.json").write_text(
+                json.dumps(
+                    {
+                        "stages": [
+                            {
+                                "stage": "accepted",
+                                "runtime_override": str(runtime),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (backup / "manifest.json").write_text("{}\n", encoding="utf-8")
+            accepted_output = {
+                "stage": "accepted",
+                "web": "started",
+                "runtime_override": str(runtime),
+                "marker": str(marker),
+            }
+            with patch.object(run_suite.stat, "S_IMODE", return_value=0o600):
+                self.assertEqual(
+                    suite.verify_acceptance_paths(backup, accepted_output),
+                    (runtime.resolve(), marker.resolve()),
+                )
+
+            item["Image"] = suite.image_ids["candidate_hub"]
+            item["Config"]["Env"] = [
+                "JUPYTERHUB_ALLOW_DB_UPGRADE=false",
+                f"LAB_IMAGE={suite.image_ids['candidate_lab']}",
+            ]
+            events: list[str] = []
+
+            def compose(argv: list[str], **_kwargs: object) -> bytes:
+                self.assertIn("ps", argv)
+                self.assertIn("hub", argv)
+                self.assertEqual(
+                    suite.active_stage, "verify-accepted-candidate-normal-mode"
+                )
+                self.assertEqual(
+                    suite.active_case, "verify-accepted-candidate-normal-mode"
+                )
+                events.append("accepted-candidate-inspect")
+                return f"{container_id}\n".encode()
+
+            original_record_stage = suite.record_stage
+
+            def record_stage(name: str, **details: Any) -> None:
+                events.append("record:" + name)
+                original_record_stage(name, **details)
+
+            with (
+                patch.object(run_suite, "require_call", side_effect=compose),
+                patch.object(suite, "inspect_container", return_value=item),
+                patch.object(suite, "record_stage", side_effect=record_stage),
+            ):
+                suite.verify_accepted_candidate()
+
+            self.assertLess(
+                events.index("accepted-candidate-inspect"),
+                events.index("record:accepted-candidate-normal-mode-verified"),
+            )
+            self.assertEqual(
+                suite.manifest["stages"][-1]["name"],
+                "accepted-candidate-normal-mode-verified",
+            )
+
+    def test_normal_hub_modes_reject_private_or_changed_fixture_shapes(self) -> None:
         def wrong_image(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
-            item["Image"] = _suite.image_ids["candidate_hub"]
+            item["Image"] = "sha256:" + "f" * 64
 
         def allow_upgrade(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
             item["Config"]["Env"] = ["JUPYTERHUB_ALLOW_DB_UPGRADE=true"]
@@ -2267,7 +2444,7 @@ class SuiteContractTests(unittest.TestCase):
         mutations: tuple[
             tuple[str, bool, Callable[[run_suite.Suite, dict[str, Any]], None]], ...
         ] = (
-            ("wrong image", False, wrong_image),
+            ("wrong inspected image", False, wrong_image),
             ("upgrade enabled", False, allow_upgrade),
             ("maintenance flag", False, private_upgrade_flag),
             ("cullers suppressed", False, suppress_cullers),
@@ -2277,12 +2454,63 @@ class SuiteContractTests(unittest.TestCase):
             ("host network changed", False, wrong_network),
             ("privilege changed", False, unprivileged),
         )
-        for label, private_intent, mutate in mutations:
-            with self.subTest(shape=label), tempfile.TemporaryDirectory() as directory:
+        for mode, image_key, flag in (
+            ("normalized baseline", "old_hub", "normalized_baseline"),
+            ("accepted candidate", "candidate_hub", "accepted_candidate"),
+        ):
+            for label, private_intent, mutate in mutations:
+                with (
+                    self.subTest(mode=mode, shape=label),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    suite, item, container_id, _backup, _wrapper = hub_mode_fixture(
+                        Path(directory), private=private_intent
+                    )
+                    expected_image = suite.image_ids[image_key]
+                    item["Image"] = expected_image
+                    mutate(suite, item)
+                    with (
+                        patch.object(
+                            suite,
+                            "compose_command",
+                            return_value=f"{container_id}\n".encode(),
+                        ),
+                        patch.object(suite, "inspect_container", return_value=item),
+                        self.assertRaises(run_suite.HarnessFailure),
+                    ):
+                        mode_arguments = {flag: True}
+                        suite.verify_hub_mode(
+                            expected_image=expected_image,
+                            upgrade_db=False,
+                            suppress_cullers=False,
+                            **mode_arguments,
+                        )
+
+    def test_private_candidate_and_accepted_restore_require_wrapper_mount(self) -> None:
+        for label, image_key, upgrade, cullers in (
+            ("private candidate", "candidate_hub", True, True),
+            ("accepted restored old", "old_hub", False, False),
+        ):
+            with (
+                self.subTest(mode=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 suite, item, container_id, _backup, _wrapper = hub_mode_fixture(
-                    Path(directory), private=private_intent
+                    Path(directory), private=False
                 )
-                mutate(suite, item)
+                item["Image"] = suite.image_ids[image_key]
+                item["Config"]["Cmd"] = [
+                    "jupyterhub",
+                    "-f",
+                    run_suite.MAINTENANCE_HUB_CONFIG_PATH,
+                ]
+                item["Config"]["Env"] = [
+                    "JUPYTERHUB_ALLOW_DB_UPGRADE=false",
+                    "JUPYTERHUB_MAINTENANCE_UPGRADE_DB="
+                    + ("true" if upgrade else "false"),
+                    "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS="
+                    + ("true" if cullers else "false"),
+                ]
                 with (
                     patch.object(
                         suite,
@@ -2293,34 +2521,40 @@ class SuiteContractTests(unittest.TestCase):
                     self.assertRaises(run_suite.HarnessFailure),
                 ):
                     suite.verify_hub_mode(
-                        expected_image=suite.image_ids["old_hub"],
-                        upgrade_db=False,
-                        suppress_cullers=False,
-                        normalized_baseline=True,
+                        expected_image=suite.image_ids[image_key],
+                        upgrade_db=upgrade,
+                        suppress_cullers=cullers,
                     )
 
-        for label, expected_image, upgrade_db, suppress_cullers in (
-            ("wrong image", "sha256:" + "f" * 64, False, False),
-            ("upgrade enabled", None, True, False),
-            ("cullers suppressed", None, False, True),
-        ):
+    def test_normal_mode_selectors_are_exclusive_and_image_bound(self) -> None:
+        invalid_modes = (
+            {"normalized_baseline": True, "accepted_candidate": True},
+            {"normalized_baseline": True, "expected_image": "sha256:" + "f" * 64},
+            {"accepted_candidate": True, "expected_image": "sha256:" + "f" * 64},
+            {"normalized_baseline": True, "upgrade_db": True},
+            {"normalized_baseline": True, "suppress_cullers": True},
+            {"accepted_candidate": True, "upgrade_db": True},
+            {"accepted_candidate": True, "suppress_cullers": True},
+        )
+        for mode in invalid_modes:
             with (
-                self.subTest(normalized_mode=label),
+                self.subTest(mode=mode),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 suite, _item, _container_id, _backup, _wrapper = hub_mode_fixture(
                     Path(directory), private=False
                 )
+                arguments: dict[str, Any] = {
+                    "expected_image": suite.image_ids["old_hub"],
+                    "upgrade_db": False,
+                    "suppress_cullers": False,
+                    **mode,
+                }
                 with (
                     patch.object(suite, "compose_ids") as compose_ids,
                     self.assertRaises(run_suite.HarnessFailure),
                 ):
-                    suite.verify_hub_mode(
-                        expected_image=expected_image or suite.image_ids["old_hub"],
-                        upgrade_db=upgrade_db,
-                        suppress_cullers=suppress_cullers,
-                        normalized_baseline=True,
-                    )
+                    suite.verify_hub_mode(**arguments)
                 compose_ids.assert_not_called()
 
     def test_accepted_old_hub_requires_the_exact_private_wrapper(self) -> None:
