@@ -29,7 +29,7 @@ compose_pull --profile images pull
 
 # Inspect candidate image labels which are written only after each Dockerfile
 # asserts the installed JupyterHub package version.
-config_values=$(compose config --format json | python_bounded -c 'import json,sys; s=json.load(sys.stdin)["services"]; h=s["hub"]; print("\t".join((s["web"]["image"],s["proxy"]["image"],h["image"],s["lab"]["image"],next(v["source"] for v in h["volumes"] if v.get("target")=="/srv/pool"),str(h["environment"]["LAB_USER"]))))')
+config_values=$(compose --profile images config --format json | python_bounded -c 'import json,sys; s=json.load(sys.stdin)["services"]; h=s["hub"]; print("\t".join((s["web"]["image"],s["proxy"]["image"],h["image"],s["lab"]["image"],next(v["source"] for v in h["volumes"] if v.get("target")=="/srv/pool"),str(h["environment"]["LAB_USER"]))))')
 IFS="$(printf '\t')" read -r candidate_web candidate_proxy candidate_hub candidate_lab expected_pool expected_lab_user <<EOF
 $config_values
 EOF
@@ -57,7 +57,7 @@ export WEB_IMAGE="$candidate_web_id"
 export PROXY_IMAGE="$candidate_proxy_id"
 export HUB_IMAGE="$candidate_hub_id"
 export LAB_IMAGE="$candidate_lab_id"
-compose config --format json | python_bounded -c '
+compose --profile images config --format json | python_bounded -c '
 import json,sys
 s=json.load(sys.stdin)["services"]
 expected={"web": __import__("os").environ["WEB_IMAGE"], "proxy": __import__("os").environ["PROXY_IMAGE"], "hub": __import__("os").environ["HUB_IMAGE"], "lab": __import__("os").environ["LAB_IMAGE"]}

@@ -10,6 +10,22 @@ from pathlib import Path
 
 
 class UpdaterPinTests(unittest.TestCase):
+    def test_image_profile_is_limited_to_config_and_not_final_activation(self) -> None:
+        updater = Path(__file__).parents[1] / "update.sh"
+        source = updater.read_text(encoding="utf-8")
+        config_command = "compose --profile images config --format json"
+        self.assertEqual(source.count(config_command), 2)
+        self.assertIn("compose_pull --profile images pull", source)
+        self.assertNotIn("COMPOSE_PROFILES", source)
+        activation = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("timeout 180s docker compose")
+        ]
+        self.assertEqual(len(activation), 1)
+        self.assertIn(" up -d ", activation[0])
+        self.assertNotIn("--profile", activation[0])
+
     @unittest.skipUnless(
         os.name != "nt" and shutil.which("bash"),
         "a POSIX Bash runtime is required for updater contract test",
@@ -23,16 +39,19 @@ class UpdaterPinTests(unittest.TestCase):
             bin_dir.mkdir()
             (project / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
             log = root / "activation.json"
+            original_refs = {
+                "web:tag": "sha256:web-original",
+                "proxy:tag": "sha256:proxy-original",
+                "hub:tag": "sha256:hub-original",
+                "lab:tag": "sha256:lab-original",
+            }
             (root / "image-state.json").write_text(
                 json.dumps(
                     {
-                        "refs": {
-                            "web:tag": "sha256:web-original",
-                            "proxy:tag": "sha256:proxy-original",
-                            "hub:tag": "sha256:hub-original",
-                            "lab:tag": "sha256:lab-original",
-                        },
+                        "refs": original_refs,
                         "retagged": False,
+                        "compose_config_profiles": [],
+                        "activation_profiled": None,
                     }
                 ),
                 encoding="utf-8",
@@ -70,7 +89,11 @@ state = json.loads(state_path.read_text())
 config = json.loads((root / 'compose-config.json').read_text())
 if args[0] == 'compose':
     tail = args[args.index('--project-directory') + 2:]
-    if tail[:2] == ['config', '--format']:
+    if 'config' in tail:
+        if tail[:4] != ['--profile', 'images', 'config', '--format'] or tail[4:] != ['json']:
+            raise SystemExit(29)
+        state['compose_config_profiles'].append(tail[:2])
+        state_path.write_text(json.dumps(state))
         services = config['services']
         env = os.environ
         for service, key in [('web','WEB_IMAGE'),('proxy','PROXY_IMAGE'),('hub','HUB_IMAGE'),('lab','LAB_IMAGE')]:
@@ -81,11 +104,17 @@ if args[0] == 'compose':
         print(json.dumps(config))
         raise SystemExit(0)
     if 'pull' in tail:
+        if tail[:2] != ['--profile', 'images']:
+            raise SystemExit(29)
         raise SystemExit(0)
     if tail[:2] == ['ps', '-q']:
         print('hub-current')
         raise SystemExit(0)
     if 'up' in tail:
+        state['activation_profiled'] = '--profile' in tail
+        state_path.write_text(json.dumps(state))
+        if state['activation_profiled']:
+            raise SystemExit(30)
         payload = {key: os.environ[key] for key in ('WEB_IMAGE','PROXY_IMAGE','HUB_IMAGE','LAB_IMAGE')}
         (root / 'activation.json').write_text(json.dumps(payload))
         raise SystemExit(0)
@@ -99,14 +128,14 @@ if args[:2] == ['image', 'inspect']:
     if fmt == '{{.Id}}':
         print(image_id)
     elif '{{.Id}}|' in fmt:
-        label = '6.0.1' if image_id in {'sha256:hub-original','sha256:lab-original'} else ''
+        label = os.environ.get('FAKE_CANDIDATE_VERSION','6.0.1') if image_id in {'sha256:hub-original','sha256:lab-original'} else ''
         print(image_id + '|' + label)
     else:
         print('{}')
     raise SystemExit(0)
 if args and args[0] == 'inspect':
     if 'hub-current' in args:
-        print('6.0.1')
+        print(os.environ.get('FAKE_CURRENT_VERSION', '6.0.1'))
         if not state['retagged']:
             state['refs'] = {key: 'sha256:' + key.split(':')[0] + '-retagged' for key in state['refs']}
             state['retagged'] = True
@@ -167,7 +196,20 @@ raise SystemExit(0)
                     "LAB_IMAGE": "sha256:lab-original",
                 },
             )
+            successful_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                successful_state["compose_config_profiles"],
+                [["--profile", "images"], ["--profile", "images"]],
+            )
+            self.assertFalse(successful_state["activation_profiled"])
             activated = log.read_bytes()
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["refs"] = original_refs.copy()
+            state["retagged"] = False
+            state["compose_config_profiles"] = []
+            state["activation_profiled"] = None
+            state_path.write_text(json.dumps(state), encoding="utf-8")
             failure_env = env.copy()
             failure_env["FAKE_FAIL_INSPECT"] = "hub:tag"
             failed = subprocess.run(  # ruff: ignore[S603] - executes only fixture-owned scripts
@@ -180,6 +222,36 @@ raise SystemExit(0)
             )
             self.assertNotEqual(failed.returncode, 0)
             self.assertEqual(log.read_bytes(), activated)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["refs"] = original_refs.copy()
+            state["retagged"] = False
+            state["compose_config_profiles"] = []
+            state["activation_profiled"] = None
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            log.unlink()
+            old_stack_env = env.copy()
+            old_stack_env["FAKE_CURRENT_VERSION"] = "5.0.0"
+            refused = subprocess.run(  # ruff: ignore[S603] - executes only fixture-owned scripts
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=old_stack_env,
+                check=False,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(
+                "Hub version change 5.0.0 -> 6.0.1 may require a schema migration",
+                refused.stderr,
+            )
+            self.assertFalse(log.exists(), "version refusal must not activate images")
+            refusal_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                refusal_state["compose_config_profiles"],
+                [["--profile", "images"], ["--profile", "images"]],
+            )
+            self.assertIsNone(refusal_state["activation_profiled"])
 
 
 if __name__ == "__main__":
