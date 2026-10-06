@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite real Hub/proxy/Lab API acceptance stage; emits only sanitized cases.
+"""Finite real Hub/proxy/Lab API acceptance stage with sanitized diagnostics.
 
 Run from a disposable Hub image with its installed httpx/tornado dependencies.
 The loopback URL and ownership marker are mandatory. Browser/API credentials
@@ -31,6 +31,32 @@ SPAWN_TIMEOUT = 210
 STOP_TIMEOUT = 60
 HTTP_TIMEOUT = 15
 WS_TIMEOUT = 10
+CHECKPOINTS = (
+    "readiness",
+    "login-a",
+    "login-b",
+    "spawn-a",
+    "spawn-b",
+    "storage-a",
+    "storage-b",
+    "cross-user",
+    "cookie-oauth",
+    "terminals",
+    "websocket",
+    "reconnect",
+    "complete",
+)
+CHECKPOINT_SET = frozenset(CHECKPOINTS)
+FAILURE_CLASSIFICATIONS = frozenset(
+    {
+        "http-status",
+        "request-timeout",
+        "request-transport",
+        "assertion-failed",
+        "websocket-failed",
+        "probe-error",
+    }
+)
 
 
 def validate_origin(base: str) -> tuple[str, str]:
@@ -55,9 +81,93 @@ def validate_origin(base: str) -> tuple[str, str]:
     return origin, ws_origin
 
 
+class ProbeFailure(AssertionError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str = "assertion-failed",
+        http_status: int | None = None,
+        errno: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.classification = (
+            classification
+            if isinstance(classification, str)
+            and classification in FAILURE_CLASSIFICATIONS
+            else "probe-error"
+        )
+        self.http_status = (
+            http_status
+            if type(http_status) is int and 100 <= http_status <= 599
+            else None
+        )
+        self.errno = errno if type(errno) is int and 0 <= errno <= 4095 else None
+
+
 def assert_status(status: int, allowed: set[int], case: str) -> None:
     if status not in allowed:
-        raise AssertionError(f"contract failed: {case}")
+        raise ProbeFailure(
+            f"contract failed: {case}",
+            classification="http-status",
+            http_status=status,
+        )
+
+
+def failure_context(checkpoint: str, error: Exception) -> dict[str, object]:
+    """Return only enum diagnostics and bounded numeric fields, never exception text."""
+    if checkpoint not in CHECKPOINT_SET:
+        checkpoint = "readiness"
+    http_status: int | None = None
+    errno: int | None = None
+    if isinstance(error, ProbeFailure):
+        classification = error.classification
+        http_status = error.http_status
+    elif checkpoint == "websocket":
+        classification = "websocket-failed"
+        code = getattr(error, "code", None)
+        if type(code) is int and 100 <= code <= 599:
+            http_status = code
+    elif isinstance(error, TimeoutError):
+        classification = "request-timeout"
+    elif isinstance(error, AssertionError):
+        classification = "assertion-failed"
+    else:
+        classification = "probe-error"
+    if classification not in FAILURE_CLASSIFICATIONS:
+        classification = "probe-error"
+    raw_errno = getattr(error, "errno", None)
+    if type(raw_errno) is int and 0 <= raw_errno <= 4095:
+        errno = raw_errno
+    result: dict[str, object] = {
+        "checkpoint": checkpoint,
+        "classification": classification,
+    }
+    if http_status is not None:
+        result["http_status"] = http_status
+    if errno is not None:
+        result["errno"] = errno
+    return result
+
+
+def failure_report(
+    stage: str, probe: Probe | None, error: Exception
+) -> dict[str, object]:
+    checkpoint = probe.current_checkpoint if probe is not None else "readiness"
+    completed = probe.completed_cases if probe is not None else []
+    safe_completed = [case for case in completed if case in CHECKPOINT_SET]
+    return {
+        "stage": stage,
+        "status": "failed",
+        "failure_context": failure_context(checkpoint, error),
+        "completed_cases": safe_completed,
+    }
+
+
+def failure_json(stage: str, probe: Probe | None, error: Exception) -> str:
+    return json.dumps(
+        failure_report(stage, probe, error), sort_keys=True, separators=(",", ":")
+    )
 
 
 def check_marker(path: Path, run_id: str) -> None:
@@ -110,6 +220,39 @@ class Probe:
         )
         self.cookie_clients: dict[str, Any] = {}
         self.results: dict[str, str] = {}
+        self.current_checkpoint = "readiness"
+        self.completed_cases: list[str] = []
+
+    def checkpoint(self, name: str) -> None:
+        if not isinstance(name, str) or name not in CHECKPOINT_SET:
+            raise ProbeFailure("invalid probe checkpoint", classification="probe-error")
+        self.current_checkpoint = name
+
+    def complete_checkpoint(self) -> None:
+        if self.current_checkpoint not in self.completed_cases:
+            self.completed_cases.append(self.current_checkpoint)
+
+    def _http_failure(self, error: Exception) -> ProbeFailure:
+        raw_errno = getattr(error, "errno", None)
+        if isinstance(error, self.httpx.TimeoutException):
+            return ProbeFailure(
+                "HTTP request timed out",
+                classification="request-timeout",
+                errno=raw_errno,
+            )
+        return ProbeFailure(
+            "HTTP request transport failed",
+            classification="request-transport",
+            errno=raw_errno,
+        )
+
+    def _http_call(self, call, *args, **kwargs):
+        try:
+            return call(*args, **kwargs)
+        except self.httpx.TimeoutException as exc:
+            raise self._http_failure(exc) from None
+        except self.httpx.TransportError as exc:
+            raise self._http_failure(exc) from None
 
     def record(self, name: str, status: str = "pass") -> None:
         self.results[name] = status
@@ -137,7 +280,8 @@ class Probe:
         if session is None:
             client.cookies.clear()
         try:
-            response = client.request(
+            response = self._http_call(
+                client.request,
                 method,
                 self.origin + path,
                 headers=headers,
@@ -152,8 +296,16 @@ class Probe:
             if location:
                 target = urlsplit(location)
                 if target.netloc and target.netloc != urlsplit(self.origin).netloc:
-                    raise AssertionError("off-origin redirect rejected")
-            raise AssertionError("unexpected redirect")
+                    raise ProbeFailure(
+                        "off-origin redirect rejected",
+                        classification="http-status",
+                        http_status=response.status_code,
+                    )
+            raise ProbeFailure(
+                "unexpected redirect",
+                classification="http-status",
+                http_status=response.status_code,
+            )
         return response
 
     @staticmethod
@@ -246,13 +398,18 @@ class Probe:
         self.anonymous_client.cookies.clear()
         assert_status(anonymous_api.status_code, ALLOWED_DENIALS, "cookie-less-hub-api")
         try:
-            anonymous_page = self.anonymous_client.get(
-                self.origin + "/hub/home", timeout=self.timeout
+            anonymous_page = self._http_call(
+                self.anonymous_client.get,
+                self.origin + "/hub/home",
+                timeout=self.timeout,
             )
         finally:
             self.anonymous_client.cookies.clear()
-        if anonymous_page.status_code not in {302, 303}:
-            raise AssertionError("empty anonymous browser session was not redirected")
+        assert_status(
+            anonymous_page.status_code,
+            {302, 303},
+            "empty-anonymous-session-redirect",
+        )
         anonymous_location = urlsplit(
             urljoin(self.origin + "/", anonymous_page.headers.get("location", ""))
         )
@@ -277,9 +434,10 @@ class Probe:
                 "state": state,
             }
         )
-        oauth = session.get(self.origin + oauth_path, timeout=self.timeout)
-        if oauth.status_code not in {302, 303}:
-            raise AssertionError("private cookie OAuth authorization did not redirect")
+        oauth = self._http_call(
+            session.get, self.origin + oauth_path, timeout=self.timeout
+        )
+        assert_status(oauth.status_code, {302, 303}, "private-cookie-oauth-redirect")
         target = urlsplit(urljoin(self.origin + "/", oauth.headers.get("location", "")))
         params = dict(parse_qsl(target.query))
         if (
@@ -300,7 +458,9 @@ class Probe:
                 "state": state,
             }
         )
-        off_origin = session.get(self.origin + off_origin_path, timeout=self.timeout)
+        off_origin = self._http_call(
+            session.get, self.origin + off_origin_path, timeout=self.timeout
+        )
         if off_origin.status_code in {302, 303}:
             target = urlsplit(
                 urljoin(self.origin + "/", off_origin.headers.get("location", ""))
@@ -309,19 +469,27 @@ class Probe:
                 private_origin.scheme,
                 private_origin.netloc,
             ):
-                raise AssertionError(
-                    "OAuth rejected redirect escaped the private origin"
+                raise ProbeFailure(
+                    "OAuth rejected redirect escaped the private origin",
+                    classification="http-status",
+                    http_status=off_origin.status_code,
                 )
-            raise AssertionError("off-origin OAuth redirect was not rejected")
+            raise ProbeFailure(
+                "off-origin OAuth redirect was not rejected",
+                classification="http-status",
+                http_status=off_origin.status_code,
+            )
         assert_status(off_origin.status_code, {400, 403}, "off-origin-oauth-redirect")
         self.record("private-cookie-oauth-flow")
         self.record("off-origin-oauth-redirect-rejected")
 
     def prepare_identity(self, state: dict, stage: str) -> None:
         identities = state.get("identities")
+        self.checkpoint("login-a")
         if not isinstance(identities, list) or len(identities) != 2:
             raise AssertionError("state must contain exactly two fixture identities")
-        for identity in identities:
+        for index, identity in enumerate(identities):
+            self.checkpoint("login-a" if index == 0 else "login-b")
             raw = identity.get("browser_token")
             original_user = identity.get("username")
             if not isinstance(raw, str) or not isinstance(
@@ -338,6 +506,7 @@ class Probe:
             if stage == "baseline":
                 identity["api_token"] = session["apiToken"]
             self.record("identity-create" if stage == "baseline" else "identity-resume")
+            self.complete_checkpoint()
 
     def spawn(self, username: str, token: str) -> None:
         response = self.request(
@@ -490,6 +659,7 @@ class Probe:
         import tornado.websocket
         from tornado.httpclient import HTTPClientError, HTTPRequest
 
+        self.checkpoint("terminals")
         response = self.request(
             "POST", f"/user/{quote(username, safe='')}/api/terminals", token
         )
@@ -538,6 +708,8 @@ class Probe:
             connect_timeout=WS_TIMEOUT,
             request_timeout=WS_TIMEOUT,
         )
+        self.complete_checkpoint()
+        self.checkpoint("websocket")
         ws = await tornado.websocket.websocket_connect(
             request, connect_timeout=WS_TIMEOUT
         )
@@ -584,8 +756,10 @@ class Probe:
             )
         except HTTPClientError as exc:
             if exc.code not in ALLOWED_DENIALS:
-                raise AssertionError(
-                    "unauthenticated WebSocket failed outside authorization"
+                raise ProbeFailure(
+                    "unauthenticated WebSocket failed outside authorization",
+                    classification="websocket-failed",
+                    http_status=exc.code,
                 ) from None
             self.record("unauthenticated-terminal-websocket")
         else:
@@ -614,8 +788,10 @@ class Probe:
             )
         except HTTPClientError as exc:
             if exc.code not in ALLOWED_DENIALS:
-                raise AssertionError(
-                    "cross-user WebSocket failed outside authorization"
+                raise ProbeFailure(
+                    "cross-user WebSocket failed outside authorization",
+                    classification="websocket-failed",
+                    http_status=exc.code,
                 ) from None
             self.record("cross-user-terminal-websocket")
         else:
@@ -633,6 +809,7 @@ class Probe:
             token,
         )
         assert_status(removed.status_code, {204}, "terminal-cleanup")
+        self.complete_checkpoint()
         return name, marker
 
     def stop_respawn(self, identity: dict, path: str) -> None:
@@ -719,21 +896,30 @@ class Probe:
             self.record(case + "-resume")
 
     def run(self, stage: str, state: dict) -> dict[str, str]:
+        self.checkpoint("readiness")
         self.ready()
+        self.complete_checkpoint()
         self.prepare_identity(state, stage)
         identities = state["identities"]
         if stage == "cleanup":
+            self.checkpoint("complete")
             for identity in identities:
                 self.stop_for_cleanup(identity)
+            self.complete_checkpoint()
             return self.results
         if stage in {"updater-smoke", "accepted-smoke"}:
+            self.checkpoint("complete")
             self.resumed_smoke(identities, stage)
+            self.complete_checkpoint()
             return self.results
         # Reuse the baseline-issued SPA token across migration/restore stages.
-        for identity in identities:
+        for index, identity in enumerate(identities):
+            self.checkpoint("spawn-a" if index == 0 else "spawn-b")
             self.spawn(identity["username"], identity["api_token"])
+            self.complete_checkpoint()
         paths = []
-        for identity in identities:
+        for index, identity in enumerate(identities):
+            self.checkpoint("storage-a" if index == 0 else "storage-b")
             path, _ = self.own_lab_checks(
                 identity["username"],
                 identity["api_token"],
@@ -741,8 +927,13 @@ class Probe:
                 stage,
             )
             paths.append(path)
+            self.complete_checkpoint()
+        self.checkpoint("cross-user")
         self.deny_other_user(identities[0], identities[1], paths[1])
+        self.complete_checkpoint()
+        self.checkpoint("cookie-oauth")
         self.cookie_auth_boundary(identities)
+        self.complete_checkpoint()
         asyncio.run(
             self.terminal_check(
                 identities[0]["username"],
@@ -751,7 +942,11 @@ class Probe:
                 identities[1]["api_token"],
             )
         )
+        self.checkpoint("reconnect")
         self.stop_respawn(identities[0], paths[0])
+        self.complete_checkpoint()
+        self.checkpoint("complete")
+        self.complete_checkpoint()
         return self.results
 
 
@@ -807,6 +1002,7 @@ def main() -> int:
         parser.error(
             "--acknowledge-disposable is required before creating test identities"
         )
+    probe: Probe | None = None
     try:
         # Client libraries must not emit exception URLs containing short tokens.
         logging.disable(logging.CRITICAL)
@@ -842,9 +1038,9 @@ def main() -> int:
             save_state(args.state_file, state)
         print(json.dumps({"stage": args.stage, "cases": results}, sort_keys=True))
         return 1 if "fail" in results.values() else 0
-    except Exception:
+    except Exception as exc:
         # No exception details: they may contain raw auth headers, URLs, or tokens.
-        print(json.dumps({"stage": args.stage, "status": "failed"}, sort_keys=True))
+        print(failure_json(args.stage, probe, exc))
     return 1
 
 

@@ -14,7 +14,11 @@ from scripts.integration.probe import (
     STOP_TIMEOUT,
     WS_TIMEOUT,
     Probe,
+    ProbeFailure,
     assert_status,
+    failure_context,
+    failure_json,
+    failure_report,
     validate_origin,
 )
 
@@ -77,8 +81,16 @@ class ProbeSafetyTests(unittest.TestCase):
         try:
             with self.assertRaises(ValueError):
                 probe.request("GET", "//attacker.invalid/path")
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ProbeFailure) as raised:
                 probe.request("GET", "/hub/api")
+            self.assertEqual(
+                failure_context("readiness", raised.exception),
+                {
+                    "checkpoint": "readiness",
+                    "classification": "http-status",
+                    "http_status": 302,
+                },
+            )
             self.assertEqual(len(calls), 1)
             self.assertFalse(probe.client.cookies.jar)
         finally:
@@ -245,6 +257,195 @@ class ProbeSafetyTests(unittest.TestCase):
                 probe.own_lab_checks("user-a", "token", "abc123", "candidate")
             self.assertEqual(methods, ["GET", "GET"])
             self.assertNotIn("PUT", methods)
+        finally:
+            probe.client.close()
+            probe.anonymous_client.close()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("httpx"),
+        "httpx is installed in the locked Hub test environment",
+    )
+    def test_failure_report_identifies_http_checkpoint_without_private_values(
+        self,
+    ) -> None:
+        import httpx
+
+        def handler(request):
+            if request.url.path == "/hub/lab/ready":
+                return httpx.Response(200, json={"ready": True}, request=request)
+            if request.url.path == "/hub/lab/login":
+                return httpx.Response(
+                    503,
+                    text="token-secret https://private.invalid/?api=secret",
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+
+        probe = Probe(
+            "http://127.0.0.1:8000",
+            "ws://127.0.0.1:8000",
+            1,
+            transport=httpx.MockTransport(handler),
+        )
+        state = {
+            "identities": [
+                {
+                    "browser_token": "browser-token-secret",
+                    "api_token": "api-token-secret",
+                    "username": sha256(b"browser-token-secret").hexdigest()[:32],
+                    "marker": "marker-secret",
+                },
+                {
+                    "browser_token": "browser-token-b",
+                    "api_token": "api-token-b",
+                    "username": sha256(b"browser-token-b").hexdigest()[:32],
+                    "marker": "marker-b",
+                },
+            ]
+        }
+        try:
+            with self.assertRaises(ProbeFailure) as raised:
+                probe.run("candidate", state)
+            emitted = failure_json("candidate", probe, raised.exception)
+            report = json.loads(emitted)
+            self.assertLessEqual(len(emitted.encode("utf-8")), 64 * 1024)
+            self.assertEqual(
+                set(report),
+                {"stage", "status", "failure_context", "completed_cases"},
+            )
+            self.assertEqual(report["stage"], "candidate")
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["completed_cases"], ["readiness"])
+            self.assertEqual(
+                report["failure_context"],
+                {
+                    "checkpoint": "login-a",
+                    "classification": "http-status",
+                    "http_status": 503,
+                },
+            )
+            for private_value in (
+                "browser-token-secret",
+                "api-token-secret",
+                "marker-secret",
+                "token-secret",
+                "private.invalid",
+            ):
+                self.assertNotIn(private_value, emitted)
+        finally:
+            probe.client.close()
+            probe.anonymous_client.close()
+            for session in probe.cookie_clients.values():
+                session.close()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("httpx"),
+        "httpx is installed in the locked Hub test environment",
+    )
+    def test_request_timeout_and_transport_are_classified_without_exception_text(
+        self,
+    ) -> None:
+        import httpx
+
+        errors = (
+            (httpx.ReadTimeout, "request-timeout"),
+            (httpx.ConnectError, "request-transport"),
+        )
+        for error_type, classification in errors:
+            with self.subTest(classification=classification):
+
+                def handler(request, exception_type=error_type):
+                    raise exception_type(
+                        "token-secret https://private.invalid/?token=secret",
+                        request=request,
+                    )
+
+                probe = Probe(
+                    "http://127.0.0.1:8000",
+                    "ws://127.0.0.1:8000",
+                    1,
+                    transport=httpx.MockTransport(handler),
+                )
+                try:
+                    with self.assertRaises(ProbeFailure) as raised:
+                        probe.request("GET", "/hub/api", "api-token-secret")
+                    report = failure_report("restore", probe, raised.exception)
+                    self.assertEqual(
+                        report["failure_context"]["classification"], classification
+                    )
+                    self.assertNotIn("http_status", report["failure_context"])
+                    self.assertNotIn("token-secret", json.dumps(report))
+                    self.assertNotIn("private.invalid", json.dumps(report))
+                finally:
+                    probe.client.close()
+                    probe.anonymous_client.close()
+
+    def test_websocket_context_only_includes_bounded_http_status(self) -> None:
+        class WebSocketFailure(RuntimeError):
+            code = 403
+            errno = 9999
+
+        context = failure_context(
+            "websocket", WebSocketFailure("api-token-secret private.invalid")
+        )
+        self.assertEqual(
+            context,
+            {
+                "checkpoint": "websocket",
+                "classification": "websocket-failed",
+                "http_status": 403,
+            },
+        )
+        self.assertNotIn("api-token-secret", json.dumps(context))
+
+    def test_failure_context_uses_closed_enums_and_bounded_errno(self) -> None:
+        context = failure_context(
+            "untrusted-checkpoint", OSError(13, "private path and token-secret")
+        )
+        self.assertEqual(
+            context,
+            {
+                "checkpoint": "readiness",
+                "classification": "probe-error",
+                "errno": 13,
+            },
+        )
+        assertion = failure_context(
+            "cookie-oauth", AssertionError("token-secret https://private.invalid")
+        )
+        self.assertEqual(
+            assertion,
+            {
+                "checkpoint": "cookie-oauth",
+                "classification": "assertion-failed",
+            },
+        )
+        self.assertNotIn("token-secret", json.dumps(assertion))
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("httpx"),
+        "httpx is installed in the locked Hub test environment",
+    )
+    def test_unknown_checkpoint_cannot_enter_failure_report(self) -> None:
+        import httpx
+
+        probe = Probe(
+            "http://127.0.0.1:8000",
+            "ws://127.0.0.1:8000",
+            1,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, request=request)
+            ),
+        )
+        try:
+            with self.assertRaises(ProbeFailure) as raised:
+                probe.checkpoint("private-user-checkpoint")
+            report = failure_report("candidate", probe, raised.exception)
+            self.assertEqual(
+                report["failure_context"],
+                {"checkpoint": "readiness", "classification": "probe-error"},
+            )
+            self.assertNotIn("private-user-checkpoint", json.dumps(report))
         finally:
             probe.client.close()
             probe.anonymous_client.close()

@@ -67,6 +67,46 @@ def configured_suite(root: Path) -> run_suite.Suite:
     return suite
 
 
+def fixture_lab_cleanup_record(suite: run_suite.Suite, container_id: str, home: Path):
+    record = {
+        "id": container_id,
+        "name": "lab-user-a",
+        "kind": "fixture-lab",
+        "label": suite.run_id,
+        "user": "user-a",
+        "image_id": "sha256:" + "a" * 64,
+        "home_source": str(home.resolve()),
+        "auto_remove": True,
+        "removed": False,
+    }
+    suite.manifest["resources"]["containers"].append(record)
+    return record
+
+
+def fixture_lab_cleanup_inspect(
+    suite: run_suite.Suite,
+    container_id: str,
+    home: Path,
+    *,
+    running: bool = True,
+):
+    return {
+        "Id": container_id,
+        "Image": "sha256:" + "a" * 64,
+        "Name": "/lab-user-a",
+        "State": {"Running": running},
+        "HostConfig": {"AutoRemove": True},
+        "Config": {
+            "Labels": {
+                run_suite.RUN_LABEL: suite.run_id,
+                "finki.role": "lab",
+                "finki.user": "user-a",
+            }
+        },
+        "Mounts": [{"Destination": "/home/ubuntu", "Source": str(home.resolve())}],
+    }
+
+
 def run_xfs_setup_case(root: Path, safe_call, *, fail_save_at: int | None = None):
     suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
     root.mkdir(parents=True, exist_ok=True)
@@ -1651,6 +1691,122 @@ class SuiteContractTests(unittest.TestCase):
         )
         self.assertNotIn(secret.decode(), json.dumps(suite.failure_context))
 
+    def test_probe_failure_parser_forwards_only_allowlisted_context(self) -> None:
+        output = json.dumps(
+            {
+                "stage": "baseline",
+                "status": "failed",
+                "completed_cases": ["readiness", "login-a"],
+                "failure_context": {
+                    "checkpoint": "spawn-a",
+                    "classification": "http-status",
+                    "http_status": 503,
+                },
+            }
+        ).encode()
+        context, completed, count, _ = run_suite.parse_probe_result(
+            output, expected_stage="baseline", returncode=7
+        )
+        self.assertEqual(
+            context,
+            {
+                "operation": "api-probe",
+                "checkpoint": "spawn-a",
+                "classification": "http-status",
+                "http_status": 503,
+            },
+        )
+        self.assertEqual(completed, ["readiness", "login-a"])
+        self.assertEqual(count, 0)
+        self.assertNotIn("cases", context)
+
+    def test_probe_failure_parser_rejects_unknown_fields_and_duplicate_keys(
+        self,
+    ) -> None:
+        valid = {
+            "stage": "baseline",
+            "status": "failed",
+            "failure_context": {
+                "checkpoint": "login-a",
+                "classification": "request-transport",
+            },
+            "completed_cases": ["readiness"],
+        }
+        unknown = {**valid, "response_body": "sensitive-body"}
+        duplicate = (
+            b'{"stage":"baseline","stage":"baseline","status":"failed",'
+            b'"failure_context":{"checkpoint":"login-a",'
+            b'"classification":"request-transport"}}'
+        )
+        for output in (json.dumps(unknown).encode(), duplicate):
+            with self.subTest(output_length=len(output)):
+                with self.assertRaises(run_suite.HarnessFailure) as raised:
+                    run_suite.parse_probe_result(
+                        output, expected_stage="baseline", returncode=7
+                    )
+                self.assertNotIn("sensitive-body", str(raised.exception))
+
+    def test_probe_failure_parser_rejects_unknown_completed_case(self) -> None:
+        output = json.dumps(
+            {
+                "stage": "baseline",
+                "status": "failed",
+                "completed_cases": ["private-response-body"],
+                "failure_context": {
+                    "checkpoint": "login-a",
+                    "classification": "request-transport",
+                },
+            }
+        ).encode()
+        with self.assertRaises(run_suite.HarnessFailure) as raised:
+            run_suite.parse_probe_result(
+                output, expected_stage="baseline", returncode=7
+            )
+        self.assertNotIn("private-response-body", str(raised.exception))
+
+    def test_run_probe_preserves_failure_checkpoint_and_partial_case_names_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run"
+            probe = run_root / "probe"
+            probe.mkdir(parents=True)
+            suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+            suite.run_root = run_root
+            suite.probe_dir = probe
+            suite.image_ids["candidate_hub"] = "sha256:" + "a" * 64
+            child_output = json.dumps(
+                {
+                    "stage": "baseline",
+                    "status": "failed",
+                    "completed_cases": ["readiness"],
+                    "failure_context": {
+                        "checkpoint": "login-a",
+                        "classification": "http-status",
+                        "http_status": 403,
+                    },
+                }
+            ).encode()
+            with (
+                patch.object(suite, "run_owned_tool", return_value=(7, child_output)),
+                self.assertRaisesRegex(
+                    run_suite.HarnessFailure, "acceptance stage failed"
+                ),
+            ):
+                suite.run_probe("baseline")
+            self.assertEqual(
+                suite.failure_context,
+                {
+                    "operation": "api-probe",
+                    "checkpoint": "login-a",
+                    "classification": "http-status",
+                    "http_status": 403,
+                },
+            )
+            self.assertEqual(suite.results["completed_probe_cases"], ["readiness"])
+            self.assertEqual(suite.results["cases"], {})
+
     def test_proxy_image_reference_is_registered_with_its_content_id(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
         content_id = "sha256:" + "a" * 64
@@ -2449,10 +2605,13 @@ class SuiteContractTests(unittest.TestCase):
                 "Mounts": [],
             }
             with patch.object(
-                run_suite,
-                "safe_call",
+                suite,
+                "docker_result",
                 return_value=subprocess.CompletedProcess(
-                    [], 1, b"", b"Error: No such container"
+                    [],
+                    1,
+                    b"[]\n",
+                    f"Error: No such container: {container_id}".encode(),
                 ),
             ):
                 suite.cleanup_compose()
@@ -2549,10 +2708,13 @@ class SuiteContractTests(unittest.TestCase):
             )
             suite.inspect_container = lambda _cid: actual
             with patch.object(
-                run_suite,
-                "safe_call",
+                suite,
+                "docker_result",
                 return_value=subprocess.CompletedProcess(
-                    [], 1, b"", b"Error: No such container"
+                    [],
+                    1,
+                    b"[]\n",
+                    f"Error: No such container: {container_id}".encode(),
                 ),
             ):
                 suite.cleanup_compose()
@@ -2656,24 +2818,282 @@ class SuiteContractTests(unittest.TestCase):
         ):
             suite.run_owned_tool("sha256:image", ["true"], name_prefix="test-tool")
 
-    def test_hub_and_lab_term_timeout_prevents_removal(self) -> None:
-        container_id = "e" * 64
-        for service in ("hub", "lab"):
-            with self.subTest(service=service):
-                suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
-                suite.inspect_container = running_inspector(suite.run_id)
-                calls: list[list[str]] = []
-                suite.docker = docker_call_logger(calls)
-                with (
-                    patch.object(run_suite.time, "monotonic", side_effect=[0.0, 61.0]),
-                    patch.object(run_suite.time, "sleep"),
-                    self.assertRaisesRegex(run_suite.HarnessFailure, "bounded TERM"),
-                ):
-                    suite.remove_owned_container(container_id)
-                self.assertTrue(
-                    any(call[:2] == ["kill", "--signal=TERM"] for call in calls)
-                )
-                self.assertFalse(any(call[0] == "rm" for call in calls))
+    def test_lab_auto_remove_after_term_is_verified_without_rm(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            container_id = "e" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            item = fixture_lab_cleanup_inspect(suite, container_id, home)
+            outputs = [
+                subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    b"[]\n",
+                    f"Error: No such object: {container_id}".encode(),
+                ),
+            ]
+            calls: list[list[str]] = []
+            suite.docker = docker_call_logger(calls)
+            suite.docker_result = lambda *_args, **_kwargs: outputs.pop(0)
+
+            suite.remove_owned_container(container_id)
+
+            self.assertTrue(record["removed"])
+            self.assertIn(["kill", "--signal=TERM", container_id], calls)
+            self.assertFalse(any(call[0] == "rm" for call in calls))
+
+    def test_dynamic_lab_cleanup_records_identity_and_accepts_verified_autoremove(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool = root / "pool"
+            home = pool / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.pool = pool
+            suite.image_ids.update(
+                {
+                    "old_lab": "sha256:" + "a" * 64,
+                    "candidate_lab": "sha256:" + "b" * 64,
+                }
+            )
+            container_id = "9" * 64
+            item = fixture_lab_cleanup_inspect(suite, container_id, home)
+            calls: list[list[str]] = []
+            suite.docker = lambda *args, **_kwargs: (
+                (container_id + "\n").encode()
+                if args[:3] == ("ps", "-aq", "--no-trunc")
+                else docker_call_logger(calls)(*args)
+            )
+            suite.inspect_container = lambda _cid: item
+            outputs = [
+                subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    b"[]\n",
+                    f"Error: No such object: {container_id}".encode(),
+                ),
+            ]
+            suite.docker_result = lambda *_args, **_kwargs: outputs.pop(0)
+
+            suite.cleanup_dynamic_labs({"user-a"})
+
+            resource = suite.manifest["resources"]["containers"][0]
+            self.assertEqual(resource["user"], "user-a")
+            self.assertEqual(resource["image_id"], item["Image"])
+            self.assertEqual(resource["home_source"], str(home.resolve()))
+            self.assertTrue(resource["auto_remove"])
+            self.assertTrue(resource["removed"])
+            self.assertIn(["kill", "--signal=TERM", container_id], calls)
+            self.assertFalse(any(call[0] == "rm" for call in calls))
+
+    def test_lab_rm_race_is_removed_only_after_exact_absence_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            container_id = "f" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            item = fixture_lab_cleanup_inspect(suite, container_id, home, running=False)
+            outputs = [
+                subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    b"[]\n",
+                    f"Error: No such container: {container_id}".encode(),
+                ),
+            ]
+            calls: list[list[str]] = []
+
+            def docker(*args, **_kwargs):
+                calls.append(list(args))
+                if args[0] == "rm":
+                    raise run_suite.CommandFailure(1)
+                return b""
+
+            suite.docker = docker
+            suite.docker_result = lambda *_args, **_kwargs: outputs.pop(0)
+
+            suite.remove_owned_container(container_id)
+
+            self.assertTrue(record["removed"])
+            self.assertIn(["rm", container_id], calls)
+
+    def test_lab_term_timeout_does_not_force_remove(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            container_id = "d" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            item = fixture_lab_cleanup_inspect(suite, container_id, home)
+            calls: list[list[str]] = []
+            suite.inspect_owned_container_for_removal = lambda _cid: item
+            suite.docker = docker_call_logger(calls)
+            with (
+                patch.object(run_suite.time, "monotonic", side_effect=[0.0, 61.0]),
+                patch.object(run_suite.time, "sleep"),
+                self.assertRaisesRegex(run_suite.HarnessFailure, "bounded TERM"),
+            ):
+                suite.remove_owned_container(container_id)
+            self.assertIn(["kill", "--signal=TERM", container_id], calls)
+            self.assertFalse(any(call[0] == "rm" for call in calls))
+            self.assertFalse(record["removed"])
+
+    def test_lab_cleanup_rejects_changed_owned_facts_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            container_id = "c" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            item = fixture_lab_cleanup_inspect(suite, container_id, home)
+            item["Name"] = "/lab-other-user"
+            suite.inspect_owned_container_for_removal = lambda _cid: item
+            calls: list[list[str]] = []
+            suite.docker = docker_call_logger(calls)
+            with self.assertRaisesRegex(run_suite.HarnessFailure, "identity"):
+                suite.remove_owned_container(container_id)
+            self.assertEqual(calls, [])
+            self.assertFalse(record["removed"])
+
+    def test_lab_cleanup_unknown_inspect_or_wrong_id_is_not_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            for result in (
+                subprocess.CompletedProcess(
+                    [], 1, b"", b"Cannot connect to Docker daemon"
+                ),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        [{"Id": "b" * 64, "State": {"Running": False}}]
+                    ).encode(),
+                    b"",
+                ),
+            ):
+                with self.subTest(returncode=result.returncode):
+                    suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+                    container_id = "a" * 64
+                    record = fixture_lab_cleanup_record(suite, container_id, home)
+                    calls: list[list[str]] = []
+                    suite.docker = docker_call_logger(calls)
+                    suite.docker_result = lambda *_args, _result=result, **_kwargs: (
+                        _result
+                    )
+                    with self.assertRaises(run_suite.HarnessFailure):
+                        suite.remove_owned_container(container_id)
+                    self.assertFalse(record["removed"])
+                    self.assertEqual(calls, [])
+
+    def test_lab_exactly_absent_id_is_marked_removed_without_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "pool" / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            container_id = "b" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            suite.docker = lambda *_args, **_kwargs: self.fail(
+                "confirmed-absent container must not be mutated"
+            )
+            suite.docker_result = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error: No such object: {container_id}".encode(),
+            )
+            suite.remove_owned_container(container_id)
+            self.assertTrue(record["removed"])
+
+    def test_tracked_lab_absent_from_inventory_is_reconciled_by_exact_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool = root / "pool"
+            home = pool / "users" / "user-a"
+            home.mkdir(parents=True)
+            suite = run_suite.Suite(root, run_suite.BASELINE_SHA)
+            suite.pool = pool
+            container_id = "8" * 64
+            record = fixture_lab_cleanup_record(suite, container_id, home)
+            suite.docker = lambda *_args, **_kwargs: b""
+            suite.docker_result = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error: No such object: {container_id}".encode(),
+            )
+            suite.cleanup_dynamic_labs({"user-a"})
+            self.assertTrue(record["removed"])
+
+    def test_uncertain_lab_inspection_preserves_network_pool_and_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run-root"
+            root.mkdir()
+            pool = root / "pool"
+            pool.mkdir()
+            probe = root / "probe"
+            probe.mkdir()
+            (probe / "probe-state.json").touch()
+            suite = run_suite.Suite(Path(directory), run_suite.BASELINE_SHA)
+            suite.run_root = root
+            suite.pool = pool
+            suite.probe_dir = probe
+            suite.created_run_root = True
+            primary = {
+                "operation": "api-probe",
+                "checkpoint": "login-a",
+                "classification": "http-status",
+                "http_status": 403,
+            }
+            suite.failure_context = primary.copy()
+            suite.docker = lambda *args, **_kwargs: (
+                ("a" * 64 + "\n").encode()
+                if args[:3] == ("ps", "-aq", "--no-trunc")
+                else b""
+            )
+            suite.lab_names = lambda: {"user-a"}
+            suite.inspect_container = lambda _cid: (_ for _ in ()).throw(
+                run_suite.HarnessFailure("bounded inspect failed")
+            )
+            with (
+                patch.object(suite, "cleanup_compose"),
+                patch.object(suite, "cleanup_owned_tools"),
+                patch.object(suite, "cleanup_registry"),
+                patch.object(suite, "cleanup_network") as network,
+                patch.object(suite, "cleanup_pool") as cleanup_pool,
+                patch.object(suite, "remove_run_images"),
+                patch.object(suite, "cleanup_run_root") as cleanup_root,
+            ):
+                failures = suite.cleanup()
+            self.assertIn("dynamic-labs", failures)
+            self.assertIn("users-network-blocked-by-live-container", failures)
+            self.assertIn("xfs-pool-preserved-after-upstream-cleanup-failure", failures)
+            self.assertEqual(
+                suite.results["cleanup_failure_context"],
+                {
+                    "operation": "cleanup-dynamic-labs",
+                    "classification": "cleanup-incomplete",
+                },
+            )
+            self.assertEqual(suite.failure_context, primary)
+            network.assert_not_called()
+            cleanup_pool.assert_not_called()
+            cleanup_root.assert_not_called()
+            self.assertTrue(root.is_dir())
 
 
 if __name__ == "__main__":

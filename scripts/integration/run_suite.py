@@ -45,6 +45,36 @@ DB_RESULT_MAX_BYTES = 64 * 1024
 PROBE_TIMEOUT = 1230
 STAGE_TIMEOUT = 1800
 OVERALL_TEST_TIMEOUT = 4800
+PROBE_STAGES = frozenset(
+    {"baseline", "updater-smoke", "candidate", "restore", "accepted-smoke", "cleanup"}
+)
+PROBE_CHECKPOINTS = frozenset(
+    {
+        "readiness",
+        "login-a",
+        "login-b",
+        "spawn-a",
+        "spawn-b",
+        "storage-a",
+        "storage-b",
+        "cross-user",
+        "cookie-oauth",
+        "terminals",
+        "websocket",
+        "reconnect",
+        "complete",
+    }
+)
+PROBE_FAILURE_CLASSIFICATIONS = frozenset(
+    {
+        "http-status",
+        "request-timeout",
+        "request-transport",
+        "assertion-failed",
+        "websocket-failed",
+        "probe-error",
+    }
+)
 QuotaOperation = Literal[
     "quota-state",
     "quota-project",
@@ -133,6 +163,102 @@ def readiness_is_ready(status: int, payload: bytes) -> bool:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return False
     return isinstance(body, dict) and body.get("ready") is True
+
+
+def parse_probe_result(
+    output: bytes, *, expected_stage: str, returncode: int
+) -> tuple[dict[str, str | int] | None, list[str], int, dict[str, Any]]:
+    if expected_stage not in PROBE_STAGES or len(output) > DB_RESULT_MAX_BYTES:
+        raise HarnessFailure("API probe returned invalid sanitized evidence")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        result = json.loads(output.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise HarnessFailure("API probe returned invalid sanitized JSON") from exc
+    if not isinstance(result, dict) or result.get("stage") != expected_stage:
+        raise HarnessFailure("API probe returned invalid sanitized evidence")
+    if returncode:
+        if (
+            set(result) != {"stage", "status", "failure_context", "completed_cases"}
+            or result.get("status") != "failed"
+            or not isinstance(result.get("failure_context"), dict)
+        ):
+            raise HarnessFailure("API probe returned invalid sanitized evidence")
+        completed = result["completed_cases"]
+        if (
+            not isinstance(completed, list)
+            or len(completed) > len(PROBE_CHECKPOINTS)
+            or any(
+                not isinstance(item, str) or item not in PROBE_CHECKPOINTS
+                for item in completed
+            )
+            or len(set(completed)) != len(completed)
+        ):
+            raise HarnessFailure("API probe returned invalid sanitized evidence")
+        failure = result["failure_context"]
+        if not set(failure) <= {
+            "checkpoint",
+            "classification",
+            "http_status",
+            "errno",
+        }:
+            raise HarnessFailure("API probe returned invalid sanitized evidence")
+        checkpoint = failure.get("checkpoint")
+        classification = failure.get("classification")
+        if (
+            not isinstance(checkpoint, str)
+            or checkpoint not in PROBE_CHECKPOINTS
+            or not isinstance(classification, str)
+            or classification not in PROBE_FAILURE_CLASSIFICATIONS
+        ):
+            raise HarnessFailure("API probe returned invalid sanitized evidence")
+        safe_failure: dict[str, str | int] = {
+            "operation": "api-probe",
+            "checkpoint": checkpoint,
+            "classification": classification,
+        }
+        for field in ("http_status", "errno"):
+            value = failure.get(field)
+            if value is not None:
+                if type(value) is not int or not 0 <= value <= 4095:
+                    raise HarnessFailure(
+                        "API probe returned invalid sanitized evidence"
+                    )
+                if field == "http_status" and not 100 <= value <= 599:
+                    raise HarnessFailure(
+                        "API probe returned invalid sanitized evidence"
+                    )
+                safe_failure[field] = value
+        return safe_failure, completed, 0, result
+
+    if set(result) != {"stage", "cases"}:
+        raise HarnessFailure("API probe returned invalid sanitized evidence")
+    cases = result.get("cases")
+    if (
+        not isinstance(cases, dict)
+        or not cases
+        or len(cases) > 64
+        or any(
+            not isinstance(key, str)
+            or not key
+            or len(key) > 80
+            or not isinstance(value, str)
+            or value not in {"pass", "fail"}
+            for key, value in cases.items()
+        )
+    ):
+        raise HarnessFailure("API probe returned invalid sanitized evidence")
+    if any(value != "pass" for value in cases.values()):
+        raise HarnessFailure("API probe returned invalid sanitized evidence")
+    return None, [], len(cases), result
 
 
 def validate_db_evidence(facts: dict[str, Any]) -> None:
@@ -804,14 +930,77 @@ class Suite:
         return item
 
     def verify_container_absent(self, container_id: str) -> None:
-        result = safe_call(
-            ["docker", "inspect", container_id], timeout=15, capture=True
-        )
-        message = (result.stderr or b"").decode("utf-8", errors="replace").lower()
-        if result.returncode == 0 or not any(
-            phrase in message for phrase in ("no such object", "no such container")
-        ):
+        if not FULL_CONTAINER_ID_RE.fullmatch(container_id):
+            raise HarnessFailure("container absence check requires an exact ID")
+        result = self.docker_result("inspect", container_id, timeout=15, capture=True)
+        if not self.docker_inspect_not_found(result, container_id):
             raise HarnessFailure("Docker removal could not be verified")
+
+    def inspect_owned_container_for_removal(
+        self, container_id: str
+    ) -> dict[str, Any] | None:
+        result = self.docker_result("inspect", container_id, timeout=15, capture=True)
+        if result.returncode:
+            if self.docker_inspect_not_found(result, container_id):
+                return None
+            raise HarnessFailure("owned container cleanup inspection failed")
+        output = result.stdout or b""
+        if len(output) > 1024 * 1024:
+            raise HarnessFailure("owned container cleanup inspection was oversized")
+        try:
+            values = json.loads(output.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise HarnessFailure(
+                "owned container cleanup inspection was invalid"
+            ) from exc
+        if (
+            not isinstance(values, list)
+            or len(values) != 1
+            or not isinstance(values[0], dict)
+            or values[0].get("Id") != container_id
+            or not isinstance(values[0].get("State"), dict)
+            or type(values[0]["State"].get("Running")) is not bool
+        ):
+            raise HarnessFailure("owned container cleanup inspection did not match ID")
+        return values[0]
+
+    def verify_fixture_lab_cleanup_identity(
+        self, resource: dict[str, Any], item: dict[str, Any]
+    ) -> None:
+        container_id = resource.get("id")
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        mounts = item.get("Mounts")
+        host = item.get("HostConfig")
+        home = next(
+            (
+                mount
+                for mount in mounts or []
+                if isinstance(mount, dict)
+                and mount.get("Destination") == "/home/ubuntu"
+            ),
+            None,
+        )
+        if (
+            resource.get("kind") != "fixture-lab"
+            or not isinstance(container_id, str)
+            or item.get("Id") != container_id
+            or labels.get(RUN_LABEL) != self.run_id
+            or labels.get("finki.role") != "lab"
+            or labels.get("finki.user") != resource.get("user")
+            or (item.get("Name") or "").lstrip("/") != resource.get("name")
+            or item.get("Image") != resource.get("image_id")
+            or not isinstance(home, dict)
+            or Path(str(home.get("Source", ""))).resolve()
+            != Path(str(resource.get("home_source", ""))).resolve()
+            or not isinstance(host, dict)
+            or type(host.get("AutoRemove")) is not bool
+            or host.get("AutoRemove") != resource.get("auto_remove")
+        ):
+            raise HarnessFailure("fixture Lab cleanup identity no longer matched")
+
+    def mark_owned_container_removed(self, resource: dict[str, Any]) -> None:
+        resource["removed"] = True
+        self.save_manifest()
 
     def remove_owned_container(self, container_id: str, *, force: bool = False) -> None:
         if not FULL_CONTAINER_ID_RE.fullmatch(container_id):
@@ -824,12 +1013,20 @@ class Suite:
             ),
             None,
         )
+        item: dict[str, Any] | None
         if force:
             if resource is None:
                 raise HarnessFailure("forced cleanup requires a recorded owned tool")
             item = self.verify_container_record(resource)
         else:
-            item = self.inspect_container(container_id)
+            if resource is None or resource.get("kind") != "fixture-lab":
+                raise HarnessFailure("Lab cleanup requires a recorded owned fixture ID")
+            item = self.inspect_owned_container_for_removal(container_id)
+            if item is None:
+                self.mark_owned_container_removed(resource)
+                return
+            self.verify_fixture_lab_cleanup_identity(resource, item)
+        assert item is not None
         if item.get("Id") != container_id:
             raise HarnessFailure("inspected container ID differed from cleanup target")
         labels = (item.get("Config") or {}).get("Labels") or {}
@@ -839,15 +1036,30 @@ class Suite:
             )
         if bool((item.get("State") or {}).get("Running")):
             if not force:
-                self.docker("update", "--restart=no", container_id, timeout=20)
-                self.docker("kill", "--signal=TERM", container_id, timeout=20)
+                try:
+                    self.docker("update", "--restart=no", container_id, timeout=20)
+                    self.docker("kill", "--signal=TERM", container_id, timeout=20)
+                except Exception:
+                    latest = self.inspect_owned_container_for_removal(container_id)
+                    if latest is None:
+                        self.mark_owned_container_removed(resource)
+                        return
+                    self.verify_fixture_lab_cleanup_identity(resource, latest)
+                    if bool(latest["State"]["Running"]):
+                        raise
+                    item = latest
                 until = time.monotonic() + 60
                 while time.monotonic() < until:
-                    item = self.inspect_container(container_id)
-                    if not bool((item.get("State") or {}).get("Running")):
+                    latest = self.inspect_owned_container_for_removal(container_id)
+                    if latest is None:
+                        self.mark_owned_container_removed(resource)
+                        return
+                    self.verify_fixture_lab_cleanup_identity(resource, latest)
+                    item = latest
+                    if not bool(item["State"]["Running"]):
                         break
                     time.sleep(1)
-                if bool((item.get("State") or {}).get("Running")):
+                if bool(item["State"]["Running"]):
                     raise HarnessFailure(
                         "owned container did not exit after bounded TERM"
                     )
@@ -857,15 +1069,28 @@ class Suite:
                 self.verify_container_absent(container_id)
                 for resource in self.manifest["resources"]["containers"]:
                     if resource["id"] == container_id:
-                        resource["removed"] = True
-                self.save_manifest()
+                        self.mark_owned_container_removed(resource)
                 return
-        self.docker("rm", container_id, timeout=30)
-        self.verify_container_absent(container_id)
-        for resource in self.manifest["resources"]["containers"]:
-            if resource["id"] == container_id:
-                resource["removed"] = True
-        self.save_manifest()
+        if not force:
+            self.verify_fixture_lab_cleanup_identity(resource, item)
+        try:
+            self.docker("rm", container_id, timeout=30)
+        except Exception:
+            if (
+                not force
+                and self.inspect_owned_container_for_removal(container_id) is None
+            ):
+                self.mark_owned_container_removed(resource)
+                return
+            raise
+        if force:
+            self.verify_container_absent(container_id)
+        else:
+            latest = self.inspect_owned_container_for_removal(container_id)
+            if latest is not None:
+                self.verify_fixture_lab_cleanup_identity(resource, latest)
+                raise HarnessFailure("owned container remained after exact-ID removal")
+        self.mark_owned_container_removed(resource)
 
     def run_owned_tool(
         self,
@@ -2873,7 +3098,8 @@ class Suite:
                     (m for m in mounts if m.get("Destination") == "/home/ubuntu"), None
                 )
                 if (
-                    user not in usernames
+                    not isinstance(user, str)
+                    or user not in usernames
                     or name != f"lab-{user}"
                     or item.get("Image") != expected_image
                     or not home
@@ -2884,21 +3110,64 @@ class Suite:
                         "dynamic Lab ownership or home bind did not match this fixture"
                     )
                 self.retained_lab_ids.add(cid)
-                if not any(
-                    resource.get("id") == cid
-                    for resource in self.manifest["resources"]["containers"]
-                ):
-                    self.manifest["resources"]["containers"].append(
-                        {
-                            "id": cid,
-                            "name": name,
-                            "kind": "fixture-lab",
-                            "label": self.run_id,
-                            "removed": False,
-                        }
-                    )
+                resource = self.fixture_lab_manifest_entry(cid, name, user)
+                self.record_fixture_lab_identity(resource, item, user, home)
         self.manifest["fixture_lab_ids"] = sorted(self.retained_lab_ids)
         self.save_manifest()
+
+    def fixture_lab_manifest_entry(
+        self,
+        container_id: str,
+        name: str,
+        user: str,
+    ) -> dict[str, Any]:
+        resource = next(
+            (
+                entry
+                for entry in self.manifest["resources"]["containers"]
+                if entry.get("id") == container_id
+            ),
+            None,
+        )
+        if resource is None:
+            resource = {
+                "id": container_id,
+                "name": name,
+                "kind": "fixture-lab",
+                "label": self.run_id,
+                "removed": False,
+            }
+            self.manifest["resources"]["containers"].append(resource)
+        elif (
+            resource.get("kind") != "fixture-lab"
+            or resource.get("removed")
+            or resource.get("label") != self.run_id
+        ):
+            raise HarnessFailure("fixture Lab ID conflicted with its manifest record")
+        return resource
+
+    def record_fixture_lab_identity(
+        self,
+        resource: dict[str, Any],
+        item: dict[str, Any],
+        user: str,
+        home: dict[str, Any],
+    ) -> None:
+        host = item.get("HostConfig")
+        auto_remove = host.get("AutoRemove") if isinstance(host, dict) else None
+        if type(auto_remove) is not bool:
+            raise HarnessFailure("fixture Lab AutoRemove setting was malformed")
+        identity = {
+            "name": (item.get("Name") or "").lstrip("/"),
+            "user": user,
+            "image_id": item.get("Image"),
+            "home_source": str(Path(str(home.get("Source", ""))).resolve()),
+            "auto_remove": auto_remove,
+        }
+        for key, value in identity.items():
+            if key in resource and resource[key] != value:
+                raise HarnessFailure("fixture Lab identity changed from its manifest")
+            resource[key] = value
 
     def run_probe(self, stage: str) -> dict[str, Any]:
         self.active_stage = f"api-probe-{stage}"
@@ -2940,22 +3209,24 @@ class Suite:
             network="host",
             timeout=PROBE_TIMEOUT,
         )
-        if code:
-            raise HarnessFailure(f"real API acceptance stage failed: {stage}")
         try:
-            result = json.loads(output.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise HarnessFailure("API probe returned invalid sanitized JSON") from exc
-        cases = result.get("cases") if isinstance(result, dict) else None
-        if (
-            result.get("stage") != stage
-            or not isinstance(cases, dict)
-            or not cases
-            or any(value != "pass" for value in cases.values())
-        ):
-            raise HarnessFailure(f"API acceptance stage had nonpassing cases: {stage}")
-        self.add_case("api-" + stage, count=len(cases))
-        self.record_stage("api-probe-" + stage, case_count=len(cases))
+            failure_context, completed_cases, case_count, result = parse_probe_result(
+                output, expected_stage=stage, returncode=code
+            )
+        except HarnessFailure:
+            if code:
+                self.failure_context = {
+                    "operation": "api-probe",
+                    "classification": "invalid-probe-result",
+                }
+                self.results["completed_probe_cases"] = []
+            raise
+        if code:
+            self.failure_context = failure_context
+            self.results["completed_probe_cases"] = completed_cases
+            raise HarnessFailure("API acceptance stage failed")
+        self.add_case("api-" + stage, count=case_count)
+        self.record_stage("api-probe-" + stage, case_count=case_count)
         if stage == "baseline":
             state = json.loads(
                 (self.probe_dir / "probe-state.json").read_text(encoding="utf-8")
@@ -3682,17 +3953,28 @@ class Suite:
     def cleanup_dynamic_labs(self, usernames: set[str]) -> None:
         assert self.pool is not None
         ids = self.docker("ps", "-aq", "--no-trunc", capture=True).decode().splitlines()
+        seen_ids: set[str] = set()
         for cid in filter(None, (x.strip() for x in ids)):
             if not FULL_CONTAINER_ID_RE.fullmatch(cid):
                 raise HarnessFailure(
                     "cleanup inventory returned a truncated container ID"
                 )
+            seen_ids.add(cid)
             item = self.inspect_container(cid)
             labels = (item.get("Config") or {}).get("Labels") or {}
+            if item.get("Id") != cid:
+                raise HarnessFailure("Lab inspection ID differed from inventory ID")
             if (
                 labels.get(RUN_LABEL) != self.run_id
                 or labels.get("finki.role") != "lab"
             ):
+                if any(
+                    resource.get("id") == cid
+                    and resource.get("kind") == "fixture-lab"
+                    and not resource.get("removed")
+                    for resource in self.manifest["resources"]["containers"]
+                ):
+                    raise HarnessFailure("recorded Lab ownership labels changed")
                 continue
             name = (item.get("Name") or "").lstrip("/")
             user = labels.get("finki.user")
@@ -3715,28 +3997,45 @@ class Suite:
                     else {self.image_ids["old_lab"], self.image_ids["candidate_lab"]}
                 )
                 or not home
-                or Path(home.get("Source", "")).resolve()
+                or not isinstance(home.get("Source"), str)
+                or Path(home["Source"]).resolve()
                 != (self.pool / "users" / user).resolve()
             ):
                 raise HarnessFailure(
                     "cleanup refused a Lab with mismatched run/user/name/home ownership"
                 )
-            if not any(
-                resource.get("id") == cid
-                for resource in self.manifest["resources"]["containers"]
-            ):
-                self.manifest["resources"]["containers"].append(
-                    {
-                        "id": cid,
-                        "name": name,
-                        "kind": "fixture-lab",
-                        "label": self.run_id,
-                        "removed": False,
-                    }
-                )
-                self.save_manifest()
+            if not isinstance(user, str) or not isinstance(home, dict):
+                raise HarnessFailure("cleanup Lab identity fields were malformed")
+            record = self.fixture_lab_manifest_entry(cid, name, user)
+            self.record_fixture_lab_identity(record, item, user, home)
+            self.save_manifest()
             self.remove_owned_container(cid)
             self.retained_lab_ids.discard(cid)
+
+        for resource in self.manifest["resources"]["containers"]:
+            if (
+                resource.get("kind") != "fixture-lab"
+                or resource.get("removed")
+                or resource.get("id") in seen_ids
+            ):
+                continue
+            container_id = resource.get("id")
+            if not isinstance(container_id, str) or not FULL_CONTAINER_ID_RE.fullmatch(
+                container_id
+            ):
+                raise HarnessFailure("recorded fixture Lab lacks an exact ID")
+            if resource.get("user") in usernames:
+                self.remove_owned_container(container_id)
+                continue
+            inspected_item = self.inspect_owned_container_for_removal(container_id)
+            if inspected_item is None:
+                self.mark_owned_container_removed(resource)
+                self.retained_lab_ids.discard(container_id)
+                continue
+            self.verify_fixture_lab_cleanup_identity(resource, inspected_item)
+            raise HarnessFailure(
+                "recorded fixture Lab user was absent from probe state"
+            )
 
     def cleanup_compose(self) -> None:
         # Operate only on recorded project containers after rechecking project
@@ -4095,12 +4394,26 @@ class Suite:
         shutil.rmtree(self.run_root)
         self.created_run_root = False
 
+    def record_cleanup_failure(self, operation: str, error: Exception) -> None:
+        if self.cleanup_failure_context is not None:
+            return
+        context: dict[str, str | int] = {
+            "operation": operation,
+            "classification": "cleanup-incomplete",
+        }
+        if isinstance(error, CommandFailure) and -255 <= error.returncode <= 255:
+            context["returncode"] = error.returncode
+        elif isinstance(error, OSError) and isinstance(error.errno, int):
+            context["errno"] = error.errno
+        self.cleanup_failure_context = context
+
     def cleanup(self) -> list[str]:
         failures: list[str] = []
         try:
             # Public ingress and Hub control-plane are fenced before dynamic Labs.
             self.cleanup_compose()
-        except Exception:
+        except Exception as exc:
+            self.record_cleanup_failure("cleanup-compose-control-plane", exc)
             failures.append("compose-control-plane")
         if not failures:
             try:
@@ -4112,7 +4425,8 @@ class Suite:
                     self.lab_names() if state_path and state_path.is_file() else set()
                 )
                 self.cleanup_dynamic_labs(usernames)
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure("cleanup-dynamic-labs", exc)
                 failures.append("dynamic-labs")
         for stage, action in (
             ("owned-tools", self.cleanup_owned_tools),
@@ -4120,34 +4434,43 @@ class Suite:
         ):
             try:
                 action()
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure(f"cleanup-{stage}", exc)
                 failures.append(stage)
         container_failures = bool(failures)
         if not container_failures:
             try:
                 self.cleanup_network()
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure("cleanup-network", exc)
                 failures.append("users-network")
         else:
             failures.append("users-network-blocked-by-live-container")
         if not failures:
             try:
                 self.cleanup_pool()
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure("cleanup-pool", exc)
                 failures.append("xfs-pool")
         else:
             failures.append("xfs-pool-preserved-after-upstream-cleanup-failure")
         if not failures:
             try:
                 self.remove_run_images()
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure("cleanup-run-images", exc)
                 failures.append("run-images")
         if not failures:
             try:
                 self.cleanup_run_root()
-            except Exception:
+            except Exception as exc:
+                self.record_cleanup_failure("cleanup-run-root", exc)
                 failures.append("run-root-preserved")
         self.results["cleanup_stages_failed"] = failures
+        if self.cleanup_failure_context is not None:
+            self.results["cleanup_failure_context"] = (
+                self.cleanup_failure_context.copy()
+            )
         if failures:
             self.results["cleanup_incomplete"] = failures
             if self.created_run_root and self.run_root is not None:
