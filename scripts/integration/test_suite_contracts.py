@@ -14,6 +14,7 @@ import unittest
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from scripts import jupyterhub_maintenance as maintenance
@@ -65,6 +66,88 @@ def configured_suite(root: Path) -> run_suite.Suite:
         }
     )
     return suite
+
+
+def hub_mode_fixture(
+    root: Path, *, private: bool
+) -> tuple[run_suite.Suite, dict[str, Any], str, Path, Path]:
+    suite = configured_suite(root)
+    with patch.object(
+        run_suite.secrets,
+        "token_urlsafe",
+        return_value="fixture-proxy-token-not-written-to-inspect-output",
+    ):
+        suite.write_compose_fixture()
+    assert suite.run_root is not None and suite.project_dir is not None
+    backup = suite.run_root / "backups" / "rollback-cycle"
+    wrapper = backup / "configuration" / "jupyterhub_maintenance_config.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("# owned maintenance config fixture\n", encoding="utf-8")
+    suite.backups["rollback"] = backup
+    suite.register_compose_intents(["hub"], wrapper_source=wrapper if private else None)
+    container_id = "e" * 64
+    env = ["JUPYTERHUB_ALLOW_DB_UPGRADE=false"]
+    command = ["jupyterhub", "-f", "/app/jupyterhub_config.py"]
+    if private:
+        env.extend(
+            [
+                "JUPYTERHUB_MAINTENANCE_UPGRADE_DB=false",
+                "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS=false",
+            ]
+        )
+        command = [
+            "jupyterhub",
+            "-f",
+            run_suite.MAINTENANCE_HUB_CONFIG_PATH,
+        ]
+    mounts = [
+        {
+            "Type": "bind",
+            "Source": str(Path("/var/run/docker.sock").resolve()),
+            "Destination": "/var/run/docker.sock",
+            "RW": True,
+        },
+        {
+            "Type": "bind",
+            "Source": str((suite.project_dir / "data" / "hub").resolve()),
+            "Destination": "/srv/hub",
+            "RW": True,
+        },
+        {
+            "Type": "bind",
+            "Source": str(suite.pool.resolve()) if suite.pool else "",
+            "Destination": "/srv/pool",
+            "RW": True,
+        },
+    ]
+    if private:
+        mounts.append(
+            {
+                "Type": "bind",
+                "Source": str(wrapper.resolve()),
+                "Destination": run_suite.MAINTENANCE_HUB_CONFIG_PATH,
+                "RW": False,
+            }
+        )
+    item: dict[str, Any] = {
+        "Id": container_id,
+        "Name": f"/{suite.project_name}-hub-1",
+        "Image": suite.image_ids["old_hub"],
+        "Config": {
+            "Labels": {
+                "com.docker.compose.project": suite.project_name,
+                "com.docker.compose.service": "hub",
+                "com.docker.compose.project.working_dir": str(suite.project_dir),
+                run_suite.RUN_LABEL: suite.run_id,
+            },
+            "Env": env,
+            "Cmd": command,
+            "Entrypoint": None,
+        },
+        "HostConfig": {"NetworkMode": "host", "Privileged": True},
+        "Mounts": mounts,
+    }
+    return suite, item, container_id, backup, wrapper
 
 
 def fixture_lab_cleanup_record(suite: run_suite.Suite, container_id: str, home: Path):
@@ -2027,33 +2110,268 @@ class SuiteContractTests(unittest.TestCase):
             self.assertEqual(suite.active_stage, "explicit-fixture-configuration")
             self.assertEqual(suite.active_case, "scenario-setup")
 
-    def test_second_scenario_normalizes_old_hub_before_preflight(self) -> None:
-        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
-        suite.initial_override = Path("old.override.json")
-        suite.image_ids["old_hub"] = "sha256:" + "a" * 64
-        calls: list[str] = []
-        with (
-            patch.object(
-                suite,
-                "compose_command",
-                side_effect=lambda *a, **k: calls.append("compose"),
-            ),
-            patch.object(suite, "compose_ids", return_value=["owned-hub"]),
-            patch.object(
-                suite, "wait_ready", side_effect=lambda: calls.append("ready")
-            ),
-            patch.object(
-                suite, "verify_hub_mode", side_effect=lambda **_k: calls.append("mode")
-            ),
-            patch.object(
-                suite, "run_probe", side_effect=lambda _stage: calls.append("probe")
-            ),
-            patch.object(
-                suite, "record_stage", side_effect=lambda _name: calls.append("record")
-            ),
+    def test_normalized_baseline_runs_after_accepted_restore_and_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite, current_item, container_id, backup, wrapper = hub_mode_fixture(
+                root, private=True
+            )
+            assert suite.project_dir is not None and suite.initial_override is not None
+            runtime = backup / "accepted-runtime.json"
+            runtime.write_text("{}\n", encoding="utf-8")
+            runtime.chmod(0o600)
+            state = {
+                "stages": [{"stage": "accepted", "runtime_override": str(runtime)}]
+            }
+            (backup / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            (backup / "manifest.json").write_text("{}\n", encoding="utf-8")
+            marker = suite.project_dir / ".jupyterhub-maintenance.json"
+            marker.write_text(
+                json.dumps({"backup_directory": str(backup)}), encoding="utf-8"
+            )
+            marker.chmod(0o600)
+            accepted = {"marker": str(marker), "runtime_override": str(runtime)}
+            events: list[str] = []
+            holder = {"item": current_item}
+
+            def require(argv: list[str], **_kwargs: object) -> bytes:
+                if "up" in argv:
+                    self.assertEqual(suite.active_stage, "normalize-old-baseline")
+                    self.assertEqual(suite.active_case, "normalize-old-baseline")
+                    self.assertIn(str(suite.initial_override), argv)
+                    self.assertNotIn(str(runtime), argv)
+                    events.append("compose-up-original-override")
+                    normalized = {
+                        **holder["item"],
+                        "Config": {
+                            **holder["item"]["Config"],
+                            "Env": ["JUPYTERHUB_ALLOW_DB_UPGRADE=false"],
+                            "Cmd": [
+                                "jupyterhub",
+                                "-f",
+                                "/app/jupyterhub_config.py",
+                            ],
+                        },
+                        "Mounts": [
+                            mount
+                            for mount in holder["item"]["Mounts"]
+                            if mount.get("Destination")
+                            != run_suite.MAINTENANCE_HUB_CONFIG_PATH
+                        ],
+                    }
+                    holder["item"] = normalized
+                    return b""
+                if "ps" in argv:
+                    events.append("compose-ps")
+                    return f"{container_id}\n".encode()
+                self.fail("unexpected fixture Compose boundary operation")
+
+            def run_restore_probe(stage: str) -> None:
+                self.assertEqual(stage, "restore")
+                self.assertNotIn(
+                    "restored-old-baseline-normalized", suite.results["cases"]
+                )
+                events.append("restored-api-probe")
+
+            original_record_stage = suite.record_stage
+
+            def record_stage(name: str, **details: Any) -> None:
+                events.append("record:" + name)
+                original_record_stage(name, **details)
+
+            with (
+                patch.object(run_suite, "require_call", side_effect=require),
+                patch.object(
+                    suite,
+                    "inspect_container",
+                    side_effect=lambda _cid: holder["item"],
+                ),
+                patch.object(
+                    suite,
+                    "wait_ready",
+                    side_effect=lambda: events.append("ready"),
+                ),
+                patch.object(suite, "run_probe", side_effect=run_restore_probe),
+                patch.object(suite, "record_stage", side_effect=record_stage),
+            ):
+                # The prior restored-and-accepted old Hub remains in its
+                # required private wrapper mode until the normalization call.
+                suite.verify_hub_mode(
+                    expected_image=suite.image_ids["old_hub"],
+                    upgrade_db=False,
+                    suppress_cullers=False,
+                )
+                with patch.object(run_suite.stat, "S_IMODE", return_value=0o600):
+                    suite.clear_disposable_interlock(backup, accepted)
+                self.assertFalse(marker.exists())
+                events.clear()
+                suite.normalize_old_baseline()
+
+            self.assertLess(
+                events.index("compose-up-original-override"),
+                events.index("restored-api-probe"),
+            )
+            self.assertLess(
+                events.index("restored-api-probe"),
+                events.index("record:second-transaction-baseline-normalized"),
+            )
+            self.assertEqual(
+                suite.results["cases"]["restored-old-baseline-normalized"]["status"],
+                "pass",
+            )
+            self.assertEqual(
+                suite.manifest["stages"][-1]["name"],
+                "second-transaction-baseline-normalized",
+            )
+            self.assertTrue(wrapper.is_file())
+
+    def test_normalized_baseline_mode_rejects_private_or_changed_fixture_shapes(
+        self,
+    ) -> None:
+        def wrong_image(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Image"] = _suite.image_ids["candidate_hub"]
+
+        def allow_upgrade(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Env"] = ["JUPYTERHUB_ALLOW_DB_UPGRADE=true"]
+
+        def private_upgrade_flag(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Env"].append("JUPYTERHUB_MAINTENANCE_UPGRADE_DB=false")
+
+        def suppress_cullers(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Env"].append("JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS=true")
+
+        def wrapper_command(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Cmd"] = [
+                "jupyterhub",
+                "-f",
+                run_suite.MAINTENANCE_HUB_CONFIG_PATH,
+            ]
+
+        def custom_command(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Cmd"] = ["jupyterhub", "-f", "/tmp/other.py"]
+
+        def unexpected_mount(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["Config"]["Env"] = ["JUPYTERHUB_ALLOW_DB_UPGRADE=false"]
+            item["Config"]["Cmd"] = [
+                "jupyterhub",
+                "-f",
+                "/app/jupyterhub_config.py",
+            ]
+
+        def wrong_network(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["HostConfig"]["NetworkMode"] = "bridge"
+
+        def unprivileged(_suite: run_suite.Suite, item: dict[str, Any]) -> None:
+            item["HostConfig"]["Privileged"] = False
+
+        mutations: tuple[
+            tuple[str, bool, Callable[[run_suite.Suite, dict[str, Any]], None]], ...
+        ] = (
+            ("wrong image", False, wrong_image),
+            ("upgrade enabled", False, allow_upgrade),
+            ("maintenance flag", False, private_upgrade_flag),
+            ("cullers suppressed", False, suppress_cullers),
+            ("maintenance command", False, wrapper_command),
+            ("custom command", False, custom_command),
+            ("unexpected wrapper mount", True, unexpected_mount),
+            ("host network changed", False, wrong_network),
+            ("privilege changed", False, unprivileged),
+        )
+        for label, private_intent, mutate in mutations:
+            with self.subTest(shape=label), tempfile.TemporaryDirectory() as directory:
+                suite, item, container_id, _backup, _wrapper = hub_mode_fixture(
+                    Path(directory), private=private_intent
+                )
+                mutate(suite, item)
+                with (
+                    patch.object(
+                        suite,
+                        "compose_command",
+                        return_value=f"{container_id}\n".encode(),
+                    ),
+                    patch.object(suite, "inspect_container", return_value=item),
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_hub_mode(
+                        expected_image=suite.image_ids["old_hub"],
+                        upgrade_db=False,
+                        suppress_cullers=False,
+                        normalized_baseline=True,
+                    )
+
+        for label, expected_image, upgrade_db, suppress_cullers in (
+            ("wrong image", "sha256:" + "f" * 64, False, False),
+            ("upgrade enabled", None, True, False),
+            ("cullers suppressed", None, False, True),
         ):
-            suite.normalize_old_baseline()
-        self.assertEqual(calls, ["compose", "ready", "mode", "probe", "record"])
+            with (
+                self.subTest(normalized_mode=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, _item, _container_id, _backup, _wrapper = hub_mode_fixture(
+                    Path(directory), private=False
+                )
+                with (
+                    patch.object(suite, "compose_ids") as compose_ids,
+                    self.assertRaises(run_suite.HarnessFailure),
+                ):
+                    suite.verify_hub_mode(
+                        expected_image=expected_image or suite.image_ids["old_hub"],
+                        upgrade_db=upgrade_db,
+                        suppress_cullers=suppress_cullers,
+                        normalized_baseline=True,
+                    )
+                compose_ids.assert_not_called()
+
+    def test_accepted_old_hub_requires_the_exact_private_wrapper(self) -> None:
+        for valid_wrapper in (False, True):
+            with (
+                self.subTest(valid_wrapper=valid_wrapper),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                suite, item, container_id, _backup, _wrapper = hub_mode_fixture(
+                    Path(directory), private=valid_wrapper
+                )
+                if not valid_wrapper:
+                    item["Config"]["Env"].extend(
+                        [
+                            "JUPYTERHUB_MAINTENANCE_UPGRADE_DB=false",
+                            "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS=false",
+                        ]
+                    )
+                    item["Config"]["Cmd"] = [
+                        "jupyterhub",
+                        "-f",
+                        run_suite.MAINTENANCE_HUB_CONFIG_PATH,
+                    ]
+                    with (
+                        patch.object(
+                            suite,
+                            "compose_command",
+                            return_value=f"{container_id}\n".encode(),
+                        ),
+                        patch.object(suite, "inspect_container", return_value=item),
+                        self.assertRaises(run_suite.HarnessFailure),
+                    ):
+                        suite.verify_hub_mode(
+                            expected_image=suite.image_ids["old_hub"],
+                            upgrade_db=False,
+                            suppress_cullers=False,
+                        )
+                else:
+                    with (
+                        patch.object(
+                            suite,
+                            "compose_command",
+                            return_value=f"{container_id}\n".encode(),
+                        ),
+                        patch.object(suite, "inspect_container", return_value=item),
+                    ):
+                        suite.verify_hub_mode(
+                            expected_image=suite.image_ids["old_hub"],
+                            upgrade_db=False,
+                            suppress_cullers=False,
+                        )
 
     def test_old_and_candidate_compose_overrides_label_web_and_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

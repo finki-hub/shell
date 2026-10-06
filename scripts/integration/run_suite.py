@@ -32,6 +32,7 @@ from typing import Any, Literal, NoReturn, cast
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
 VERSION_LABEL = "org.finki-hub.jupyterhub-version"
+MAINTENANCE_HUB_CONFIG_PATH = "/srv/maintenance/jupyterhub-maintenance-config.py"
 RUN_LABEL = "shell.integration.run"
 PROJECT = "finki-hub-shell"
 NETWORK_NAME = "finki-hub-shell-users"
@@ -4114,6 +4115,8 @@ class Suite:
         self.add_case("web-loopback-acceptance", status="pass")
 
     def normalize_old_baseline(self) -> None:
+        self.active_stage = "normalize-old-baseline"
+        self.active_case = "normalize-old-baseline"
         self.compose_command(
             "up",
             "-d",
@@ -4131,8 +4134,10 @@ class Suite:
             expected_image=self.image_ids["old_hub"],
             upgrade_db=False,
             suppress_cullers=False,
+            normalized_baseline=True,
         )
         self.run_probe("restore")
+        self.add_case("restored-old-baseline-normalized", status="pass")
         self.record_stage("second-transaction-baseline-normalized")
 
     def clear_disposable_interlock(
@@ -4314,9 +4319,57 @@ class Suite:
         self.run_probe("cleanup")
         self.cleanup_dynamic_labs(users)
 
+    def expected_active_maintenance_config(self) -> Path:
+        intents = self.manifest["resources"]["containers"]
+        hub_intent = next(
+            (
+                resource
+                for resource in reversed(intents)
+                if resource.get("kind") == "compose-intent"
+                and resource.get("service") == "hub"
+                and not resource.get("removed")
+            ),
+            None,
+        )
+        if hub_intent is None:
+            raise HarnessFailure("private Hub has no current owned Compose intent")
+        sources = {
+            str(mount.get("source"))
+            for mount_set in hub_intent.get("allowed_mount_sets", [])
+            for mount in mount_set
+            if isinstance(mount, dict)
+            and mount.get("target") == MAINTENANCE_HUB_CONFIG_PATH
+            and isinstance(mount.get("source"), str)
+        }
+        if len(sources) != 1:
+            raise HarnessFailure("private Hub intent has no unique maintenance config")
+        source = Path(sources.pop()).resolve()
+        owned_configs = {
+            (backup / "configuration" / "jupyterhub_maintenance_config.py").resolve()
+            for backup in self.backups.values()
+        }
+        if source not in owned_configs:
+            raise HarnessFailure(
+                "private Hub config is outside the active owned backup"
+            )
+        return source
+
     def verify_hub_mode(
-        self, *, expected_image: str, upgrade_db: bool, suppress_cullers: bool
+        self,
+        *,
+        expected_image: str,
+        upgrade_db: bool,
+        suppress_cullers: bool,
+        normalized_baseline: bool = False,
     ) -> None:
+        if normalized_baseline and (
+            expected_image != self.image_ids.get("old_hub")
+            or upgrade_db
+            or suppress_cullers
+        ):
+            raise HarnessFailure(
+                "normalized baseline mode is limited to ordinary Hub 5"
+            )
         ids = self.compose_ids("hub")
         if len(ids) != 1:
             raise HarnessFailure("private Hub container is missing")
@@ -4330,28 +4383,71 @@ class Suite:
                 env[key] = val
         if env.get("JUPYTERHUB_ALLOW_DB_UPGRADE") != "false":
             raise HarnessFailure("restored old Hub is not migration-disabled")
+        config = item.get("Config") or {}
+        entrypoint = config.get("Entrypoint")
+        if entrypoint not in (None, []):
+            raise HarnessFailure("Hub entrypoint differs from the fixture image")
+        host = item.get("HostConfig") or {}
+        if host.get("NetworkMode") != "host" or host.get("Privileged") is not True:
+            raise HarnessFailure("Hub host-network/private-bind fixture shape changed")
+        mounts = item.get("Mounts") or []
+        helper_mounts = [
+            mount
+            for mount in mounts
+            if isinstance(mount, dict)
+            and mount.get("Destination") == MAINTENANCE_HUB_CONFIG_PATH
+        ]
         private_mode = (
             "JUPYTERHUB_MAINTENANCE_UPGRADE_DB" in env
             or "JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS" in env
         )
-        if private_mode:
-            if env.get("JUPYTERHUB_MAINTENANCE_UPGRADE_DB") != (
-                "true" if upgrade_db else "false"
-            ):
-                raise HarnessFailure("maintenance Hub upgrade mode differs from stage")
-            if env.get("JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS") != (
-                "true" if suppress_cullers else "false"
-            ):
+        if normalized_baseline:
+            if private_mode or helper_mounts:
                 raise HarnessFailure(
-                    "culler suppression is not independent/explicit for stage"
+                    "normalized baseline still has private maintenance mode"
                 )
-        elif suppress_cullers or upgrade_db:
+            if config.get("Cmd") != [
+                "jupyterhub",
+                "-f",
+                "/app/jupyterhub_config.py",
+            ]:
+                raise HarnessFailure(
+                    "normalized baseline is not using the original fixture config"
+                )
+            return
+
+        if not private_mode:
             raise HarnessFailure(
                 "private Hub is missing fixed maintenance wrapper mode"
             )
-        elif expected_image == self.image_ids["old_hub"] and not suppress_cullers:
+        if env.get("JUPYTERHUB_MAINTENANCE_UPGRADE_DB") != (
+            "true" if upgrade_db else "false"
+        ):
+            raise HarnessFailure("maintenance Hub upgrade mode differs from stage")
+        if env.get("JUPYTERHUB_MAINTENANCE_SUPPRESS_CULLERS") != (
+            "true" if suppress_cullers else "false"
+        ):
             raise HarnessFailure(
-                "accepted old Hub is missing its migration-disabled wrapper"
+                "culler suppression is not independent/explicit for stage"
+            )
+        if config.get("Cmd") != [
+            "jupyterhub",
+            "-f",
+            MAINTENANCE_HUB_CONFIG_PATH,
+        ]:
+            raise HarnessFailure(
+                "private Hub is not using its fixed maintenance config"
+            )
+        expected_source = self.expected_active_maintenance_config()
+        if (
+            len(helper_mounts) != 1
+            or helper_mounts[0].get("Type") != "bind"
+            or Path(str(helper_mounts[0].get("Source", ""))).resolve()
+            != expected_source
+            or helper_mounts[0].get("RW") is not False
+        ):
+            raise HarnessFailure(
+                "private Hub maintenance config mount differs from backup"
             )
 
     def restart_private_candidate(self) -> None:
