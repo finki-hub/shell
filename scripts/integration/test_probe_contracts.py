@@ -450,6 +450,34 @@ class ProbeSafetyTests(unittest.TestCase):
             probe.client.close()
             probe.anonymous_client.close()
 
+    def test_terminal_status_failures_have_only_allowlisted_assertion_labels(
+        self,
+    ) -> None:
+        assert_status(200, {200}, "terminal-create")
+        reports = {}
+        for label in ("url-token-attenuation", "url-token-no-mint"):
+            with self.subTest(label=label), self.assertRaises(ProbeFailure) as raised:
+                assert_status(200, ALLOWED_DENIALS, label)
+            reports[label] = failure_context("terminals", raised.exception)
+        self.assertEqual(
+            reports["url-token-attenuation"],
+            {
+                "checkpoint": "terminals",
+                "classification": "http-status",
+                "http_status": 200,
+                "assertion": "url-token-attenuation",
+            },
+        )
+        self.assertEqual(reports["url-token-no-mint"]["assertion"], "url-token-no-mint")
+
+        with self.assertRaises(ProbeFailure) as untrusted:
+            assert_status(200, {201}, "short-url-token api-token-secret")
+        failure = failure_json("candidate", None, untrusted.exception)
+        self.assertNotIn("api-token-secret", failure)
+        self.assertNotIn("short-url-token api-token-secret", failure)
+        self.assertNotIn('"assertion"', failure)
+        self.assertLessEqual(len(failure.encode("utf-8")), 64 * 1024)
+
     def test_runtime_deadlines_are_bounded_by_the_contract(self) -> None:
         self.assertLessEqual(HTTP_TIMEOUT, 15)
         self.assertLessEqual(SPAWN_TIMEOUT, 210)

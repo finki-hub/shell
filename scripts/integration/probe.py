@@ -57,6 +57,16 @@ FAILURE_CLASSIFICATIONS = frozenset(
         "probe-error",
     }
 )
+DIAGNOSTIC_ASSERTIONS = frozenset(
+    {
+        "terminal-create",
+        "short-url-token",
+        "url-token-attenuation",
+        "url-token-no-hub-model",
+        "url-token-no-mint",
+        "terminal-cleanup",
+    }
+)
 
 
 def validate_origin(base: str) -> tuple[str, str]:
@@ -89,6 +99,7 @@ class ProbeFailure(AssertionError):
         classification: str = "assertion-failed",
         http_status: int | None = None,
         errno: int | None = None,
+        assertion: str | None = None,
     ) -> None:
         super().__init__(message)
         self.classification = (
@@ -103,6 +114,11 @@ class ProbeFailure(AssertionError):
             else None
         )
         self.errno = errno if type(errno) is int and 0 <= errno <= 4095 else None
+        self.assertion = (
+            assertion
+            if isinstance(assertion, str) and assertion in DIAGNOSTIC_ASSERTIONS
+            else None
+        )
 
 
 def assert_status(status: int, allowed: set[int], case: str) -> None:
@@ -111,6 +127,7 @@ def assert_status(status: int, allowed: set[int], case: str) -> None:
             f"contract failed: {case}",
             classification="http-status",
             http_status=status,
+            assertion=case,
         )
 
 
@@ -120,9 +137,11 @@ def failure_context(checkpoint: str, error: Exception) -> dict[str, object]:
         checkpoint = "readiness"
     http_status: int | None = None
     errno: int | None = None
+    assertion: str | None = None
     if isinstance(error, ProbeFailure):
         classification = error.classification
         http_status = error.http_status
+        assertion = error.assertion
     elif checkpoint == "websocket":
         classification = "websocket-failed"
         code = getattr(error, "code", None)
@@ -147,6 +166,8 @@ def failure_context(checkpoint: str, error: Exception) -> dict[str, object]:
         result["http_status"] = http_status
     if errno is not None:
         result["errno"] = errno
+    if assertion is not None:
+        result["assertion"] = assertion
     return result
 
 

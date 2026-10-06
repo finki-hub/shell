@@ -75,6 +75,16 @@ PROBE_FAILURE_CLASSIFICATIONS = frozenset(
         "probe-error",
     }
 )
+PROBE_DIAGNOSTIC_ASSERTIONS = frozenset(
+    {
+        "terminal-create",
+        "short-url-token",
+        "url-token-attenuation",
+        "url-token-no-hub-model",
+        "url-token-no-mint",
+        "terminal-cleanup",
+    }
+)
 QuotaOperation = Literal[
     "quota-state",
     "quota-project",
@@ -123,6 +133,18 @@ QuotaCleanupPhase = Literal["limit-reset", "scratch-remove", "project-map-restor
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FULL_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+FULL_NETWORK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+NETWORK_CLEANUP_CLASSIFICATIONS = frozenset(
+    {
+        "inspection-failed",
+        "inspection-invalid",
+        "record-mismatch",
+        "ownership-mismatch",
+        "endpoints-present",
+        "remove-failed",
+        "network-still-present",
+    }
+)
 FS_IOC_FSGETXATTR = 0x801C581F
 FS_XFLAG_PROJINHERIT = 0x00000200
 QUOTA_PROJECT_ID = 9999
@@ -209,6 +231,7 @@ def parse_probe_result(
             "classification",
             "http_status",
             "errno",
+            "assertion",
         }:
             raise HarnessFailure("API probe returned invalid sanitized evidence")
         checkpoint = failure.get("checkpoint")
@@ -225,6 +248,14 @@ def parse_probe_result(
             "checkpoint": checkpoint,
             "classification": classification,
         }
+        assertion = failure.get("assertion")
+        if assertion is not None:
+            if (
+                not isinstance(assertion, str)
+                or assertion not in PROBE_DIAGNOSTIC_ASSERTIONS
+            ):
+                raise HarnessFailure("API probe returned invalid sanitized evidence")
+            safe_failure["assertion"] = assertion
         for field in ("http_status", "errno"):
             value = failure.get(field)
             if value is not None:
@@ -2671,24 +2702,113 @@ class Suite:
         self.verify_network_resource(self.docker_json("network", "inspect", ids[0])[0])
 
     def verify_network_resource(self, item: dict[str, Any]) -> None:
-        labels = item.get("Labels") or {}
-        ipam = (item.get("IPAM") or {}).get("Config") or []
+        labels = item.get("Labels")
+        ipam_data = item.get("IPAM")
+        ipam = ipam_data.get("Config") if isinstance(ipam_data, dict) else None
+        options = item.get("Options")
         if (
-            item.get("Name") != NETWORK_NAME
+            not isinstance(labels, dict)
+            or not isinstance(ipam, list)
+            or len(ipam) != 1
+            or not isinstance(ipam[0], dict)
+            or not isinstance(options, dict)
+            or item.get("Name") != NETWORK_NAME
             or item.get("Driver") != "bridge"
             or item.get("Internal") is not True
             or labels.get(RUN_LABEL) != self.run_id
-            or len(ipam) != 1
             or ipam[0].get("Subnet") != "172.30.0.0/23"
             or ipam[0].get("Gateway") != "172.30.0.1"
-            or item.get("Options", {}).get("com.docker.network.bridge.enable_icc")
-            != "false"
-            or item.get("Options", {}).get("com.docker.network.bridge.name")
-            != BRIDGE_NAME
+            or options.get("com.docker.network.bridge.enable_icc") != "false"
+            or options.get("com.docker.network.bridge.name") != BRIDGE_NAME
         ):
             raise HarnessFailure(
                 "fixture users network does not match isolated production shape"
             )
+
+    @staticmethod
+    def docker_network_not_found(
+        result: subprocess.CompletedProcess[bytes], network_id: str
+    ) -> bool:
+        if not FULL_NETWORK_ID_RE.fullmatch(network_id) or result.returncode == 0:
+            return False
+        output = (result.stdout or b"").strip()
+        if output:
+            try:
+                empty_result = json.loads(output) == []
+            except (UnicodeDecodeError, ValueError):
+                return False
+            if not empty_result:
+                return False
+        try:
+            diagnostic = (result.stderr or b"").decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            return False
+        return diagnostic == (
+            f"Error response from daemon: network {network_id} not found"
+        )
+
+    def fail_network_cleanup(
+        self,
+        phase: Literal["ownership", "endpoints", "removal", "absence-verification"],
+        classification: str,
+        *,
+        returncode: int | None = None,
+    ) -> NoReturn:
+        if classification not in NETWORK_CLEANUP_CLASSIFICATIONS:
+            classification = "inspection-invalid"
+        context: dict[str, str | int] = {
+            "operation": "cleanup-network",
+            "phase": phase,
+            "classification": classification,
+        }
+        if type(returncode) is int and -255 <= returncode <= 255:
+            context["returncode"] = returncode
+        if self.cleanup_failure_context is None:
+            self.cleanup_failure_context = context
+        raise HarnessFailure("owned users network cleanup could not be verified")
+
+    def inspect_network_for_cleanup(
+        self,
+        network_id: str,
+        *,
+        phase: Literal["ownership", "absence-verification"],
+    ) -> dict[str, Any] | None:
+        try:
+            result = self.docker_result(
+                "network", "inspect", network_id, timeout=15, capture=True
+            )
+        except HarnessFailure:
+            self.fail_network_cleanup(phase, "inspection-failed")
+        if result.returncode:
+            if self.docker_network_not_found(result, network_id):
+                return None
+            self.fail_network_cleanup(
+                phase,
+                "inspection-failed",
+                returncode=result.returncode,
+            )
+        output = result.stdout or b""
+        if len(output) > 1024 * 1024:
+            self.fail_network_cleanup(phase, "inspection-invalid")
+        try:
+            values = json.loads(output.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            self.fail_network_cleanup(phase, "inspection-invalid")
+        if (
+            not isinstance(values, list)
+            or len(values) != 1
+            or not isinstance(values[0], dict)
+            or values[0].get("Id") != network_id
+        ):
+            self.fail_network_cleanup(phase, "inspection-invalid")
+        return values[0]
+
+    def mark_owned_network_removed(self, resource: dict[str, Any]) -> None:
+        resource["removed"] = True
+        resource["intent"] = False
+        self.network_id = None
+        self.manifest["network_id"] = None
+        self.save_manifest()
 
     def write_compose_fixture(self) -> None:
         assert self.run_root is not None and self.pool is not None
@@ -4128,37 +4248,77 @@ class Suite:
             ):
                 raise HarnessFailure("network creation intent remains unresolved")
             return
-        item = self.docker_json("network", "inspect", self.network_id)[0]
+        network_id = self.network_id
         resource = next(
             (
                 network
                 for network in self.manifest["resources"]["networks"]
-                if network.get("id") == self.network_id and not network.get("removed")
+                if network.get("id") == network_id and not network.get("removed")
             ),
             None,
         )
-        if resource is None:
-            raise HarnessFailure("refusing to remove a network without creation intent")
-        self.verify_network_resource(item)
-        if item.get("Containers") or {}:
-            raise HarnessFailure("run-owned users network still has endpoints")
-        self.docker("network", "rm", self.network_id)
-        result = safe_call(
-            ["docker", "network", "inspect", self.network_id],
-            timeout=15,
-            capture=True,
+        if (
+            resource is None
+            or not FULL_NETWORK_ID_RE.fullmatch(network_id)
+            or resource.get("id") != network_id
+            or resource.get("name") != NETWORK_NAME
+            or resource.get("run_label") != self.run_id
+            or resource.get("purpose") != "isolated-users-network"
+            or resource.get("removed")
+        ):
+            self.fail_network_cleanup("ownership", "record-mismatch")
+
+        item = self.inspect_network_for_cleanup(network_id, phase="ownership")
+        if item is None:
+            # The manifest records this exact ID and its creation intent; an
+            # exact-ID not-found response is sufficient to reconcile a race.
+            self.mark_owned_network_removed(resource)
+            return
+        try:
+            self.verify_network_resource(item)
+        except HarnessFailure:
+            self.fail_network_cleanup("ownership", "ownership-mismatch")
+        if (
+            item.get("Id") != network_id
+            or item.get("Name") != resource["name"]
+            or item["Labels"].get(RUN_LABEL) != resource["run_label"]
+            or item.get("Driver") != "bridge"
+        ):
+            self.fail_network_cleanup("ownership", "ownership-mismatch")
+
+        endpoints = item.get("Containers")
+        if not isinstance(endpoints, dict):
+            self.fail_network_cleanup("endpoints", "inspection-invalid")
+        if endpoints:
+            self.fail_network_cleanup("endpoints", "endpoints-present")
+
+        try:
+            removal = self.docker_result("network", "rm", network_id, capture=True)
+        except HarnessFailure:
+            self.fail_network_cleanup("removal", "remove-failed")
+        if removal.returncode:
+            # A concurrent exact-ID deletion is acceptable only after the
+            # independent inspect confirms absence using Docker's exact error.
+            after_failed_remove = self.inspect_network_for_cleanup(
+                network_id, phase="absence-verification"
+            )
+            if after_failed_remove is None:
+                self.mark_owned_network_removed(resource)
+                return
+            self.fail_network_cleanup(
+                "removal", "remove-failed", returncode=removal.returncode
+            )
+
+        remaining = self.inspect_network_for_cleanup(
+            network_id, phase="absence-verification"
         )
-        message = (result.stderr or b"").decode("utf-8", errors="replace").lower()
-        if result.returncode == 0 or "no such network" not in message:
-            raise HarnessFailure("users network removal could not be verified")
-        self.manifest["resources"]["networks"] = [
-            {**network, "removed": True, "intent": False}
-            if network.get("id") == self.network_id
-            else network
-            for network in self.manifest["resources"]["networks"]
-        ]
-        self.network_id = None
-        self.save_manifest()
+        if remaining is not None:
+            self.fail_network_cleanup(
+                "absence-verification",
+                "network-still-present",
+                returncode=0,
+            )
+        self.mark_owned_network_removed(resource)
 
     def cleanup_registry(self) -> None:
         if self.registry_id is None:

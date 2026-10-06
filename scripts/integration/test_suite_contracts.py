@@ -107,6 +107,38 @@ def fixture_lab_cleanup_inspect(
     }
 
 
+def owned_network_cleanup_record(suite: run_suite.Suite, network_id: str):
+    record = {
+        "id": network_id,
+        "name": run_suite.NETWORK_NAME,
+        "run_label": suite.run_id,
+        "purpose": "isolated-users-network",
+        "removed": False,
+        "intent": False,
+    }
+    suite.network_id = network_id
+    suite.manifest["resources"]["networks"].append(record)
+    return record
+
+
+def owned_network_cleanup_inspect(
+    suite: run_suite.Suite, network_id: str, *, endpoints=None
+):
+    return {
+        "Id": network_id,
+        "Name": run_suite.NETWORK_NAME,
+        "Driver": "bridge",
+        "Internal": True,
+        "Labels": {run_suite.RUN_LABEL: suite.run_id},
+        "IPAM": {"Config": [{"Subnet": "172.30.0.0/23", "Gateway": "172.30.0.1"}]},
+        "Options": {
+            "com.docker.network.bridge.enable_icc": "false",
+            "com.docker.network.bridge.name": run_suite.BRIDGE_NAME,
+        },
+        "Containers": {} if endpoints is None else endpoints,
+    }
+
+
 def run_xfs_setup_case(root: Path, safe_call, *, fail_save_at: int | None = None):
     suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
     root.mkdir(parents=True, exist_ok=True)
@@ -1698,9 +1730,10 @@ class SuiteContractTests(unittest.TestCase):
                 "status": "failed",
                 "completed_cases": ["readiness", "login-a"],
                 "failure_context": {
-                    "checkpoint": "spawn-a",
+                    "checkpoint": "terminals",
                     "classification": "http-status",
-                    "http_status": 503,
+                    "http_status": 200,
+                    "assertion": "terminal-cleanup",
                 },
             }
         ).encode()
@@ -1711,9 +1744,10 @@ class SuiteContractTests(unittest.TestCase):
             context,
             {
                 "operation": "api-probe",
-                "checkpoint": "spawn-a",
+                "checkpoint": "terminals",
                 "classification": "http-status",
-                "http_status": 503,
+                "http_status": 200,
+                "assertion": "terminal-cleanup",
             },
         )
         self.assertEqual(completed, ["readiness", "login-a"])
@@ -1763,6 +1797,28 @@ class SuiteContractTests(unittest.TestCase):
                 output, expected_stage="baseline", returncode=7
             )
         self.assertNotIn("private-response-body", str(raised.exception))
+
+    def test_probe_failure_parser_rejects_unknown_assertion_label(self) -> None:
+        for assertion in ("private-path-token-secret", "terminal-delete"):
+            output = json.dumps(
+                {
+                    "stage": "baseline",
+                    "status": "failed",
+                    "completed_cases": ["readiness"],
+                    "failure_context": {
+                        "checkpoint": "terminals",
+                        "classification": "http-status",
+                        "http_status": 200,
+                        "assertion": assertion,
+                    },
+                }
+            ).encode()
+            with self.subTest(assertion=assertion):
+                with self.assertRaises(run_suite.HarnessFailure) as raised:
+                    run_suite.parse_probe_result(
+                        output, expected_stage="baseline", returncode=7
+                    )
+                self.assertNotIn(assertion, str(raised.exception))
 
     def test_run_probe_preserves_failure_checkpoint_and_partial_case_names_only(
         self,
@@ -2732,34 +2788,223 @@ class SuiteContractTests(unittest.TestCase):
                 )["removed"]
             )
 
-    def test_live_network_endpoint_refuses_network_removal(self) -> None:
+    def test_network_cleanup_accepts_exact_moby_absence_after_removal(self) -> None:
         suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
         network_id = "c" * 64
-        suite.network_id = network_id
-        suite.manifest["resources"]["networks"].append(
-            {"id": network_id, "name": run_suite.NETWORK_NAME, "removed": False}
-        )
-        suite.docker_json = lambda *_args, **_kwargs: [
-            {
-                "Name": run_suite.NETWORK_NAME,
-                "Driver": "bridge",
-                "Internal": True,
-                "Labels": {run_suite.RUN_LABEL: suite.run_id},
-                "IPAM": {
-                    "Config": [{"Subnet": "172.30.0.0/23", "Gateway": "172.30.0.1"}]
-                },
-                "Options": {
-                    "com.docker.network.bridge.enable_icc": "false",
-                    "com.docker.network.bridge.name": run_suite.BRIDGE_NAME,
-                },
-                "Containers": {"live-endpoint": {"Name": "fixture"}},
-            }
+        record = owned_network_cleanup_record(suite, network_id)
+        item = owned_network_cleanup_inspect(suite, network_id)
+        outputs = [
+            subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+            subprocess.CompletedProcess([], 0, b"", b""),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error response from daemon: network {network_id} not found".encode(),
+            ),
         ]
-        calls: list[str] = []
-        suite.docker = lambda *args, **_kwargs: calls.append(args[0]) or b""
-        with self.assertRaisesRegex(run_suite.HarnessFailure, "endpoints"):
+        calls: list[list[str]] = []
+
+        def fake_result(*args, **_kwargs):
+            calls.append(list(args))
+            return outputs.pop(0)
+
+        suite.docker_result = fake_result
+        suite.save_manifest = lambda: None
+
+        suite.cleanup_network()
+
+        self.assertEqual(
+            calls,
+            [
+                ["network", "inspect", network_id],
+                ["network", "rm", network_id],
+                ["network", "inspect", network_id],
+            ],
+        )
+        self.assertTrue(record["removed"])
+        self.assertFalse(record["intent"])
+        self.assertIsNone(suite.network_id)
+        self.assertIsNone(suite.manifest["network_id"])
+
+    def test_network_cleanup_reconciles_only_exact_id_not_found_before_remove(
+        self,
+    ) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        network_id = "d" * 64
+        record = owned_network_cleanup_record(suite, network_id)
+        suite.save_manifest = lambda: None
+        calls: list[list[str]] = []
+        suite.docker_result = lambda *args, **_kwargs: (
+            calls.append(list(args))
+            or subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error response from daemon: network {network_id} not found".encode(),
+            )
+        )
+
+        suite.cleanup_network()
+
+        self.assertEqual(calls, [["network", "inspect", network_id]])
+        self.assertTrue(record["removed"])
+        self.assertIsNone(suite.network_id)
+
+    def test_network_not_found_classifier_rejects_untrusted_diagnostics(self) -> None:
+        network_id = "e" * 64
+        cases = (
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error response from daemon: network {'f' * 64} not found".encode(),
+            ),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"permission denied inspecting network {network_id}".encode(),
+            ),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b'[{"Id":"other"}]',
+                f"Error response from daemon: network {network_id} not found".encode(),
+            ),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                b"[]\n",
+                f"Error response from daemon: network {network_id} not found".encode(),
+            ),
+        )
+        for result in cases:
+            with self.subTest(returncode=result.returncode, stdout=result.stdout):
+                self.assertFalse(
+                    run_suite.Suite.docker_network_not_found(result, network_id)
+                )
+
+    def test_network_cleanup_unknown_inspection_preserves_owned_record(self) -> None:
+        network_id = "a" * 64
+        cases = (
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b"[]\n",
+                f"Error response from daemon: network {'b' * 64} not found".encode(),
+            ),
+            subprocess.CompletedProcess([], 0, b"not json", b""),
+            subprocess.CompletedProcess([], 0, b'[{"Id":"other"}]', b""),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                b"[{}]\n",
+                f"Error response from daemon: network {network_id} not found".encode(),
+            ),
+        )
+        for result in cases:
+            with self.subTest(stdout=result.stdout, returncode=result.returncode):
+                suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+                record = owned_network_cleanup_record(suite, network_id)
+                calls: list[list[str]] = []
+
+                def fake_result(*args, _result=result, _calls=calls, **_kwargs):
+                    _calls.append(list(args))
+                    return _result
+
+                suite.docker_result = fake_result
+                suite.save_manifest = lambda: None
+                with self.assertRaises(run_suite.HarnessFailure):
+                    suite.cleanup_network()
+                self.assertFalse(record["removed"])
+                self.assertEqual(suite.network_id, network_id)
+                self.assertEqual(calls, [["network", "inspect", network_id]])
+                self.assertEqual(suite.cleanup_failure_context["phase"], "ownership")
+
+    def test_live_network_endpoint_refuses_network_removal(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        network_id = "b" * 64
+        record = owned_network_cleanup_record(suite, network_id)
+        item = owned_network_cleanup_inspect(
+            suite, network_id, endpoints={"live-endpoint": {"Name": "fixture"}}
+        )
+        calls: list[list[str]] = []
+        suite.docker_result = lambda *args, **_kwargs: (
+            calls.append(list(args))
+            or subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b"")
+        )
+        suite.save_manifest = lambda: None
+        with self.assertRaises(run_suite.HarnessFailure):
             suite.cleanup_network()
-        self.assertNotIn("network", calls)
+        self.assertEqual(calls, [["network", "inspect", network_id]])
+        self.assertFalse(record["removed"])
+        self.assertEqual(suite.cleanup_failure_context["phase"], "endpoints")
+        self.assertEqual(
+            suite.cleanup_failure_context["classification"], "endpoints-present"
+        )
+
+    def test_network_cleanup_refuses_inspected_id_mismatch(self) -> None:
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        network_id = "9" * 64
+        record = owned_network_cleanup_record(suite, network_id)
+        item = owned_network_cleanup_inspect(suite, "8" * 64)
+        calls: list[list[str]] = []
+        suite.docker_result = lambda *args, **_kwargs: (
+            calls.append(list(args))
+            or subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b"")
+        )
+        suite.save_manifest = lambda: None
+        with self.assertRaises(run_suite.HarnessFailure):
+            suite.cleanup_network()
+        self.assertEqual(calls, [["network", "inspect", network_id]])
+        self.assertFalse(record["removed"])
+        self.assertEqual(suite.cleanup_failure_context["phase"], "ownership")
+        self.assertEqual(
+            suite.cleanup_failure_context["classification"], "inspection-invalid"
+        )
+
+    def test_network_remove_failure_preserves_record_and_primary_api_context(self):
+        suite = run_suite.Suite(Path.cwd(), run_suite.BASELINE_SHA)
+        network_id = "7" * 64
+        record = owned_network_cleanup_record(suite, network_id)
+        item = owned_network_cleanup_inspect(suite, network_id)
+        primary = {
+            "operation": "api-probe",
+            "checkpoint": "terminals",
+            "classification": "http-status",
+            "http_status": 200,
+        }
+        suite.failure_context = primary.copy()
+        outputs = [
+            subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+            subprocess.CompletedProcess([], 1, b"", b"network is busy"),
+            subprocess.CompletedProcess([], 0, json.dumps([item]).encode(), b""),
+        ]
+        calls: list[list[str]] = []
+
+        def fake_result(*args, **_kwargs):
+            calls.append(list(args))
+            return outputs.pop(0)
+
+        suite.docker_result = fake_result
+        suite.save_manifest = lambda: None
+        with self.assertRaises(run_suite.HarnessFailure):
+            suite.cleanup_network()
+
+        self.assertFalse(record["removed"])
+        self.assertEqual(suite.network_id, network_id)
+        self.assertEqual(suite.failure_context, primary)
+        self.assertEqual(
+            suite.cleanup_failure_context,
+            {
+                "operation": "cleanup-network",
+                "phase": "removal",
+                "classification": "remove-failed",
+                "returncode": 1,
+            },
+        )
+        self.assertEqual(calls[1], ["network", "rm", network_id])
 
     def test_wrong_loop_backing_is_rejected_before_unmount_or_detach(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
