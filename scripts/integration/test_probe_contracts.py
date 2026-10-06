@@ -1,10 +1,14 @@
 """Nonprivileged contract tests for integration probe safety/assertion helpers."""
 
+import asyncio
+import hashlib
 import importlib.util
 import json
+import re
 import unittest
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.integration.probe import (
@@ -619,6 +623,118 @@ class ProbeSafetyTests(unittest.TestCase):
             assert_status(response.status_code, {200}, "url-token-no-hub-model")
             self.assertEqual(seen, [("token minted-token-secret", None)])
             self.assertFalse(probe.client.cookies.jar)
+        finally:
+            probe.client.close()
+            probe.anonymous_client.close()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("httpx") and importlib.util.find_spec("tornado"),
+        "locked Hub HTTP and WebSocket clients are installed",
+    )
+    def test_all_websocket_calls_use_real_validation_and_preserve_request_timeouts(
+        self,
+    ) -> None:
+        import httpx
+        import tornado.websocket
+        from tornado.httpclient import HTTPClientError
+
+        url_token = "synthetic-short-token"
+        access_scope = "access:servers!user=owner"
+
+        def api_handler(request):
+            path = request.url.path
+            if request.method == "POST" and path == "/user/owner/api/terminals":
+                return httpx.Response(
+                    200, json={"name": "owner-terminal"}, request=request
+                )
+            if request.method == "POST" and path == "/hub/api/users/owner/tokens":
+                body = json.loads(request.content)
+                if "scopes" in body:
+                    return httpx.Response(
+                        201,
+                        json={"token": url_token, "scopes": [access_scope]},
+                        request=request,
+                    )
+                return httpx.Response(403, request=request)
+            if request.method == "GET" and path == "/hub/api/users/other":
+                return httpx.Response(403, request=request)
+            if request.method == "GET" and path == "/hub/api/users/owner":
+                return httpx.Response(
+                    200,
+                    json={
+                        "kind": "user",
+                        "name": "owner",
+                        "admin": False,
+                        "groups": [],
+                        "user_info": {},
+                    },
+                    request=request,
+                )
+            if request.method == "POST" and path == "/user/other/api/terminals":
+                return httpx.Response(
+                    200, json={"name": "other-terminal"}, request=request
+                )
+            if request.method == "DELETE":
+                return httpx.Response(204, request=request)
+            raise AssertionError(f"unexpected fixture request: {request.method} {path}")
+
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.marker = ""
+
+            def write_message(self, message: str) -> None:
+                command = json.loads(message)[1]
+                match = re.search(r'bytes\.fromhex\("([a-f0-9]+)"\)', command)
+                if match is None:
+                    raise AssertionError("fixture terminal command missing marker")
+                self.marker = hashlib.sha256(bytes.fromhex(match.group(1))).hexdigest()
+
+            async def read_message(self) -> str:
+                return json.dumps(["stdout", self.marker])
+
+            def close(self) -> None:
+                return
+
+        requests = []
+
+        class StubWebSocketConnection:
+            def __init__(self, request, **_kwargs) -> None:
+                requests.append(request)
+                self.connect_future = asyncio.get_running_loop().create_future()
+                if len(requests) == 1:
+                    self.connect_future.set_result(FakeWebSocket())
+                else:
+                    self.connect_future.set_exception(HTTPClientError(403))
+
+        probe = Probe(
+            "http://127.0.0.1:8000",
+            "ws://127.0.0.1:8000",
+            1,
+            transport=httpx.MockTransport(api_handler),
+        )
+        try:
+            with patch.object(
+                tornado.websocket,
+                "WebSocketClientConnection",
+                StubWebSocketConnection,
+            ):
+                asyncio.run(
+                    probe.terminal_check(
+                        "owner", "spa-token", "other", "other-token", 6
+                    )
+                )
+            self.assertEqual(len(requests), 3)
+            for index, request in enumerate(requests):
+                self.assertEqual(request.connect_timeout, WS_TIMEOUT)
+                self.assertEqual(request.request_timeout, WS_TIMEOUT)
+                self.assertEqual(request.headers.get("Origin"), "http://127.0.0.1:8000")
+                self.assertIsNone(request.headers.get("Authorization"))
+                self.assertIsNone(request.headers.get("Cookie"))
+                params = parse_qs(urlsplit(request.url).query)
+                if index in {0, 2}:
+                    self.assertEqual(params.get("token"), [url_token])
+                else:
+                    self.assertNotIn("token", params)
         finally:
             probe.client.close()
             probe.anonymous_client.close()

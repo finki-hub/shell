@@ -865,9 +865,7 @@ class Probe:
         )
         self.complete_checkpoint()
         self.checkpoint("websocket")
-        ws = await tornado.websocket.websocket_connect(
-            request, connect_timeout=WS_TIMEOUT
-        )
+        ws = await tornado.websocket.websocket_connect(request)
         try:
             ws.write_message(json.dumps(["stdin", command]))
             deadline = time.monotonic() + WS_TIMEOUT
@@ -906,8 +904,7 @@ class Probe:
                     headers={"Origin": self.origin},
                     connect_timeout=WS_TIMEOUT,
                     request_timeout=WS_TIMEOUT,
-                ),
-                connect_timeout=WS_TIMEOUT,
+                )
             )
         except HTTPClientError as exc:
             if exc.code not in ALLOWED_DENIALS:
@@ -938,8 +935,7 @@ class Probe:
                     headers={"Origin": self.origin},
                     connect_timeout=WS_TIMEOUT,
                     request_timeout=WS_TIMEOUT,
-                ),
-                connect_timeout=WS_TIMEOUT,
+                )
             )
         except HTTPClientError as exc:
             if exc.code not in ALLOWED_DENIALS:
