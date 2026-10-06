@@ -7,7 +7,7 @@ dependencies = [
     "jupyter-archive==3.5.1",
     "jupyter-server==2.21.1",
     "jupyter-server-terminals==0.5.4",
-    "jupyterhub==5.5.1",
+    "jupyterhub==6.0.1",
 ]
 
 [build-system]
