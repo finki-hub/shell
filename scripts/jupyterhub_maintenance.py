@@ -47,6 +47,35 @@ FAILURE_PHASES = (
     "candidate-images",
     "lab-ownership",
     "backup-location",
+    "interlock",
+    "quiesce-services",
+    "drain-labs",
+    "cold-backup",
+    "reconcile-labs",
+    "start-private-proxy",
+    "start-migration-hub",
+    "migration-readiness",
+    "stop-migration-hub",
+    "start-candidate-hub",
+    "candidate-readiness",
+)
+COMMAND_OPERATIONS = (
+    "compose-config",
+    "compose-ps",
+    "compose-up-proxy",
+    "compose-up-hub",
+    "compose-up-web",
+    "daemon-info",
+    "container-list",
+    "container-inspect",
+    "image-inspect",
+    "hub-version-exec",
+    "lab-version-create",
+    "lab-version-start",
+    "lab-version-remove",
+    "restart-disable",
+    "send-term",
+    "container-remove",
 )
 FAILURE_CLASSIFICATIONS = (
     "required-service-missing",
@@ -103,6 +132,42 @@ SAFE_FAILURES = {
 
 class MaintenanceError(RuntimeError):
     """Sanitized operational failure; never carries command output or secrets."""
+
+
+class ExternalCommandFailure(MaintenanceError):
+    """Closed external-command status with no command data or output attached."""
+
+    def __init__(
+        self,
+        command_operation: str,
+        command_status: str,
+        external_returncode: int | None,
+    ) -> None:
+        if command_operation not in COMMAND_OPERATIONS:
+            raise ValueError("unsupported command operation")
+        if command_status not in ("nonzero", "timeout", "exec-failed"):
+            raise ValueError("unsupported command status")
+        if command_status == "nonzero":
+            if (
+                type(external_returncode) is not int
+                or not -255 <= external_returncode <= 255
+                or external_returncode == 0
+            ):
+                raise ValueError("invalid external return code")
+        elif external_returncode is not None:
+            raise ValueError("external return code is only valid for nonzero status")
+        super().__init__("bounded external command failed")
+        self.command_operation = command_operation
+        self.command_status = command_status
+        self.external_returncode = external_returncode
+        self.failure_phase: str | None = None
+
+
+class _ContainerAbsent:
+    pass
+
+
+_CONTAINER_ABSENT = _ContainerAbsent()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -399,9 +464,9 @@ class Controller:
             )
         if any(not path.is_file() for path in self.compose_files):
             raise MaintenanceError("all explicit Compose files must be regular files")
-        self.command = command or self._system_command
+        self.command = command
         self.clock = clock
-        self.sleeper = time.sleep
+        self.sleeper: Callable[[float], None] = lambda delay: time.sleep(delay)
         self.http_get = http_get or _http_get
         self.marker = self.project / MARKER_NAME
         self.manifest: dict[str, Any] = {}
@@ -414,7 +479,15 @@ class Controller:
         self.failure_phase = "dispatch"
 
     @staticmethod
-    def _system_command(args: Sequence[str], timeout: float, check: bool = True) -> str:
+    def _system_command(
+        args: Sequence[str],
+        timeout: float,
+        check: bool = True,
+        *,
+        operation: str,
+        missing_container_id: str | None = None,
+    ) -> str | _ContainerAbsent:
+        failure: ExternalCommandFailure | None = None
         try:
             result = subprocess.run(  # ruff: ignore[S603] - fixed argv, no shell, finite timeout
                 list(args),
@@ -424,18 +497,108 @@ class Controller:
                 timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise MaintenanceError("bounded external command timed out") from exc
-        except OSError as exc:
-            raise MaintenanceError(
-                "required external command could not be executed"
-            ) from exc
-        if check and result.returncode:
-            raise MaintenanceError("bounded external command failed")
+        except subprocess.TimeoutExpired:
+            failure = ExternalCommandFailure(operation, "timeout", None)
+        except OSError:
+            failure = ExternalCommandFailure(operation, "exec-failed", None)
+        if failure is not None:
+            raise failure
+        if result.returncode:
+            if missing_container_id is not None and Controller._inspect_not_found(
+                result.stdout, result.stderr, result.returncode, missing_container_id
+            ):
+                return _CONTAINER_ABSENT
+            if check or missing_container_id is not None:
+                return_code = result.returncode
+                if type(return_code) is not int or not -255 <= return_code <= 255:
+                    failure = ExternalCommandFailure(operation, "exec-failed", None)
+                else:
+                    failure = ExternalCommandFailure(operation, "nonzero", return_code)
+                raise failure
         return result.stdout.strip()
 
-    def _docker(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> str:
-        return self.command(["docker", *args], timeout, True)
+    @staticmethod
+    def _inspect_not_found(
+        stdout: str | bytes | None,
+        stderr: str | bytes | None,
+        returncode: int,
+        container_id: str,
+    ) -> bool:
+        if returncode == 0:
+            return False
+        output = stdout or ""
+        if isinstance(output, bytes):
+            try:
+                output = output.decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+        output = output.strip()
+        if output:
+            try:
+                decoded = json.loads(output)
+            except json.JSONDecodeError:
+                return False
+            if not isinstance(decoded, list) or decoded:
+                return False
+        message = stderr or ""
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", errors="replace")
+        return message.strip() in {
+            f"Error: No such object: {container_id}",
+            f"Error: No such container: {container_id}",
+            f"Error response from daemon: No such container: {container_id}",
+        }
+
+    def _run_command(
+        self,
+        args: Sequence[str],
+        timeout: float,
+        *,
+        operation: str,
+        check: bool = True,
+        missing_container_id: str | None = None,
+    ) -> str | _ContainerAbsent:
+        if operation not in COMMAND_OPERATIONS:
+            raise MaintenanceError("unsupported bounded command operation")
+        try:
+            if self.command is None:
+                result = self._system_command(
+                    args,
+                    timeout,
+                    check,
+                    operation=operation,
+                    missing_container_id=missing_container_id,
+                )
+            else:
+                result = self.command(args, timeout, check)
+        except ExternalCommandFailure as exc:
+            if exc.command_operation != operation:
+                failure = ExternalCommandFailure(
+                    operation, exc.command_status, exc.external_returncode
+                )
+                failure.failure_phase = (
+                    exc.failure_phase
+                    if exc.failure_phase in FAILURE_PHASES
+                    else self.failure_phase
+                )
+                raise failure from None
+            if exc.failure_phase is None:
+                exc.failure_phase = self.failure_phase
+            raise
+        return result
+
+    def _docker(
+        self,
+        *args: str,
+        operation: str,
+        timeout: float = COMMAND_TIMEOUT,
+    ) -> str:
+        result = self._run_command(
+            ["docker", *args], timeout, operation=operation, check=True
+        )
+        if isinstance(result, _ContainerAbsent):
+            raise MaintenanceError("Docker returned an invalid container inspection")
+        return result
 
     def _compose_args(self, files: Sequence[Path] | None = None) -> list[str]:
         args = [
@@ -457,14 +620,25 @@ class Controller:
     def _compose(
         self,
         *args: str,
+        operation: str,
         files: Sequence[Path] | None = None,
         timeout: float = COMMAND_TIMEOUT,
     ) -> str:
-        return self.command([*self._compose_args(files), *args], timeout, True)
+        result = self._run_command(
+            [*self._compose_args(files), *args],
+            timeout,
+            operation=operation,
+            check=True,
+        )
+        if isinstance(result, _ContainerAbsent):
+            raise MaintenanceError("Compose returned an invalid command result")
+        return result
 
     def _inspect(self, container_id: str) -> dict[str, Any]:
         try:
-            value = json.loads(self._docker("inspect", container_id))
+            value = json.loads(
+                self._docker("inspect", container_id, operation="container-inspect")
+            )
             item = value[0]
         except (json.JSONDecodeError, IndexError, TypeError) as exc:
             raise MaintenanceError(
@@ -472,11 +646,47 @@ class Controller:
             ) from exc
         if not isinstance(item, dict):
             raise MaintenanceError("Docker returned an invalid container inspection")
+        actual_id = item.get("Id")
+        if (
+            not isinstance(actual_id, str)
+            or not actual_id
+            or not actual_id.lower().startswith(container_id.lower())
+        ):
+            raise MaintenanceError("Docker returned a different container identity")
+        return item
+
+    def _inspect_exact_or_missing(self, container_id: str) -> dict[str, Any] | None:
+        result = self._run_command(
+            ["docker", "inspect", container_id],
+            COMMAND_TIMEOUT,
+            operation="container-inspect",
+            check=False,
+            missing_container_id=container_id,
+        )
+        if isinstance(result, _ContainerAbsent):
+            return None
+        try:
+            value = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise MaintenanceError(
+                "Docker returned an invalid container inspection"
+            ) from exc
+        if (
+            not isinstance(value, list)
+            or len(value) != 1
+            or not isinstance(value[0], dict)
+        ):
+            raise MaintenanceError("Docker returned an invalid container inspection")
+        item = value[0]
+        if item.get("Id") != container_id:
+            raise MaintenanceError("Docker returned a different container identity")
         return item
 
     def _image(self, reference: str) -> dict[str, Any]:
         try:
-            value = json.loads(self._docker("image", "inspect", reference))
+            value = json.loads(
+                self._docker("image", "inspect", reference, operation="image-inspect")
+            )
             item = value[0]
         except (json.JSONDecodeError, IndexError, TypeError) as exc:
             raise MaintenanceError(
@@ -503,7 +713,14 @@ class Controller:
     def _load_config(self) -> None:
         try:
             self.config = json.loads(
-                self._compose("--profile", "images", "config", "--format", "json")
+                self._compose(
+                    "--profile",
+                    "images",
+                    "config",
+                    "--format",
+                    "json",
+                    operation="compose-config",
+                )
             )
         except json.JSONDecodeError as exc:
             raise MaintenanceError(
@@ -612,7 +829,9 @@ class Controller:
             )
 
     def _daemon(self) -> None:
-        self.daemon_id = self._docker("info", "--format", "{{.ID}}")
+        self.daemon_id = self._docker(
+            "info", "--format", "{{.ID}}", operation="daemon-info"
+        )
         if not self.daemon_id or "\n" in self.daemon_id:
             raise MaintenanceError("Docker daemon identity is unavailable")
 
@@ -628,7 +847,7 @@ class Controller:
         return item
 
     def _find_service_container(self, service: str) -> dict[str, Any] | None:
-        output = self._compose("ps", "-aq", service)
+        output = self._compose("ps", "-aq", service, operation="compose-ps")
         ids = [line.strip() for line in output.splitlines() if line.strip()]
         if not ids:
             return None
@@ -773,7 +992,7 @@ class Controller:
             )
 
     def _all_containers(self) -> list[dict[str, Any]]:
-        output = self._docker("ps", "-aq")
+        output = self._docker("ps", "-aq", operation="container-list")
         ids = [line.strip() for line in output.splitlines() if line.strip()]
         return [self._inspect(identifier) for identifier in ids]
 
@@ -820,6 +1039,7 @@ class Controller:
             "python",
             "-c",
             "import importlib.metadata as m; print(m.version('jupyterhub'))",
+            operation="hub-version-exec",
             timeout=15,
         )
         return _version(output, label="running Hub")
@@ -853,10 +1073,17 @@ class Controller:
                 image_id,
                 "-c",
                 "import importlib.metadata as m; print(m.version('jupyterhub'))",
+                operation="lab-version-create",
                 timeout=COMMAND_TIMEOUT,
             )
             output = (
-                self._docker("start", "-a", container_id, timeout=COMMAND_TIMEOUT)
+                self._docker(
+                    "start",
+                    "-a",
+                    container_id,
+                    operation="lab-version-start",
+                    timeout=COMMAND_TIMEOUT,
+                )
                 if container_id
                 else ""
             )
@@ -893,6 +1120,7 @@ class Controller:
             "--no-trunc",
             "--filter",
             f"label={label_key}={label_value}",
+            operation="container-list",
         )
         ids = [line.strip() for line in output.splitlines() if line.strip()]
         if not ids:
@@ -914,8 +1142,20 @@ class Controller:
         ):
             raise MaintenanceError("refusing to clean an unowned Lab probe container")
         if bool((container.get("State") or {}).get("Running")):
-            self._docker("update", "--restart=no", ids[0], timeout=COMMAND_TIMEOUT)
-            self._docker("kill", "--signal=TERM", ids[0], timeout=COMMAND_TIMEOUT)
+            self._docker(
+                "update",
+                "--restart=no",
+                ids[0],
+                operation="restart-disable",
+                timeout=COMMAND_TIMEOUT,
+            )
+            self._docker(
+                "kill",
+                "--signal=TERM",
+                ids[0],
+                operation="send-term",
+                timeout=COMMAND_TIMEOUT,
+            )
             deadline = self.clock() + STOP_TIMEOUT
             while self.clock() < deadline:
                 container = self._inspect(ids[0])
@@ -926,7 +1166,9 @@ class Controller:
                 raise MaintenanceError(
                     "owned Lab probe container did not stop after TERM"
                 )
-        self._docker("rm", ids[0], timeout=COMMAND_TIMEOUT)
+        self._docker(
+            "rm", ids[0], operation="lab-version-remove", timeout=COMMAND_TIMEOUT
+        )
 
     def _candidate_image(self, service: str) -> tuple[str, str, str]:
         image_ref = (self.config["services"][service] or {}).get("image")
@@ -944,6 +1186,43 @@ class Controller:
             image.get("Id", ""),
             _version(version, label=f"candidate {service}"),
         )
+
+    def _lab_shape_sha256(self, item: dict[str, Any], username: str) -> str:
+        host_config = item.get("HostConfig") or {}
+        labels = self._labels(item)
+        mounts = self._mounts(item)
+        shape = {
+            "id": item.get("Id"),
+            "name": str(item.get("Name", "")).removeprefix("/"),
+            "role": labels.get("finki.role"),
+            "username": username,
+            "image_id": item.get("Image"),
+            "auto_remove": host_config.get("AutoRemove"),
+            "network_mode": host_config.get("NetworkMode"),
+            "privileged": host_config.get("Privileged"),
+            "cap_add": host_config.get("CapAdd"),
+            "cap_drop": host_config.get("CapDrop"),
+            "devices": host_config.get("Devices"),
+            "pid_mode": host_config.get("PidMode"),
+            "ipc_mode": host_config.get("IpcMode"),
+            "mounts": sorted(
+                [
+                    (
+                        mount.get("Type"),
+                        mount.get("Source"),
+                        mount.get("Destination"),
+                        mount.get("RW"),
+                        mount.get("Name"),
+                    )
+                    for mount in mounts
+                ],
+                key=lambda mount: json.dumps(mount, sort_keys=True),
+            ),
+        }
+        try:
+            return _sha256_json(shape)
+        except (TypeError, ValueError) as exc:
+            raise MaintenanceError("owned Lab container shape is invalid") from exc
 
     def _validate_labs(
         self,
@@ -986,8 +1265,18 @@ class Controller:
                     "possible Lab has an unexpected or ambiguous home bind"
                 )
             image_id = item.get("Image")
-            if not image_id:
+            container_id = item.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                raise MaintenanceError("owned Lab container identity is unavailable")
+            if not isinstance(image_id, str) or not image_id:
                 raise MaintenanceError("owned Lab image identity is unavailable")
+            state = item.get("State") or {}
+            if type(state.get("Running")) is not bool:
+                raise MaintenanceError("owned Lab running state is unavailable")
+            host_config = item.get("HostConfig") or {}
+            auto_remove = host_config.get("AutoRemove")
+            if type(auto_remove) is not bool:
+                raise MaintenanceError("owned Lab AutoRemove setting is unavailable")
             lab_version = self._probe_lab_image(image_id)
             if expected_version is not None and lab_version != expected_version:
                 raise MaintenanceError(
@@ -995,16 +1284,18 @@ class Controller:
                 )
             labs.append(
                 {
-                    "id": item.get("Id"),
+                    "id": container_id,
                     "name": name,
                     "username": username,
                     "image_id": image_id,
                     "version": lab_version,
                     "home": str(expected_home),
-                    "running": bool((item.get("State") or {}).get("Running")),
+                    "running": state["Running"],
+                    "auto_remove": auto_remove,
                     "restart_policy": (
-                        (item.get("HostConfig") or {}).get("RestartPolicy") or {}
-                    ).get("Name", "no"),
+                        (host_config.get("RestartPolicy") or {}).get("Name", "no")
+                    ),
+                    "shape_sha256": self._lab_shape_sha256(item, username),
                 }
             )
         return labs
@@ -1405,18 +1696,42 @@ class Controller:
         return path
 
     def _graceful_exit(
-        self, container: dict[str, Any], timeout: float = STOP_TIMEOUT
-    ) -> None:
+        self,
+        container: dict[str, Any],
+        timeout: float = STOP_TIMEOUT,
+        *,
+        allow_auto_remove: bool = False,
+    ) -> bool:
         identifier = container["Id"]
-        self._docker("update", "--restart=no", identifier, timeout=COMMAND_TIMEOUT)
+        self._docker(
+            "update",
+            "--restart=no",
+            identifier,
+            operation="restart-disable",
+            timeout=COMMAND_TIMEOUT,
+        )
         if not bool((container.get("State") or {}).get("Running")):
-            return
-        self._docker("kill", "--signal=TERM", identifier, timeout=COMMAND_TIMEOUT)
+            return False
+        self._docker(
+            "kill",
+            "--signal=TERM",
+            identifier,
+            operation="send-term",
+            timeout=COMMAND_TIMEOUT,
+        )
         deadline = self.clock() + timeout
         while self.clock() < deadline:
-            inspected = self._inspect(identifier)
+            inspected = (
+                self._inspect_exact_or_missing(identifier)
+                if allow_auto_remove
+                else self._inspect(identifier)
+            )
+            if inspected is None:
+                if allow_auto_remove:
+                    return True
+                raise MaintenanceError("container disappeared during shutdown")
             if not bool((inspected.get("State") or {}).get("Running")):
-                return
+                return False
             self.sleeper(1)
         raise MaintenanceError(
             "graceful container shutdown timed out; no forced kill was attempted"
@@ -1425,11 +1740,19 @@ class Controller:
     def _start_service(
         self, service: str, *, override: Path, files: Sequence[Path] | None = None
     ) -> None:
+        operation = {
+            "proxy": "compose-up-proxy",
+            "hub": "compose-up-hub",
+            "web": "compose-up-web",
+        }.get(service)
+        if operation is None:
+            raise MaintenanceError("unsupported private service startup")
         self._compose(
             "up",
             "-d",
             "--no-deps",
             service,
+            operation=operation,
             files=(*((override,) if files is None else files),),
             timeout=START_TIMEOUT,
         )
@@ -1464,9 +1787,15 @@ class Controller:
     ) -> None:
         hub = self._service_container("hub")
         proxy = self._service_container("proxy")
-        self._docker("update", "--restart=no", proxy["Id"], timeout=COMMAND_TIMEOUT)
+        self._docker(
+            "update",
+            "--restart=no",
+            proxy["Id"],
+            operation="restart-disable",
+            timeout=COMMAND_TIMEOUT,
+        )
         self._graceful_exit(hub)
-        self._docker("rm", hub["Id"])
+        self._docker("rm", hub["Id"], operation="container-remove")
         wrapper = backup / "configuration" / "jupyterhub_maintenance_config.py"
         private = self._write_private_override(
             backup,
@@ -1511,33 +1840,136 @@ class Controller:
             self.sleeper(1)
         raise MaintenanceError("private Hub readiness probe failed before deadline")
 
-    def _stop_owned_labs(self, labs: Sequence[dict[str, Any]]) -> None:
+    @staticmethod
+    def _lab_matches_record(
+        expected: dict[str, Any], actual: dict[str, Any], *, check_restart: bool
+    ) -> bool:
+        fields = (
+            "id",
+            "name",
+            "username",
+            "image_id",
+            "version",
+            "home",
+            "auto_remove",
+            "shape_sha256",
+        )
+        if any(expected.get(field) != actual.get(field) for field in fields):
+            return False
+        return not check_restart or expected.get("restart_policy") == actual.get(
+            "restart_policy"
+        )
+
+    def _stop_owned_labs(self, labs: Sequence[dict[str, Any]]) -> set[str]:
+        auto_removed: set[str] = set()
         for lab in labs:
-            item = self._inspect(lab["id"])
-            labels = self._labels(item)
-            if (
-                labels.get("finki.role") != "lab"
-                or labels.get("finki.user") != lab["username"]
-            ):
-                raise MaintenanceError("Lab ownership changed before graceful shutdown")
+            identifier = lab.get("id")
+            if not isinstance(identifier, str) or not identifier:
+                raise MaintenanceError("owned Lab container identity is unavailable")
+            if type(lab.get("auto_remove")) is not bool:
+                raise MaintenanceError("owned Lab AutoRemove setting is unavailable")
+            item = self._inspect_exact_or_missing(identifier)
+            if item is None:
+                if lab["auto_remove"] is True:
+                    auto_removed.add(identifier)
+                    continue
+                raise MaintenanceError("non-AutoRemove Lab disappeared before shutdown")
             checked = self._validate_labs(
                 [item],
                 pool=Path(self.manifest["pool"]),
                 lab_user=self.manifest["old_lab_user"],
             )
-            if len(checked) != 1 or checked[0]["home"] != lab["home"]:
+            if (
+                len(checked) != 1
+                or item.get("Id") != identifier
+                or not self._lab_matches_record(lab, checked[0], check_restart=True)
+            ):
                 raise MaintenanceError(
-                    "Lab home ownership changed before graceful shutdown"
+                    "Lab identity, image, home, or shape changed before graceful shutdown"
                 )
-            self._graceful_exit(item)
+            self._graceful_exit(item, allow_auto_remove=lab["auto_remove"] is True)
+            if lab["auto_remove"] is True:
+                deadline = self.clock() + STOP_TIMEOUT
+                while self.clock() < deadline:
+                    current = self._inspect_exact_or_missing(identifier)
+                    if current is None:
+                        auto_removed.add(identifier)
+                        break
+                    current_labs = self._validate_labs(
+                        [current],
+                        pool=Path(self.manifest["pool"]),
+                        lab_user=self.manifest["old_lab_user"],
+                    )
+                    if (
+                        len(current_labs) != 1
+                        or current.get("Id") != identifier
+                        or not self._lab_matches_record(
+                            lab, current_labs[0], check_restart=False
+                        )
+                        or bool((current.get("State") or {}).get("Running"))
+                    ):
+                        raise MaintenanceError(
+                            "AutoRemove Lab changed while awaiting exact-ID disappearance"
+                        )
+                    self.sleeper(1)
+                else:
+                    raise MaintenanceError(
+                        "verified AutoRemove Lab did not disappear after TERM"
+                    )
+            else:
+                current = self._inspect_exact_or_missing(identifier)
+                if current is None:
+                    raise MaintenanceError(
+                        "non-AutoRemove Lab disappeared during graceful shutdown"
+                    )
+                if bool((current.get("State") or {}).get("Running")):
+                    raise MaintenanceError(
+                        "non-AutoRemove Lab remained running after graceful shutdown"
+                    )
+        return auto_removed
+
+    def _reconcile_owned_labs(
+        self,
+        original: Sequence[dict[str, Any]],
+        current: Sequence[dict[str, Any]],
+        auto_removed: set[str],
+    ) -> None:
+        original_by_id = {lab.get("id"): lab for lab in original}
+        if (
+            len(original_by_id) != len(original)
+            or any(identifier not in original_by_id for identifier in auto_removed)
+            or any(
+                original_by_id[identifier].get("auto_remove") is not True
+                for identifier in auto_removed
+            )
+        ):
+            raise MaintenanceError("verified AutoRemove disposition is inconsistent")
+        expected_ids = set(original_by_id) - auto_removed
+        current_by_id = {lab.get("id"): lab for lab in current}
+        if len(current_by_id) != len(current) or set(current_by_id) != expected_ids:
+            raise MaintenanceError("owned Lab inventory changed after cold backup")
+        for identifier in expected_ids:
+            previous = original_by_id[identifier]
+            latest = current_by_id[identifier]
+            if (
+                not self._lab_matches_record(previous, latest, check_restart=False)
+                or latest.get("restart_policy") != "no"
+                or latest.get("running") is not False
+            ):
+                raise MaintenanceError(
+                    "owned Lab identity or shape changed after cold backup"
+                )
 
     def _remove_owned_labs(self, labs: Sequence[dict[str, Any]]) -> None:
         for lab in labs:
             item = self._inspect(lab["id"])
             if bool((item.get("State") or {}).get("Running")):
                 raise MaintenanceError("refusing to remove a running Lab")
+            if lab.get("auto_remove") is not False:
+                raise MaintenanceError("refusing explicit removal of an AutoRemove Lab")
             if (
-                self._labels(item).get("finki.role") != "lab"
+                item.get("Id") != lab["id"]
+                or self._labels(item).get("finki.role") != "lab"
                 or self._labels(item).get("finki.user") != lab["username"]
                 or str(item.get("Name", "")).removeprefix("/") != lab["name"]
             ):
@@ -1547,10 +1979,12 @@ class Controller:
                 pool=Path(self.manifest["pool"]),
                 lab_user=self.manifest["old_lab_user"],
             )
-            if len(checked) != 1 or checked[0]["home"] != lab["home"]:
+            if len(checked) != 1 or not self._lab_matches_record(
+                lab, checked[0], check_restart=False
+            ):
                 raise MaintenanceError("Lab home ownership changed before removal")
             # Docker rm without --force or -v: homes and volumes are not removed.
-            self._docker("rm", lab["id"])
+            self._docker("rm", lab["id"], operation="container-remove")
 
     def _write_marker(self, manifest: dict[str, Any], backup: Path) -> dict[str, Any]:
         marker = {
@@ -1586,6 +2020,7 @@ class Controller:
         self._required_acknowledgments(args)
         self._ensure_no_marker()
         self._preflight(new_backup=True)
+        self.failure_phase = "interlock"
         self.backup.mkdir(mode=0o700)
         self.backup.chmod(0o700)
         try:
@@ -1601,11 +2036,13 @@ class Controller:
             self._write_marker(self.manifest, self.backup)
             self._write_stage(self.backup, "interlock-written")
             # External routing and every updater are fenced by explicit operator acknowledgments.
+            self.failure_phase = "quiesce-services"
             for service in ("web", "proxy", "hub"):
                 live = self._inspect(self.manifest["services"][service]["container_id"])
                 self._graceful_exit(live)
                 self._write_stage(self.backup, f"{service}-stopped")
             # No Hub remains to create Labs; enumerate and verify a second time before stopping.
+            self.failure_phase = "drain-labs"
             labs = self._validate_labs(
                 self._all_containers(),
                 pool=Path(self.manifest["pool"]),
@@ -1616,20 +2053,23 @@ class Controller:
                 self._all_containers(),
                 {self.manifest["services"]["hub"]["container_id"]},
             )
-            self._stop_owned_labs(labs)
+            auto_removed = self._stop_owned_labs(labs)
             self._write_stage(
-                self.backup, "labs-gracefully-stopped", {"count": len(labs)}
+                self.backup,
+                "labs-gracefully-stopped",
+                {"count": len(labs), "verified_auto_removed": len(auto_removed)},
             )
+            self.failure_phase = "cold-backup"
             self._copy_and_verify_cold_backup(self.backup)
             # Revalidate before removal; the verified backup is already complete.
+            self.failure_phase = "reconcile-labs"
             latest = self._validate_labs(
                 self._all_containers(),
                 pool=Path(self.manifest["pool"]),
                 lab_user=self.manifest["old_lab_user"],
                 expected_version=self.manifest["old_hub_version"],
             )
-            if {lab["id"] for lab in latest} != {lab["id"] for lab in labs}:
-                raise MaintenanceError("owned Lab inventory changed after cold backup")  # ruff: ignore[TRY301]
+            self._reconcile_owned_labs(labs, latest, auto_removed)
             self._remove_owned_labs(latest)
             self._write_stage(self.backup, "owned-labs-removed", {"count": len(latest)})
             wrapper = self.backup / "configuration" / source_wrapper.name
@@ -1643,18 +2083,22 @@ class Controller:
                 proxy_image=self.manifest["services"]["proxy"]["image_id"],
                 web_image=self.manifest["services"]["web"]["image_id"],
             )
+            self.failure_phase = "start-private-proxy"
             self._start_service("proxy", override=private)
             self._write_stage(self.backup, "proxy-private")
+            self.failure_phase = "start-migration-hub"
             self._start_service("hub", override=private)
             migration_hub = self._service_container("hub")
             self._verify_hub_wrapper_mode(
                 migration_hub, upgrade_db=True, suppress_cullers=True
             )
+            self.failure_phase = "migration-readiness"
             self._wait_private_ready()
             self._write_stage(self.backup, "migration-start-ready")
             # Never let Compose implicitly stop/escalate the migration process.
+            self.failure_phase = "stop-migration-hub"
             self._graceful_exit(migration_hub)
-            self._docker("rm", migration_hub["Id"])
+            self._docker("rm", migration_hub["Id"], operation="container-remove")
             private_normal = self._write_private_override(
                 self.backup,
                 hub_image=self.manifest["candidate_hub_image_id"],
@@ -1665,11 +2109,13 @@ class Controller:
                 proxy_image=self.manifest["services"]["proxy"]["image_id"],
                 web_image=self.manifest["services"]["web"]["image_id"],
             )
+            self.failure_phase = "start-candidate-hub"
             self._start_service("hub", override=private_normal)
             candidate_hub = self._service_container("hub")
             self._verify_hub_wrapper_mode(
                 candidate_hub, upgrade_db=False, suppress_cullers=True
             )
+            self.failure_phase = "candidate-readiness"
             self._wait_private_ready()
             self._write_stage(
                 self.backup, "candidate-private", {"cullers_suppressed": True}
@@ -1875,9 +2321,9 @@ class Controller:
         restored = running_hub["Image"] == manifest["old_hub_image_id"]
         runtime = self._write_runtime_override(backup, restored=restored)
         self._graceful_exit(running_hub)
-        self._docker("rm", running_hub["Id"])
+        self._docker("rm", running_hub["Id"], operation="container-remove")
         self._graceful_exit(proxy)
-        self._docker("rm", proxy["Id"])
+        self._docker("rm", proxy["Id"], operation="container-remove")
         self._start_service("proxy", override=runtime)
         self._start_service("hub", override=runtime)
         accepted_hub = self._service_container("hub")
@@ -1956,12 +2402,14 @@ class Controller:
                 self._graceful_exit(item)
                 self._write_stage(backup, f"restore-stopped-{service}")
         labs = self._current_owned_labs(manifest)
-        self._stop_owned_labs(labs)
+        auto_removed = self._stop_owned_labs(labs)
         self._check_foreign_hub_mounts(self._all_containers(), allowed_hub_ids)
         failed = backup / f"failed-state-{uuid.uuid4().hex}"
         self._copy_and_verify_cold_backup_to(self.host_paths["/srv/hub"], failed)
         self._write_stage(backup, "failed-state-preserved", {"directory": str(failed)})
-        self._remove_owned_labs(labs)
+        current_labs = self._current_owned_labs(manifest)
+        self._reconcile_owned_labs(labs, current_labs, auto_removed)
+        self._remove_owned_labs(current_labs)
         data = self.host_paths["/srv/hub"]
         if not data.is_dir():
             raise MaintenanceError("configured Hub data destination is unavailable")
@@ -2034,11 +2482,22 @@ def _safe_failure(exc: Exception) -> str:
 
 def _failure_diagnostic(
     exc: Exception, *, operation: str, phase: str
-) -> dict[str, str]:
+) -> dict[str, Any]:
     allowed_operations = ("preflight", "migrate", "accept", "restore")
     safe_operation = operation if operation in allowed_operations else "preflight"
-    safe_phase = phase if phase in FAILURE_PHASES else "dispatch"
-    if isinstance(exc, MaintenanceError):
+    failure_phase = (
+        exc.failure_phase
+        if isinstance(exc, ExternalCommandFailure)
+        and exc.failure_phase in FAILURE_PHASES
+        else phase
+    )
+    safe_phase = failure_phase if failure_phase in FAILURE_PHASES else "dispatch"
+    if isinstance(exc, ExternalCommandFailure):
+        classification, error = (
+            "external-command-failed",
+            "bounded external command failed",
+        )
+    elif isinstance(exc, MaintenanceError):
         classification, error = SAFE_FAILURES.get(
             str(exc), ("maintenance-error", "maintenance operation failed")
         )
@@ -2049,13 +2508,22 @@ def _failure_diagnostic(
         )
     if classification not in FAILURE_CLASSIFICATIONS:
         classification, error = "unexpected-error", "unexpected maintenance failure"
-    return {
+    diagnostic: dict[str, Any] = {
         "status": "failed",
         "operation": safe_operation,
         "phase": safe_phase,
         "classification": classification,
         "error": error,
     }
+    if isinstance(exc, ExternalCommandFailure):
+        diagnostic.update(
+            {
+                "command_operation": exc.command_operation,
+                "command_status": exc.command_status,
+                "external_returncode": exc.external_returncode,
+            }
+        )
+    return diagnostic
 
 
 def _parser() -> argparse.ArgumentParser:

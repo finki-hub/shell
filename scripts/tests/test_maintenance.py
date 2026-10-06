@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 from scripts import jupyterhub_maintenance as maintenance
 
+OWNED_LAB_ID = "a" * 64
+
 
 def make_database(directory: Path, value: str = "seed") -> None:
     directory.mkdir(parents=True, exist_ok=True)
@@ -69,8 +71,24 @@ class MigrationHarness(maintenance.Controller):
     def __init__(self, root: Path, *, bad_database: bool = False) -> None:
         self.events: list[tuple[Any, ...]] = []
         self.bad_database = bad_database
+        self.clock_value = 0.0
+        self.probe_count = 0
+        self.all_container_scans = 0
+        self.inspect_fault: str | None = None
+        self.auto_remove_delay_inspects = 0
+        self.pending_auto_remove: dict[str, int] = {}
+        self.keep_auto_remove_container = False
+        self.remove_non_auto_on_term = False
+        self.inventory_mutation: str | None = None
+        self.lab_inspect_count = 0
+        self.inspect_fault_at = 1
+        self.fail_command_phase: str | None = None
+        self.fail_command_operation: str | None = None
+        self.fail_command_occurrence = 1
+        self.command_operation_counts: dict[str, int] = {}
+        self.phase_events: list[tuple[Any, ...]] = []
         self.lab = {
-            "id": "owned-lab-id",
+            "id": OWNED_LAB_ID,
             "name": "lab-alice",
             "username": "alice",
             "image_id": "sha256:old-lab",
@@ -78,19 +96,31 @@ class MigrationHarness(maintenance.Controller):
             "home": str(root / "pool" / "users" / "alice"),
             "running": True,
             "restart_policy": "unless-stopped",
+            "auto_remove": False,
         }
+        pool = root / "pool"
         self.containers = {
             "web-container": service_container("web", "sha256:web"),
             "proxy-container": service_container("proxy", "sha256:proxy"),
             "hub-container": service_container("hub", "sha256:old-hub"),
-            "owned-lab-id": {
-                "Id": "owned-lab-id",
+            OWNED_LAB_ID: {
+                "Id": OWNED_LAB_ID,
                 "Name": "/lab-alice",
                 "Image": "sha256:old-lab",
                 "State": {"Running": True},
                 "Config": {"Labels": {"finki.role": "lab", "finki.user": "alice"}},
-                "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}},
-                "Mounts": [],
+                "HostConfig": {
+                    "RestartPolicy": {"Name": "unless-stopped"},
+                    "AutoRemove": False,
+                },
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(pool / "users" / "alice"),
+                        "Destination": "/home/ubuntu",
+                        "RW": True,
+                    }
+                ],
             },
         }
         self.new_hub: dict[str, Any] | None = None
@@ -103,7 +133,6 @@ class MigrationHarness(maintenance.Controller):
         else:
             make_database(self.data)
         (self.data / "jupyterhub_cookie_secret").write_text("private", encoding="utf-8")
-        pool = root / "pool"
         (pool / "users" / "alice").mkdir(parents=True)
         (pool / ".pool-id").write_text("pool-fixture", encoding="utf-8")
         config_file = root / "compose.yaml"
@@ -123,7 +152,11 @@ class MigrationHarness(maintenance.Controller):
             command=self.fake_command,
             clock=self.clock,
         )
+        self.sleeper = self._advance_time
         self.host_paths = {"/srv/hub": self.data, "/srv/pool": pool}
+        self.lab["shape_sha256"] = self._lab_shape_sha256(
+            self.containers[OWNED_LAB_ID], "alice"
+        )
         self.manifest = {
             "daemon_id": "fixture-daemon-id",
             "project_name": "test-project",
@@ -163,16 +196,203 @@ class MigrationHarness(maintenance.Controller):
             "candidate_lab_version": "6.0.1",
             "labs": [self.lab],
         }
-        self.clock_value = 0.0
         self.readiness_calls = 0
         self.fail_readiness_at: int | None = None
 
-    def fake_command(self, args: Any, timeout: float, check: bool = True) -> str:
+    def fake_command(self, args: Any, timeout: float, check: bool = True) -> Any:
         self.events.append(("command", tuple(args), timeout))
+        operation = self._command_operation(args)
+        self.phase_events.append(("command", self.failure_phase, operation))
+        count_operation = operation is not None and not (
+            operation == "container-list" and "--filter" in args
+        )
+        if operation is not None and count_operation:
+            self.command_operation_counts[operation] = (
+                self.command_operation_counts.get(operation, 0) + 1
+            )
+            if (
+                operation == self.fail_command_operation
+                and self.failure_phase == self.fail_command_phase
+                and count_operation
+                and self.command_operation_counts[operation]
+                == self.fail_command_occurrence
+            ):
+                failure = maintenance.ExternalCommandFailure(operation, "nonzero", 27)
+                failure.failure_phase = self.failure_phase
+                raise failure
+        if args[:2] == ["docker", "inspect"] and len(args) == 3:
+            item = self._fake_container(args[2])
+            if item is None:
+                return maintenance._CONTAINER_ABSENT
+            if args[2] == OWNED_LAB_ID:
+                self.lab_inspect_count += 1
+                if (
+                    self.inspect_fault
+                    and self.lab_inspect_count >= self.inspect_fault_at
+                    and self.inspect_fault == "transport"
+                ):
+                    raise maintenance.ExternalCommandFailure(
+                        "container-inspect", "nonzero", 23
+                    )
+                if (
+                    self.lab_inspect_count >= self.inspect_fault_at
+                    and self.inspect_fault == "malformed"
+                ):
+                    return "not-json"
+                if (
+                    self.lab_inspect_count >= self.inspect_fault_at
+                    and self.inspect_fault == "wrong-id"
+                ):
+                    item = json.loads(json.dumps(item))
+                    item["Id"] = "different-full-id"
+            if args[2] == OWNED_LAB_ID and args[2] in self.pending_auto_remove:
+                remaining = self.pending_auto_remove[args[2]]
+                if remaining <= 0:
+                    self.pending_auto_remove.pop(args[2], None)
+                    self.containers.pop(args[2], None)
+                    return maintenance._CONTAINER_ABSENT
+                self.pending_auto_remove[args[2]] = remaining - 1
+            return json.dumps([item])
+        if args[:2] == ["docker", "create"]:
+            self.probe_count += 1
+            return f"probe-container-{self.probe_count}"
+        if args[:3] == ["docker", "start", "-a"]:
+            return "5.5.1"
+        if args[:2] == ["docker", "ps"]:
+            if "--filter" in args:
+                return ""
+            self.all_container_scans += 1
+            if self.all_container_scans == 3 and self.inventory_mutation:
+                self._mutate_inventory(self.inventory_mutation)
+            identifiers = list(self.containers)
+            if self.new_hub is not None:
+                identifiers.append(self.new_hub["Id"])
+            return "\n".join(identifiers)
+        if args[:2] == ["docker", "update"]:
+            item = self._fake_container(args[-1])
+            if item is not None:
+                item.setdefault("HostConfig", {}).setdefault("RestartPolicy", {})[
+                    "Name"
+                ] = "no"
+            return ""
+        if args[:2] == ["docker", "kill"]:
+            identifier = args[-1]
+            item = self._fake_container(identifier)
+            if item is not None:
+                item.setdefault("State", {})["Running"] = False
+                labels = maintenance.Controller._labels(item)
+                name = labels.get("com.docker.compose.service") or item.get(
+                    "Name", "lab"
+                )
+                self.events.append(("graceful-exit", name))
+                if item.get("HostConfig", {}).get("AutoRemove") is True:
+                    if not self.keep_auto_remove_container:
+                        if self.auto_remove_delay_inspects:
+                            self.pending_auto_remove[item["Id"]] = (
+                                self.auto_remove_delay_inspects
+                            )
+                        else:
+                            self.containers.pop(item["Id"], None)
+                elif self.remove_non_auto_on_term:
+                    self.containers.pop(item["Id"], None)
+            return ""
+        if args[:2] == ["docker", "rm"]:
+            item = self._fake_container(args[-1])
+            if item is not None:
+                if maintenance.Controller._labels(item).get("finki.role") == "lab":
+                    self.events.append(("remove-labs", (item["Id"],)))
+                self.containers.pop(item["Id"], None)
         return ""
+
+    @staticmethod
+    def _command_operation(args: Any) -> str | None:
+        if args[:2] != ["docker", "compose"]:
+            if args[:2] == ["docker", "inspect"]:
+                return "container-inspect"
+            if args[:2] == ["docker", "image"]:
+                return "image-inspect"
+            if args[:2] == ["docker", "info"]:
+                return "daemon-info"
+            if args[:2] == ["docker", "ps"]:
+                return "container-list"
+            if args[:2] == ["docker", "update"]:
+                return "restart-disable"
+            if args[:2] == ["docker", "kill"]:
+                return "send-term"
+            if args[:2] == ["docker", "rm"]:
+                return "container-remove"
+            if args[:2] == ["docker", "create"]:
+                return "lab-version-create"
+            if args[:2] == ["docker", "start"]:
+                return "lab-version-start"
+            if args[:2] == ["docker", "exec"]:
+                return "hub-version-exec"
+            return None
+        if "config" in args:
+            return "compose-config"
+        if "ps" in args:
+            return "compose-ps"
+        if "up" in args and args[-1:] == ["proxy"]:
+            return "compose-up-proxy"
+        if "up" in args and args[-1:] == ["hub"]:
+            return "compose-up-hub"
+        if "up" in args and args[-1:] == ["web"]:
+            return "compose-up-web"
+        return None
+
+    def _mutate_inventory(self, mutation: str) -> None:
+        if mutation == "new-lab":
+            home = self.host_paths["/srv/pool"] / "users" / "bob"
+            home.mkdir(parents=True, exist_ok=True)
+            self.containers["unrelated-lab-id"] = {
+                "Id": "unrelated-lab-id",
+                "Name": "/lab-bob",
+                "Image": "sha256:old-lab",
+                "State": {"Running": False},
+                "Config": {"Labels": {"finki.role": "lab", "finki.user": "bob"}},
+                "HostConfig": {
+                    "RestartPolicy": {"Name": "no"},
+                    "AutoRemove": False,
+                },
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(home),
+                        "Destination": "/home/ubuntu",
+                        "RW": True,
+                    }
+                ],
+            }
+        elif mutation == "mount":
+            self.containers[OWNED_LAB_ID]["Mounts"][0]["Source"] = str(
+                self.host_paths["/srv/pool"] / "users" / "changed"
+            )
+        elif mutation == "home":
+            changed_home = self.host_paths["/srv/pool"] / "users" / "changed"
+            changed_home.mkdir(parents=True, exist_ok=True)
+            self.containers[OWNED_LAB_ID]["Mounts"][0]["Source"] = str(changed_home)
+        elif mutation == "image":
+            self.containers[OWNED_LAB_ID]["Image"] = "sha256:changed-image"
+
+    def _fake_container(self, identifier: str) -> dict[str, Any] | None:
+        if identifier in self.containers:
+            return self.containers[identifier]
+        if self.new_hub and identifier == self.new_hub.get("Id"):
+            return self.new_hub
+        return next(
+            (
+                item
+                for item in self.containers.values()
+                if str(item.get("Id", "")).startswith(identifier)
+            ),
+            None,
+        )
 
     def clock(self) -> float:
         return self.clock_value
+
+    def _advance_time(self, seconds: float) -> None:
+        self.clock_value += seconds
 
     def _preflight(self, *, new_backup: bool) -> dict[str, Any]:
         self.events.append(("preflight", new_backup))
@@ -181,38 +401,28 @@ class MigrationHarness(maintenance.Controller):
     def _write_stage(self, backup: Path, stage: str, facts: Any = None) -> None:
         super()._write_stage(backup, stage, facts)
         self.events.append((stage,))
-
-    def _inspect(self, container_id: str) -> dict[str, Any]:
-        if container_id in self.containers:
-            return self.containers[container_id]
-        if self.new_hub and container_id == self.new_hub["Id"]:
-            return self.new_hub
-        raise maintenance.MaintenanceError("fake container missing")
-
-    def _all_containers(self) -> list[dict[str, Any]]:
-        return [self.containers["owned-lab-id"]]
-
-    def _validate_labs(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
-        self.events.append(("validate-labs", kwargs.get("expected_version")))
-        return [self.lab.copy()]
-
-    def _graceful_exit(self, container: dict[str, Any], timeout: float = 60) -> None:
-        service = maintenance.Controller._labels(container).get(
-            "com.docker.compose.service"
-        )
-        name = service or container.get("Name", "lab")
-        self.events.append(("graceful-exit", name))
-        container.setdefault("State", {})["Running"] = False
-
-    def _stop_owned_labs(self, labs: Any) -> None:
-        self.events.append(("stop-labs", tuple(lab["id"] for lab in labs)))
-
-    def _remove_owned_labs(self, labs: Any) -> None:
-        self.events.append(("remove-labs", tuple(lab["id"] for lab in labs)))
+        self.phase_events.append(("stage", stage, self.failure_phase))
 
     def _start_service(
         self, service: str, *, override: Path, files: Any = None
     ) -> None:
+        operation = {
+            "proxy": "compose-up-proxy",
+            "hub": "compose-up-hub",
+            "web": "compose-up-web",
+        }[service]
+        self.phase_events.append(("start", service, self.failure_phase))
+        self.command_operation_counts[operation] = (
+            self.command_operation_counts.get(operation, 0) + 1
+        )
+        if (
+            self.fail_command_operation == operation
+            and self.failure_phase == self.fail_command_phase
+            and self.command_operation_counts[operation] == self.fail_command_occurrence
+        ):
+            failure = maintenance.ExternalCommandFailure(operation, "nonzero", 27)
+            failure.failure_phase = self.failure_phase
+            raise failure
         override_content = json.loads(override.read_text(encoding="utf-8"))
         self.events.append(("start", service, override_content["services"]))
         if service == "hub":
@@ -237,13 +447,10 @@ class MigrationHarness(maintenance.Controller):
             return self.new_hub
         return self.containers[f"{service}-container"]
 
-    def _docker(self, *args: str, timeout: float = 30) -> str:
-        self.events.append(("docker", *args))
-        return ""
-
     def _wait_private_ready(self, timeout: float = 180) -> None:
         self.readiness_calls += 1
         self.events.append(("private-ready", self.readiness_calls))
+        self.phase_events.append(("ready", self.readiness_calls, self.failure_phase))
         if self.fail_readiness_at == self.readiness_calls:
             raise maintenance.MaintenanceError(
                 "private Hub readiness probe failed before deadline"
@@ -491,6 +698,166 @@ class MaintenanceControllerTests(unittest.TestCase):
             len(json.dumps(invalid_context).encode("utf-8")), 64 * 1024
         )
 
+    def _system_command_controller(self) -> maintenance.Controller:
+        root = self.root / "system-command"
+        args = self._main_arguments("preflight", root)
+        return maintenance.Controller(
+            project_directory=Path(args[args.index("--project-directory") + 1]),
+            project_name="test-project",
+            env_file=Path(args[args.index("--env-file") + 1]),
+            compose_files=[Path(args[args.index("--compose-file") + 1])],
+            backup_dir=Path(args[args.index("--backup-dir") + 1]),
+        )
+
+    def test_external_command_failures_keep_only_closed_fields_and_primary_phase(
+        self,
+    ) -> None:
+        controller = self._system_command_controller()
+        controller.failure_phase = "reconcile-labs"
+        secret = "SYNTHETIC_COMMAND_OUTPUT_SECRET"
+        scenarios = (
+            (
+                "nonzero",
+                patch(
+                    "scripts.jupyterhub_maintenance.subprocess.run",
+                    return_value=maintenance.subprocess.CompletedProcess(
+                        ["private-argv"], 23, f"{secret}-stdout", f"{secret}-stderr"
+                    ),
+                ),
+                23,
+            ),
+            (
+                "timeout",
+                patch(
+                    "scripts.jupyterhub_maintenance.subprocess.run",
+                    side_effect=maintenance.subprocess.TimeoutExpired(
+                        ["private-argv"], 30, output=secret, stderr=secret
+                    ),
+                ),
+                None,
+            ),
+            (
+                "exec-failed",
+                patch(
+                    "scripts.jupyterhub_maintenance.subprocess.run",
+                    side_effect=OSError(secret),
+                ),
+                None,
+            ),
+        )
+        for status, subprocess_mock, returncode in scenarios:
+            with self.subTest(command_status=status), subprocess_mock:
+                with self.assertRaises(maintenance.ExternalCommandFailure) as raised:
+                    controller._docker("ps", "-aq", operation="container-list")
+                failure = raised.exception
+                self.assertEqual(
+                    vars(failure),
+                    {
+                        "command_operation": "container-list",
+                        "command_status": status,
+                        "external_returncode": returncode,
+                        "failure_phase": "reconcile-labs",
+                    },
+                )
+                diagnostic = maintenance._failure_diagnostic(
+                    failure, operation="migrate", phase="dispatch"
+                )
+                self.assertEqual(
+                    set(diagnostic),
+                    {
+                        "status",
+                        "operation",
+                        "phase",
+                        "classification",
+                        "error",
+                        "command_operation",
+                        "command_status",
+                        "external_returncode",
+                    },
+                )
+                self.assertEqual(diagnostic["phase"], "reconcile-labs")
+                self.assertEqual(
+                    diagnostic["classification"], "external-command-failed"
+                )
+                self.assertEqual(diagnostic["error"], "bounded external command failed")
+                self.assertEqual(diagnostic["command_operation"], "container-list")
+                self.assertEqual(diagnostic["command_status"], status)
+                self.assertEqual(diagnostic["external_returncode"], returncode)
+                self.assertNotIn(secret, json.dumps(diagnostic))
+                self.assertEqual(str(failure), "bounded external command failed")
+
+    def test_cli_emits_typed_command_envelope_without_private_operands(self) -> None:
+        secret = "SYNTHETIC_COMMAND_FAILURE_SECRET"
+        with patch.object(
+            maintenance.subprocess,
+            "run",
+            return_value=maintenance.subprocess.CompletedProcess(
+                ["private-command", secret], 19, secret, secret
+            ),
+        ):
+            status, stdout, stderr = self._invoke_main("preflight")
+        diagnostic = json.loads(stderr)
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            diagnostic,
+            {
+                "status": "failed",
+                "operation": "preflight",
+                "phase": "configuration",
+                "classification": "external-command-failed",
+                "error": "bounded external command failed",
+                "command_operation": "compose-config",
+                "command_status": "nonzero",
+                "external_returncode": 19,
+            },
+        )
+        self.assertNotIn(secret, stderr)
+        self.assertNotIn(str(self.root / "preflight"), stderr)
+
+    def test_exact_container_absence_requires_bound_cli_not_found_evidence(
+        self,
+    ) -> None:
+        controller = self._system_command_controller()
+        identifier = "f" * 64
+        allowed = (
+            ("", f"Error: No such object: {identifier}"),
+            ("[]\n", f"Error: No such container: {identifier}"),
+            (
+                "[]",
+                f"Error response from daemon: No such container: {identifier}",
+            ),
+        )
+        for stdout, stderr in allowed:
+            with (
+                self.subTest(allowed_stdout=bool(stdout)),
+                patch(
+                    "scripts.jupyterhub_maintenance.subprocess.run",
+                    return_value=maintenance.subprocess.CompletedProcess(
+                        ["docker", "inspect", identifier], 1, stdout, stderr
+                    ),
+                ),
+            ):
+                self.assertIsNone(controller._inspect_exact_or_missing(identifier))
+
+        rejected = (
+            ("[]", f"Error: No such object: {'e' * 64}"),
+            ('[{"Id":"' + identifier + '"}]', f"Error: No such object: {identifier}"),
+            ("not-json", f"Error: No such object: {identifier}"),
+        )
+        for stdout, stderr in rejected:
+            with (
+                self.subTest(rejected_stdout=stdout[:2]),
+                patch(
+                    "scripts.jupyterhub_maintenance.subprocess.run",
+                    return_value=maintenance.subprocess.CompletedProcess(
+                        ["docker", "inspect", identifier], 1, stdout, stderr
+                    ),
+                ),
+            ):
+                with self.assertRaises(maintenance.ExternalCommandFailure):
+                    controller._inspect_exact_or_missing(identifier)
+
     def test_unknown_failure_text_is_never_emitted(self) -> None:
         secret = "CONFIGPROXY_AUTH_TOKEN=synthetic-diagnostic-test-secret"
 
@@ -599,7 +966,7 @@ class MaintenanceControllerTests(unittest.TestCase):
         def command(args: Any, timeout: float, check: bool = True) -> str:
             calls.append(tuple(args))
             if args[1:3] == ["inspect", "container-id"]:
-                return json.dumps([alive])
+                return json.dumps([{**alive, "Id": "container-id"}])
             return ""
 
         (self.root / "env").write_text("x=1", encoding="utf-8")
@@ -782,6 +1149,255 @@ class MaintenanceControllerTests(unittest.TestCase):
             self.assertNotIn("-v", call)
             self.assertNotIn("--force", call)
             self.assertNotIn("--signal=KILL", call)
+
+    def test_autoremove_lab_shutdown_reconciles_after_cold_backup(self) -> None:
+        controller = MigrationHarness(self.root)
+        lab = controller.containers[OWNED_LAB_ID]
+        lab["HostConfig"]["AutoRemove"] = True
+        controller.lab["auto_remove"] = True
+        controller.lab["shape_sha256"] = controller._lab_shape_sha256(lab, "alice")
+        home_marker = Path(str(controller.lab["home"])) / "keep.txt"
+        home_marker.write_text("persistent home", encoding="utf-8")
+
+        result = controller.migrate(self.acknowledgments())
+
+        self.assertEqual(result["stage"], "candidate-private")
+        self.assertNotIn(OWNED_LAB_ID, controller.containers)
+        self.assertTrue(home_marker.is_file())
+        self.assertTrue(
+            (controller.backup / "snapshot" / "jupyterhub.sqlite").is_file()
+        )
+        stages = maintenance._read_json(controller.backup / "state.json")["stages"]
+        stopped = next(
+            item for item in stages if item["stage"] == "labs-gracefully-stopped"
+        )
+        self.assertEqual(stopped["verified_auto_removed"], 1)
+        self.assertTrue(
+            next(
+                i
+                for i, event in enumerate(controller.events)
+                if event[0] == "graceful-exit" and event[1] == "/lab-alice"
+            )
+            < next(
+                i
+                for i, event in enumerate(controller.events)
+                if event[0] == "backup-complete"
+            )
+        )
+        self.assertFalse(any(event[0] == "remove-labs" for event in controller.events))
+
+    def test_autoremove_stopped_then_removed_race_is_verified_by_full_id(self) -> None:
+        controller = MigrationHarness(self.root)
+        lab = controller.containers[OWNED_LAB_ID]
+        lab["HostConfig"]["AutoRemove"] = True
+        controller.lab["auto_remove"] = True
+        controller.lab["shape_sha256"] = controller._lab_shape_sha256(lab, "alice")
+        controller.auto_remove_delay_inspects = 1
+
+        controller.migrate(self.acknowledgments())
+
+        self.assertNotIn(OWNED_LAB_ID, controller.containers)
+        self.assertTrue(
+            any(
+                event[0] == "command"
+                and event[1][:2] == ("docker", "inspect")
+                and event[1][-1] == OWNED_LAB_ID
+                for event in controller.events
+            )
+        )
+        self.assertFalse(any(event[0] == "remove-labs" for event in controller.events))
+
+    def test_persistent_autoremove_container_times_out_with_interlock_retained(
+        self,
+    ) -> None:
+        controller = MigrationHarness(self.root)
+        lab = controller.containers[OWNED_LAB_ID]
+        lab["HostConfig"]["AutoRemove"] = True
+        controller.lab["auto_remove"] = True
+        controller.lab["shape_sha256"] = controller._lab_shape_sha256(lab, "alice")
+        controller.keep_auto_remove_container = True
+
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "did not disappear after TERM"
+        ):
+            controller.migrate(self.acknowledgments())
+
+        self.assertTrue(controller.marker.is_file())
+        self.assertIn(OWNED_LAB_ID, controller.containers)
+        stages = maintenance._read_json(controller.backup / "state.json")["stages"]
+        self.assertFalse(any(item["stage"] == "backup-complete" for item in stages))
+        self.assertFalse(any(event[0] == "start" for event in controller.events))
+
+    def test_lab_identity_inspection_failures_retain_interlock_before_term(
+        self,
+    ) -> None:
+        for fault, expected in (
+            ("wrong-id", "different container identity"),
+            ("malformed", "invalid container inspection"),
+            ("transport", "bounded external command failed"),
+        ):
+            with self.subTest(fault=fault):
+                root = self.root / fault
+                controller = MigrationHarness(root)
+                controller.inspect_fault = fault
+                controller.inspect_fault_at = 3
+                with self.assertRaisesRegex(maintenance.MaintenanceError, expected):
+                    controller.migrate(self.acknowledgments())
+                self.assertTrue(controller.marker.is_file())
+                self.assertTrue(controller.containers[OWNED_LAB_ID]["State"]["Running"])
+                self.assertFalse(
+                    any(
+                        event[0] == "command"
+                        and event[1][:2] == ("docker", "kill")
+                        and event[1][-1] == OWNED_LAB_ID
+                        for event in controller.events
+                    )
+                )
+                stages = maintenance._read_json(controller.backup / "state.json")[
+                    "stages"
+                ]
+                self.assertFalse(
+                    any(item["stage"] == "backup-complete" for item in stages)
+                )
+
+    def test_unexpected_non_autoremove_disappearance_is_not_accepted(self) -> None:
+        controller = MigrationHarness(self.root)
+        controller.remove_non_auto_on_term = True
+
+        with self.assertRaises(maintenance.MaintenanceError):
+            controller.migrate(self.acknowledgments())
+
+        self.assertTrue(controller.marker.is_file())
+        stages = maintenance._read_json(controller.backup / "state.json")["stages"]
+        self.assertFalse(any(item["stage"] == "backup-complete" for item in stages))
+        self.assertFalse(any(event[0] == "start" for event in controller.events))
+
+    def test_unrelated_or_changed_lab_inventory_fails_post_backup_reconciliation(
+        self,
+    ) -> None:
+        for mutation in ("new-lab", "mount", "home", "image"):
+            with self.subTest(mutation=mutation):
+                controller = MigrationHarness(self.root / mutation)
+                lab = controller.containers[OWNED_LAB_ID]
+                lab["HostConfig"]["AutoRemove"] = True
+                controller.lab["auto_remove"] = True
+                controller.lab["shape_sha256"] = controller._lab_shape_sha256(
+                    lab, "alice"
+                )
+                controller.inventory_mutation = mutation
+                with self.assertRaises(maintenance.MaintenanceError):
+                    controller.migrate(self.acknowledgments())
+                self.assertTrue(controller.marker.is_file())
+                stages = maintenance._read_json(controller.backup / "state.json")[
+                    "stages"
+                ]
+                self.assertTrue(
+                    any(item["stage"] == "backup-complete" for item in stages)
+                )
+                self.assertFalse(
+                    any(event[0] == "start" for event in controller.events)
+                )
+
+    def test_migration_failure_phases_are_set_at_each_boundary(self) -> None:
+        controller = MigrationHarness(self.root)
+        controller.migrate(self.acknowledgments())
+        stages = {
+            stage: phase
+            for kind, stage, phase in controller.phase_events
+            if kind == "stage"
+        }
+        self.assertEqual(stages["interlock-written"], "interlock")
+        self.assertEqual(stages["web-stopped"], "quiesce-services")
+        self.assertEqual(stages["labs-gracefully-stopped"], "drain-labs")
+        self.assertEqual(stages["backup-complete"], "cold-backup")
+        self.assertEqual(stages["owned-labs-removed"], "reconcile-labs")
+        self.assertEqual(stages["proxy-private"], "start-private-proxy")
+        self.assertEqual(stages["migration-start-ready"], "migration-readiness")
+        self.assertEqual(stages["candidate-private"], "candidate-readiness")
+        starts = [event for event in controller.phase_events if event[0] == "start"]
+        self.assertEqual(
+            [(event[1], event[2]) for event in starts],
+            [
+                ("proxy", "start-private-proxy"),
+                ("hub", "start-migration-hub"),
+                ("hub", "start-candidate-hub"),
+            ],
+        )
+        self.assertTrue(
+            any(
+                kind == "command"
+                and phase == "stop-migration-hub"
+                and operation == "restart-disable"
+                for kind, phase, operation in controller.phase_events
+            )
+        )
+        self.assertTrue(
+            any(
+                kind == "command"
+                and phase == "reconcile-labs"
+                and operation == "container-list"
+                for kind, phase, operation in controller.phase_events
+            )
+        )
+
+    def test_typed_external_failures_capture_the_active_migration_phase(self) -> None:
+        cases = (
+            ("quiesce-services", "container-inspect", 1),
+            ("drain-labs", "container-list", 1),
+            ("reconcile-labs", "container-list", 3),
+            ("start-private-proxy", "compose-up-proxy", 1),
+            ("start-migration-hub", "compose-up-hub", 1),
+            ("stop-migration-hub", "restart-disable", 5),
+            ("start-candidate-hub", "compose-up-hub", 2),
+        )
+        for phase, operation, occurrence in cases:
+            with self.subTest(phase=phase):
+                controller = MigrationHarness(self.root / phase)
+                controller.fail_command_phase = phase
+                controller.fail_command_operation = operation
+                controller.fail_command_occurrence = occurrence
+                with self.assertRaises(maintenance.ExternalCommandFailure) as raised:
+                    controller.migrate(self.acknowledgments())
+                self.assertEqual(raised.exception.failure_phase, phase)
+                self.assertTrue(controller.marker.is_file())
+                self.assertEqual(controller.failure_phase, phase)
+
+    def test_interlock_backup_and_readiness_failures_keep_primary_phase(self) -> None:
+        interlock = MigrationHarness(self.root / "interlock")
+        write_stage = interlock._write_stage
+
+        def fail_after_interlock(
+            backup_path: Path, stage: str, facts: Any = None
+        ) -> None:
+            write_stage(backup_path, stage, facts)
+            if stage == "interlock-written":
+                raise maintenance.MaintenanceError("fixed fixture failure")
+
+        with patch.object(interlock, "_write_stage", side_effect=fail_after_interlock):
+            with self.assertRaises(maintenance.MaintenanceError):
+                interlock.migrate(self.acknowledgments())
+        self.assertEqual(interlock.failure_phase, "interlock")
+        self.assertTrue(interlock.marker.is_file())
+
+        backup = MigrationHarness(self.root / "cold-backup", bad_database=True)
+        with self.assertRaisesRegex(maintenance.MaintenanceError, "integrity"):
+            backup.migrate(self.acknowledgments())
+        self.assertEqual(backup.failure_phase, "cold-backup")
+        self.assertTrue(backup.marker.is_file())
+
+        for readiness_call, phase in (
+            (1, "migration-readiness"),
+            (2, "candidate-readiness"),
+        ):
+            with self.subTest(readiness_phase=phase):
+                controller = MigrationHarness(self.root / phase)
+                controller.fail_readiness_at = readiness_call
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "private Hub readiness"
+                ):
+                    controller.migrate(self.acknowledgments())
+                self.assertEqual(controller.failure_phase, phase)
+                self.assertTrue(controller.marker.is_file())
 
     def test_backup_integrity_failure_prevents_lab_removal_and_candidate_start(
         self,

@@ -2164,7 +2164,9 @@ class SuiteContractTests(unittest.TestCase):
             updater_result = subprocess.CompletedProcess(
                 [],
                 1,
-                b"Hub version change 5.5.1 -> 6.0.1 " + token.encode(),
+                run_suite.EXPECTED_UPDATER_MAJOR_REFUSAL.encode()
+                + b"\n"
+                + token.encode(),
                 b"",
             )
 
@@ -2186,6 +2188,7 @@ class SuiteContractTests(unittest.TestCase):
                     return_value={"web": "w", "proxy": "p", "hub": "h"},
                 ),
                 patch.object(suite, "wait_ready"),
+                patch.object(suite, "run_probe"),
             ):
                 suite.run_updater_refusal()
             verify_runtime_env(updater_calls[0])
@@ -2267,6 +2270,112 @@ class SuiteContractTests(unittest.TestCase):
                 },
             )
 
+    def test_typed_external_helper_failures_are_validated_without_raw_details(
+        self,
+    ) -> None:
+        base = {
+            "status": "failed",
+            "operation": "preflight",
+            "phase": "migration-readiness",
+            "classification": "external-command-failed",
+            "error": "bounded external command failed",
+            "command_operation": "compose-up-hub",
+        }
+        valid_payloads = (
+            {**base, "command_status": "nonzero", "external_returncode": 17},
+            {**base, "command_status": "timeout", "external_returncode": None},
+            {**base, "command_status": "exec-failed", "external_returncode": None},
+        )
+        malformed_payloads = (
+            {**base, "command_status": "nonzero"},
+            {**base, "command_status": [], "external_returncode": None},
+            {**base, "command_status": "nonzero", "external_returncode": 0},
+            {**base, "command_status": "nonzero", "external_returncode": True},
+            {**base, "command_status": "nonzero", "external_returncode": 256},
+            {**base, "command_status": "timeout", "external_returncode": 9},
+            {**base, "command_status": "other", "external_returncode": None},
+            {
+                **base,
+                "command_status": "nonzero",
+                "external_returncode": 17,
+                "secret": "not-output",
+            },
+            {
+                **base,
+                "command_operation": "container-inspect-secret",
+                "command_status": "nonzero",
+                "external_returncode": 17,
+            },
+            {
+                **base,
+                "command_status": "nonzero",
+                "external_returncode": 17,
+                "error": "private command detail",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="fixture-proxy-token",
+            ):
+                suite.write_compose_fixture()
+            assert suite.run_root
+            backup = suite.run_root / "backup"
+
+            for payload in valid_payloads:
+                child = subprocess.CompletedProcess(
+                    ["fixture-helper"],
+                    2,
+                    b"untrusted stdout",
+                    json.dumps(payload).encode(),
+                )
+                with patch.object(run_suite, "safe_call", return_value=child):
+                    with self.assertRaisesRegex(
+                        run_suite.HarnessFailure,
+                        "shipping maintenance helper preflight failed",
+                    ):
+                        suite.run_helper("preflight", backup, preflight=True)
+                self.assertEqual(
+                    suite.failure_context,
+                    {
+                        "operation": "maintenance-preflight",
+                        "helper_operation": "preflight",
+                        "phase": "migration-readiness",
+                        "classification": "external-command-failed",
+                        "command_operation": "compose-up-hub",
+                        "command_status": payload["command_status"],
+                        "external_returncode": payload["external_returncode"],
+                        "returncode": 2,
+                    },
+                )
+                self.assertNotIn("untrusted stdout", json.dumps(suite.failure_context))
+
+            for payload in malformed_payloads:
+                raw = json.dumps(payload).encode()
+                child = subprocess.CompletedProcess(
+                    ["fixture-helper"], 2, b"untrusted stdout", raw
+                )
+                with patch.object(run_suite, "safe_call", return_value=child):
+                    with self.assertRaisesRegex(
+                        run_suite.HarnessFailure,
+                        "shipping maintenance helper preflight failed",
+                    ):
+                        suite.run_helper("preflight", backup, preflight=True)
+                self.assertEqual(
+                    suite.failure_context,
+                    {
+                        "operation": "maintenance-preflight",
+                        "classification": "helper-result-invalid",
+                        "returncode": 2,
+                    },
+                )
+                self.assertNotIn(
+                    "private command detail", json.dumps(suite.failure_context)
+                )
+                self.assertNotIn("not-output", json.dumps(suite.failure_context))
+
             success_payload = {"status": "completed", "fixture": "unchanged"}
             child = subprocess.CompletedProcess(
                 ["fixture-helper"], 0, json.dumps(success_payload).encode(), b""
@@ -2283,6 +2392,9 @@ class SuiteContractTests(unittest.TestCase):
                 "phase": "dispatch",
                 "classification": "external-command-failed",
                 "error": "bounded external command failed",
+                "command_operation": "compose-config",
+                "command_status": "nonzero",
+                "external_returncode": 17,
             }
             child = subprocess.CompletedProcess(
                 ["fixture-helper"], 2, b"", json.dumps(wrong_refusal).encode()
@@ -2300,6 +2412,9 @@ class SuiteContractTests(unittest.TestCase):
                     "helper_operation": "accept",
                     "phase": "dispatch",
                     "classification": "external-command-failed",
+                    "command_operation": "compose-config",
+                    "command_status": "nonzero",
+                    "external_returncode": 17,
                     "returncode": 2,
                 },
             )
@@ -2521,6 +2636,99 @@ class SuiteContractTests(unittest.TestCase):
                     self.assertNotIn(secret, emitted.decode())
                     self.assertNotIn(secret, json.dumps(suite.failure_context))
 
+            typed_operations = tuple(maintenance.COMMAND_OPERATIONS)
+            for index, command_operation in enumerate(typed_operations):
+                command_status = ("nonzero", "timeout", "exec-failed")[index % 3]
+                external_returncode = 17 if command_status == "nonzero" else None
+                failure = maintenance.ExternalCommandFailure(
+                    command_operation,
+                    command_status,
+                    external_returncode,
+                )
+                failure.failure_phase = "migration-readiness"
+                FailingController.failure = failure
+                stderr = io.StringIO()
+                argv = [
+                    "preflight",
+                    "--project-directory",
+                    str(root / "project"),
+                    "--project-name",
+                    "fixture-project",
+                    "--env-file",
+                    str(root / "environment"),
+                    "--compose-file",
+                    str(root / "compose.yaml"),
+                    "--backup-dir",
+                    str(root / "backup"),
+                ]
+                with (
+                    patch.object(maintenance, "Controller", FailingController),
+                    patch.object(maintenance, "DeploymentLock"),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(maintenance.main(argv), 2)
+                emitted = stderr.getvalue().encode()
+                envelope = json.loads(emitted)
+                self.assertEqual(
+                    set(envelope),
+                    {
+                        "status",
+                        "operation",
+                        "phase",
+                        "classification",
+                        "error",
+                        "command_operation",
+                        "command_status",
+                        "external_returncode",
+                    },
+                )
+                self.assertEqual(envelope["phase"], "migration-readiness")
+                self.assertEqual(envelope["command_operation"], command_operation)
+                self.assertEqual(envelope["command_status"], command_status)
+                self.assertEqual(envelope["external_returncode"], external_returncode)
+                validated = run_suite.parse_maintenance_helper_failure(
+                    emitted, expected_operation="preflight"
+                )
+                self.assertEqual(
+                    validated,
+                    {
+                        "operation": "preflight",
+                        "phase": "migration-readiness",
+                        "classification": "external-command-failed",
+                        "command_operation": command_operation,
+                        "command_status": command_status,
+                        "external_returncode": external_returncode,
+                    },
+                )
+                suite.failure_context = None
+                child = subprocess.CompletedProcess(
+                    ["actual-controller"], 2, b"PRIVATE-STDOUT", emitted
+                )
+                with patch.object(run_suite, "safe_call", return_value=child):
+                    with self.assertRaisesRegex(
+                        run_suite.HarnessFailure,
+                        "shipping maintenance helper preflight failed",
+                    ):
+                        suite.run_helper(
+                            "preflight",
+                            suite.run_root / "backup",
+                            preflight=True,
+                        )
+                self.assertEqual(
+                    suite.failure_context,
+                    {
+                        "operation": "maintenance-preflight",
+                        "helper_operation": "preflight",
+                        "phase": "migration-readiness",
+                        "classification": "external-command-failed",
+                        "command_operation": command_operation,
+                        "command_status": command_status,
+                        "external_returncode": external_returncode,
+                        "returncode": 2,
+                    },
+                )
+                self.assertNotIn("PRIVATE-STDOUT", json.dumps(suite.failure_context))
+
     def test_uninitialized_proxy_token_fails_before_configuration_children(
         self,
     ) -> None:
@@ -2595,12 +2803,16 @@ class SuiteContractTests(unittest.TestCase):
             def updater_call(_argv, **kwargs):
                 captured.update(kwargs)
                 return subprocess.CompletedProcess(
-                    [], 1, b"Hub version change 5.5.1 -> 6.0.1", b""
+                    [],
+                    1,
+                    (run_suite.EXPECTED_UPDATER_MAJOR_REFUSAL.encode()),
+                    b"",
                 )
 
             with (
                 patch.object(suite, "snapshot_service_ids", return_value=old_ids),
                 patch.object(suite, "wait_ready") as wait_ready,
+                patch.object(suite, "run_probe") as updater_smoke,
                 patch.object(run_suite, "safe_call", side_effect=updater_call),
             ):
                 suite.run_updater_refusal()
@@ -2612,11 +2824,62 @@ class SuiteContractTests(unittest.TestCase):
                 str(suite.run_root / "update.lock"),
             )
             wait_ready.assert_called_once_with()
+            updater_smoke.assert_called_once_with("updater-smoke")
             self.assertEqual(
                 suite.results["cases"]["routine-updater-refusal-old-stack-usable"][
                     "status"
                 ],
                 "pass",
+            )
+            self.assertEqual(
+                suite.results["cases"]["routine-updater-refusal-old-stack-usable"][
+                    "refusal"
+                ],
+                "version-change",
+            )
+
+    def test_unknown_running_label_does_not_pass_major_version_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = configured_suite(Path(directory))
+            with patch.object(
+                run_suite.secrets,
+                "token_urlsafe",
+                return_value="test-generated-proxy-auth-token",
+            ):
+                suite.write_compose_fixture()
+            old_ids = {
+                "web": "web-full-id",
+                "proxy": "proxy-full-id",
+                "hub": "hub-full-id",
+            }
+            child = subprocess.CompletedProcess(
+                [], 1, b"", b"running Hub version is unknown; refusing update"
+            )
+            with (
+                patch.object(suite, "snapshot_service_ids", return_value=old_ids),
+                patch.object(suite, "wait_ready") as wait_ready,
+                patch.object(suite, "run_probe") as updater_smoke,
+                patch.object(run_suite, "safe_call", return_value=child),
+            ):
+                with self.assertRaisesRegex(
+                    run_suite.HarnessFailure,
+                    "did not confirm the expected major-version refusal",
+                ):
+                    suite.run_updater_refusal()
+            wait_ready.assert_not_called()
+            updater_smoke.assert_not_called()
+            self.assertNotIn(
+                "routine-updater-refusal-old-stack-usable",
+                suite.results["cases"],
+            )
+            self.assertEqual(
+                suite.failure_context,
+                {
+                    "operation": "routine-updater-refusal",
+                    "classification": "major-version-refusal-not-observed",
+                    "refusal": "unknown-running-image-label",
+                    "returncode": 1,
+                },
             )
 
     def test_updater_refusal_rejects_missing_or_replaced_old_service(self) -> None:
@@ -2649,7 +2912,10 @@ class SuiteContractTests(unittest.TestCase):
                     run_suite,
                     "safe_call",
                     return_value=subprocess.CompletedProcess(
-                        [], 1, b"Hub version change 5.5.1 -> 6.0.1", b""
+                        [],
+                        1,
+                        run_suite.EXPECTED_UPDATER_MAJOR_REFUSAL.encode(),
+                        b"",
                     ),
                 ),
                 self.assertRaisesRegex(

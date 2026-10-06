@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, cast
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
 VERSION_LABEL = "org.finki-hub.jupyterhub-version"
@@ -157,6 +157,11 @@ QUOTA_WRITE_CHUNK = 1024 * 1024
 QUOTA_MIN_FREE_BEFORE = 128 * 1024 * 1024
 QUOTA_MIN_FREE_AFTER = 64 * 1024 * 1024
 QUOTA_MIN_FREE_INODES = 64
+EXPECTED_UPDATER_MAJOR_REFUSAL = (
+    "Hub version change 5.5.1 -> 6.0.1 may require a schema migration; "
+    "use only an independently approved and validated maintenance procedure"
+)
+UNKNOWN_UPDATER_VERSION_REFUSAL = "running Hub version is unknown; refusing update"
 
 
 class HarnessFailure(RuntimeError):
@@ -171,7 +176,7 @@ class CommandFailure(HarnessFailure):
 
 def parse_maintenance_helper_failure(
     stderr: bytes, *, expected_operation: str
-) -> dict[str, str]:
+) -> dict[str, str | int | None]:
     """Parse only the helper's bounded, fixed-vocabulary failure envelope."""
     if (
         type(stderr) is not bytes
@@ -194,7 +199,8 @@ def parse_maintenance_helper_failure(
         raise HarnessFailure("helper-result-invalid") from None
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"status", "operation", "phase", "classification", "error"}
+        or not {"status", "operation", "phase", "classification", "error"}
+        <= set(payload)
         or payload.get("status") != "failed"
         or payload.get("operation") != expected_operation
         or not isinstance(payload.get("phase"), str)
@@ -205,11 +211,51 @@ def parse_maintenance_helper_failure(
         or payload["error"] != MAINTENANCE_HELPER_ERRORS[payload["classification"]]
     ):
         raise HarnessFailure("helper-result-invalid")
-    return {
+    base_keys = {"status", "operation", "phase", "classification", "error"}
+    command_keys = {
+        "command_operation",
+        "command_status",
+        "external_returncode",
+    }
+    is_external_command_failure = payload["classification"] == "external-command-failed"
+    keys = set(payload)
+    typed_command = is_external_command_failure and keys == base_keys | command_keys
+    if keys != base_keys and not typed_command:
+        raise HarnessFailure("helper-result-invalid")
+
+    parsed: dict[str, str | int | None] = {
         "operation": payload["operation"],
         "phase": payload["phase"],
         "classification": payload["classification"],
     }
+    if typed_command:
+        command_operation = payload.get("command_operation")
+        command_status = payload.get("command_status")
+        external_returncode = payload.get("external_returncode")
+        if (
+            not isinstance(command_operation, str)
+            or command_operation not in MAINTENANCE_EXTERNAL_OPERATIONS
+            or not isinstance(command_status, str)
+            or command_status not in MAINTENANCE_EXTERNAL_STATUSES
+            or (
+                command_status == "nonzero"
+                and (
+                    type(external_returncode) is not int
+                    or external_returncode == 0
+                    or not -255 <= external_returncode <= 255
+                )
+            )
+            or (command_status != "nonzero" and external_returncode is not None)
+        ):
+            raise HarnessFailure("helper-result-invalid")
+        parsed.update(
+            {
+                "command_operation": command_operation,
+                "command_status": command_status,
+                "external_returncode": external_returncode,
+            }
+        )
+    return parsed
 
 
 def digest(path: Path) -> str:
@@ -392,7 +438,37 @@ MAINTENANCE_HELPER_PHASES = {
     "candidate-images",
     "lab-ownership",
     "backup-location",
+    "interlock",
+    "quiesce-services",
+    "drain-labs",
+    "cold-backup",
+    "reconcile-labs",
+    "start-private-proxy",
+    "start-migration-hub",
+    "migration-readiness",
+    "stop-migration-hub",
+    "start-candidate-hub",
+    "candidate-readiness",
 }
+MAINTENANCE_EXTERNAL_OPERATIONS = {
+    "compose-config",
+    "compose-ps",
+    "compose-up-proxy",
+    "compose-up-hub",
+    "compose-up-web",
+    "daemon-info",
+    "container-list",
+    "container-inspect",
+    "image-inspect",
+    "hub-version-exec",
+    "lab-version-create",
+    "lab-version-start",
+    "lab-version-remove",
+    "restart-disable",
+    "send-term",
+    "container-remove",
+}
+MAINTENANCE_EXTERNAL_STATUSES = {"nonzero", "timeout", "exec-failed"}
 MAINTENANCE_HELPER_ERRORS = {
     "required-service-missing": "Compose configuration is missing a required service",
     "network-topology-mismatch": "unsupported external Lab network configuration",
@@ -625,7 +701,7 @@ class Suite:
         self.results: dict[str, Any] = {"cases": {}, "runtime": "not-run"}
         self.active_stage = "initialization"
         self.active_case = ""
-        self.failure_context: dict[str, str | int] | None = None
+        self.failure_context: dict[str, str | int | None] | None = None
         self.cleanup_failure_context: dict[str, str | int] | None = None
         self.quota_evidence: dict[str, str | int] | None = None
         self.started = time.monotonic()
@@ -694,7 +770,7 @@ class Suite:
         if returncode is not None:
             context["returncode"] = returncode
         self.active_stage = f"{operation}-{role}"
-        self.failure_context = context
+        self.failure_context = cast(dict[str, str | int | None], context)
 
     def save_manifest(self) -> None:
         if self.marker is not None:
@@ -760,7 +836,7 @@ class Suite:
                     context["errno"] = cause.errno
             else:
                 context["classification"] = "command-launch-failure"
-            self.failure_context = context
+            self.failure_context = cast(dict[str, str | int | None], context)
             raise HarnessFailure("bounded filesystem setup command failed") from None
         if result.returncode:
             self.failure_context = {
@@ -1572,7 +1648,7 @@ class Suite:
             self.cleanup_failure_context = context
         else:
             self.active_stage = operation
-            self.failure_context = context
+            self.failure_context = cast(dict[str, str | int | None], context)
 
     @staticmethod
     def quota_stderr_classification(stderr: bytes) -> QuotaClassification | None:
@@ -2091,7 +2167,9 @@ class Suite:
                 "bounded XFS project quota verification failed"
             ) from None
         if self.cleanup_failure_context is not None:
-            self.failure_context = self.cleanup_failure_context.copy()
+            self.failure_context = cast(
+                dict[str, str | int | None], self.cleanup_failure_context.copy()
+            )
             operation = self.failure_context.get("operation")
             if isinstance(operation, str):
                 self.active_stage = operation
@@ -2259,6 +2337,7 @@ class Suite:
         base_id: str,
         *,
         role: str,
+        base_argument: Literal["HUB_BASE", "LAB_BASE"] = "HUB_BASE",
     ) -> str:
         self.verify_wrapper_base_reference(base_reference, base_id, role=role)
         wrapper_id = self.build(
@@ -2266,7 +2345,7 @@ class Suite:
             "Dockerfile",
             tag,
             role=role,
-            args={"HUB_BASE": base_reference},
+            args={base_argument: base_reference},
             pull=False,
         )
         self.verify_wrapper_base_reference(base_reference, base_id, role=role)
@@ -2337,6 +2416,7 @@ class Suite:
         )
         run_tag = self.run_id
         old_hub_base_tag = f"local/jh6/base-hub5:{run_tag}"
+        old_lab_base_tag = f"local/jh6/base-lab5:{run_tag}"
         candidate_hub_base_tag = f"local/jh6/base-hub6:{run_tag}"
         old_hub_base = self.build(
             old_source / "hub",
@@ -2344,11 +2424,11 @@ class Suite:
             old_hub_base_tag,
             role="baseline-hub-base",
         )
-        old_lab = self.build(
+        old_lab_base = self.build(
             old_source / "lab",
             "Dockerfile",
-            f"local/jh6/lab5:{run_tag}",
-            role="baseline-lab",
+            old_lab_base_tag,
+            role="baseline-lab-base",
         )
         candidate_hub_base = self.build(
             candidate_source / "hub",
@@ -2372,7 +2452,7 @@ class Suite:
             old_hub_base, "/app/.venv/bin/python", role="baseline-hub"
         )
         old_lab_version = self.inspect_version(
-            old_lab, "/opt/jupyter/bin/python", role="baseline-lab"
+            old_lab_base, "/opt/jupyter/bin/python", role="baseline-lab-base"
         )
         new_hub_version = self.inspect_version(
             candidate_hub_base,
@@ -2399,6 +2479,16 @@ class Suite:
             candidate_hub_base, role="candidate-hub-base", allowed=("6.0.1",)
         )
         self.verify_image_label(candidate_lab, role="candidate-lab", allowed=("6.0.1",))
+        self.verify_image_label(
+            old_hub_base,
+            role="baseline-hub-base",
+            allowed=("", "<no value>"),
+        )
+        self.verify_image_label(
+            old_lab_base,
+            role="baseline-lab-base",
+            allowed=("", "<no value>"),
+        )
         # A test-only Hub image wrapper adds only a run label to DockerSpawner.
         wrapper = self.run_root / "integration_jupyterhub_config.py"
         self.begin_image_operation("wrapper-source-create", "shared")
@@ -2421,7 +2511,11 @@ class Suite:
         self.begin_image_operation("wrapper-dockerfile-create", "shared")
         try:
             dockerfile.write_text(
-                "ARG HUB_BASE\nFROM ${HUB_BASE}\nUSER root\n"
+                "ARG HUB_BASE\nFROM ${HUB_BASE}\n"
+                "RUN PYTHONDONTWRITEBYTECODE=1 /app/.venv/bin/python -c 'import importlib.metadata as m; "
+                'assert m.version("jupyterhub") == "5.5.1", m.version("jupyterhub")\'\n'
+                f'LABEL {VERSION_LABEL}="5.5.1"\n'
+                "USER root\n"
                 "RUN cp /app/jupyterhub_config.py /app/jupyterhub_config.base.py\n"
                 "COPY integration_jupyterhub_config.py /app/jupyterhub_config.py\n",
                 encoding="utf-8",
@@ -2431,6 +2525,27 @@ class Suite:
                 "wrapper-dockerfile-create", "shared", "operation-failed", error=exc
             )
             raise HarnessFailure("could not create test-only Dockerfile") from None
+        old_lab_context = self.run_root / "lab-wrapper-old"
+        self.begin_image_operation("lab-wrapper-context-create", "baseline-lab")
+        try:
+            old_lab_context.mkdir(mode=0o700)
+            (old_lab_context / "Dockerfile").write_text(
+                "ARG LAB_BASE\nFROM ${LAB_BASE}\n"
+                "RUN PYTHONDONTWRITEBYTECODE=1 /opt/jupyter/bin/python -c 'import importlib.metadata as m; "
+                'assert m.version("jupyterhub") == "5.5.1", m.version("jupyterhub")\'\n'
+                f'LABEL {VERSION_LABEL}="5.5.1"\n',
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.fail_image_operation(
+                "lab-wrapper-context-create",
+                "baseline-lab",
+                "operation-failed",
+                error=exc,
+            )
+            raise HarnessFailure(
+                "could not create baseline Lab version wrapper"
+            ) from None
         old_context = self.run_root / "hub-wrapper-old"
         new_context = self.run_root / "hub-wrapper-new"
         for role, context in (
@@ -2456,6 +2571,14 @@ class Suite:
             old_hub_base,
             role="baseline-wrapper",
         )
+        old_lab = self.build_wrapper_image(
+            old_lab_context,
+            f"local/jh6/lab5:{run_tag}",
+            old_lab_base_tag,
+            old_lab_base,
+            role="baseline-lab-wrapper",
+            base_argument="LAB_BASE",
+        )
         new_hub = self.build_wrapper_image(
             new_context,
             f"local/jh6/hub6:{run_tag}",
@@ -2464,9 +2587,21 @@ class Suite:
             role="candidate-wrapper",
         )
         self.verify_image_label(new_hub, role="candidate-wrapper", allowed=("6.0.1",))
+        self.verify_image_label(old_hub, role="baseline-wrapper", allowed=("5.5.1",))
         self.verify_image_label(
-            old_hub, role="baseline-wrapper", allowed=("", "<no value>")
+            old_lab, role="baseline-lab-wrapper", allowed=("5.5.1",)
         )
+        old_hub_wrapper_version = self.inspect_version(
+            old_hub, "/app/.venv/bin/python", role="baseline-wrapper"
+        )
+        old_lab_wrapper_version = self.inspect_version(
+            old_lab, "/opt/jupyter/bin/python", role="baseline-lab-wrapper"
+        )
+        if (old_hub_wrapper_version, old_lab_wrapper_version) != ("5.5.1", "5.5.1"):
+            self.fail_image_operation(
+                "wrapper-version-compare", "baseline-pair", "version-mismatch"
+            )
+            raise HarnessFailure("wrapped baseline pair is not installed Hub 5.5.1")
         self.begin_image_operation("image-registration", "fixture-images")
         self.image_ids.update(
             {
@@ -3415,7 +3550,9 @@ class Suite:
                 self.results["completed_probe_cases"] = []
             raise
         if code:
-            self.failure_context = failure_context
+            self.failure_context = cast(
+                dict[str, str | int | None] | None, failure_context
+            )
             self.results["completed_probe_cases"] = completed_cases
             raise HarnessFailure("API acceptance stage failed")
         self.add_case("api-" + stage, count=case_count)
@@ -3649,6 +3786,7 @@ class Suite:
                 if type(result.returncode) is int and -255 <= result.returncode <= 255
                 else None
             )
+            context: dict[str, str | int | None]
             try:
                 if helper_operation is None or returncode is None:
                     raise HarnessFailure("helper-result-invalid")
@@ -3656,7 +3794,7 @@ class Suite:
                     result.stderr or b"", expected_operation=helper_operation
                 )
             except HarnessFailure:
-                context: dict[str, str | int] = {
+                context = {
                     "operation": f"maintenance-{verb}",
                     "classification": "helper-result-invalid",
                 }
@@ -3667,6 +3805,13 @@ class Suite:
                     "phase": child["phase"],
                     "classification": child["classification"],
                 }
+                for field in (
+                    "command_operation",
+                    "command_status",
+                    "external_returncode",
+                ):
+                    if field in child:
+                        context[field] = child[field]
             if returncode is not None:
                 context["returncode"] = returncode
             self.failure_context = context
@@ -3824,13 +3969,21 @@ class Suite:
             result.returncode == 0
             or payload["classification"] != "acceptance-not-acknowledged"
         ):
-            self.failure_context = {
+            context: dict[str, str | int | None] = {
                 "operation": "maintenance-accept",
                 "helper_operation": payload["operation"],
                 "phase": payload["phase"],
                 "classification": payload["classification"],
-                "returncode": result.returncode,
             }
+            for field in (
+                "command_operation",
+                "command_status",
+                "external_returncode",
+            ):
+                if field in payload:
+                    context[field] = payload[field]
+            context["returncode"] = result.returncode
+            self.failure_context = context
             raise HarnessFailure("maintenance helper accepted without the gate")
         web_ids = self.compose_ids("web")
         proxy_ids = self.compose_ids("proxy")
@@ -3869,27 +4022,44 @@ class Suite:
         combined = ((result.stdout or b"") + (result.stderr or b"")).decode(
             "utf-8", errors="replace"
         )
-        expected_change = "Hub version change 5.5.1 -> 6.0.1"
-        expected_unknown = "running Hub version is unknown; refusing update"
-        if result.returncode == 0 or not (
-            expected_change in combined or expected_unknown in combined
+        refusal_lines = combined.splitlines()
+        expected_major_refusal = EXPECTED_UPDATER_MAJOR_REFUSAL in refusal_lines
+        unknown_version_refusal = UNKNOWN_UPDATER_VERSION_REFUSAL in refusal_lines
+        if (
+            type(result.returncode) is int
+            and result.returncode != 0
+            and expected_major_refusal
+            and not unknown_version_refusal
         ):
+            refusal = "version-change"
+        else:
+            refusal = (
+                "unknown-running-image-label"
+                if unknown_version_refusal and not expected_major_refusal
+                else "unrecognized-refusal"
+            )
+            self.failure_context = {
+                "operation": "routine-updater-refusal",
+                "classification": "major-version-refusal-not-observed",
+                "refusal": refusal,
+            }
+            if type(result.returncode) is int and -255 <= result.returncode <= 255:
+                self.failure_context["returncode"] = result.returncode
             raise HarnessFailure(
-                "routine updater did not refuse before replacing the old stack"
+                "routine updater did not confirm the expected major-version refusal"
             )
         if self.snapshot_service_ids() != old_service_ids:
             raise HarnessFailure(
                 "routine updater refusal changed old service identities"
             )
         self.wait_ready()
+        self.run_probe("updater-smoke")
         self.add_case(
             "routine-updater-refusal-old-stack-usable",
             status="pass",
             old_hub_version="5.5.1",
             candidate_hub_version="6.0.1",
-            refusal="unknown-running-image-label"
-            if expected_unknown in combined
-            else "version-change",
+            refusal=refusal,
         )
         self.record_stage("routine-updater-refused-before-replacement")
 
@@ -3988,7 +4158,6 @@ class Suite:
         self.run_updater_refusal()
         if self.snapshot_service_ids() != old_ids:
             raise HarnessFailure("routine update changed old Hub/web/proxy IDs")
-        self.run_probe("updater-smoke")
         self.add_case("old-stack-usable-after-updater-refusal", status="pass")
         backup_root = self.run_root / "backups"
         backup1 = backup_root / "rollback-cycle"
