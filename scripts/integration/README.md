@@ -1,5 +1,29 @@
 # JupyterHub 5 → 6 integration fixture
 
+## Private build diagnostics
+
+Builds retain at most 2 MiB of merged output in exclusive mode-0600 files under
+the owned mode-0700 run directory; excess output is still drained. No raw build
+output, commands, exceptions or log paths are emitted or uploaded. The final
+JSON's optional `build_diagnostics` is a validated numeric/fixed-vocabulary
+snapshot: vertex/step, allowlisted stage (`internal`, `builder`, `final`, `jupyter`,
+and the frozen Dockerfiles' unnamed `stage-0`/`stage-1`), elapsed/progress age, byte cap/counts,
+return code, reader/reap state and disk/memory availability. It is not evidence
+of a network, OOM or package-manager cause. Snapshot values survive cleanup.
+
+Every build has a durable unique-tag intent after successful absent-tag inventory.
+A failed launched build remains unresolved even if immediate inventory is empty.
+Exact late tags can be registered for normal immutable-ID-checked image cleanup;
+no foreign/mismatched identity is deleted. `build_cancellation` reports unresolved
+intent counts separately. Client process-group termination does **not** prove
+daemon-side BuildKit cancellation. An unresolved intent or reader preserves the
+private run directory until ownership is resolved or the ephemeral VM ends;
+ordinary container/network/XFS cleanup still proceeds independently. No raw-log
+artifact is configured. The 1,200-second build ceiling and frozen sources remain
+unchanged; these diagnostics do not rehearse the manual README or prove unwrapped
+shipping-Hub startup. Linux group/pipe/permissions contracts run in hosted checks;
+Windows checks skip only those Linux-specific contracts.
+
 This directory contains an opt-in full acceptance harness, **not evidence of a
 successful migration until the workflow completes**. Runtime execution is
 restricted to an ephemeral GitHub-hosted Ubuntu runner with an exclusive rootful

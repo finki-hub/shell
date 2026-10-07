@@ -81,7 +81,8 @@ jobs:
              scripts.integration.test_probe_contracts \
              scripts.integration.test_db_runner_contracts \
              scripts.integration.test_suite_contracts \
-             scripts.integration.test_source_binding
+              scripts.integration.test_source_binding \
+              scripts.integration.test_build_diagnostics
           bash -n scripts/integration/jupyterhub-migration.sh
 
       - name: Ruff-check external test tooling without changing shipping Hub config
@@ -100,7 +101,9 @@ jobs:
             scripts/integration/test_db_runner_contracts.py \
             scripts/integration/test_suite_contracts.py \
             scripts/integration/source_binding.py \
-            scripts/integration/test_source_binding.py
+            scripts/integration/test_source_binding.py \
+            scripts/integration/build_diagnostics.py \
+            scripts/integration/test_build_diagnostics.py
 
       - name: Mypy-check the maintenance controller and integration probes on Linux
         working-directory: .
@@ -114,7 +117,8 @@ jobs:
              scripts/jupyterhub_maintenance.py \
              scripts/integration/probe.py \
              scripts/integration/run_suite.py \
-             scripts/integration/source_binding.py
+              scripts/integration/source_binding.py \
+              scripts/integration/build_diagnostics.py
 
   xfs-preflight:
     needs: checks

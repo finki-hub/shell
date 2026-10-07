@@ -36,6 +36,7 @@ from typing import Any, Literal, NoReturn, cast
 # Support the existing direct-script entry point and namespace-package tests
 # with one import identity (also used by the Linux mypy check).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.integration.build_diagnostics import run_build, validate
 from scripts.integration.source_binding import SOURCE_ENV, bind_source
 
 BASELINE_SHA = "6f682ee17c8affa988deffa44c56f2e39e28e462"
@@ -736,6 +737,64 @@ class Suite:
         self.created_run_root = False
         self.lean_ref = os.environ.get(SOURCE_ENV)
         self.source_binding: dict[str, Any] = {}
+        self.build_progress_supported = False
+
+    def exact_build_tag(self, reference: str) -> str | None:
+        result = safe_call(
+            ["docker", "image", "ls", "--no-trunc", "--format", "{{json .}}"],
+            timeout=30,
+            capture=True,
+        )
+        if result.returncode:
+            raise HarnessFailure("build image inventory failed")
+        found = []
+        try:
+            for line in (result.stdout or b"").splitlines():
+                item = json.loads(line)
+                if f"{item['Repository']}:{item['Tag']}" == reference:
+                    identity = item["ID"]
+                    if not isinstance(identity, str) or not IMAGE_RE.fullmatch(
+                        identity
+                    ):
+                        raise ValueError
+                    found.append(identity)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HarnessFailure("build image inventory malformed") from exc
+        if len(found) > 1:
+            raise HarnessFailure("build image inventory ambiguous")
+        return found[0] if found else None
+
+    def reconcile_build_intents(self) -> None:
+        self.results["build_cancellation"] = {
+            "unresolved_intents": sum(
+                not item["resolved"] for item in self.manifest.get("build_intents", [])
+            ),
+            "daemon_completion_proven": all(
+                item["resolved"] for item in self.manifest.get("build_intents", [])
+            ),
+        }
+        for intent in self.manifest.get("build_intents", []):
+            if intent["resolved"]:
+                continue
+            reference = intent["ref"]
+            if (
+                not intent["absent_before_launch"]
+                or not reference.startswith("local/jh6/")
+                or not reference.endswith(f":{self.run_id}")
+            ):
+                raise HarnessFailure("build intent ownership mismatch")
+            actual = self.exact_build_tag(reference)
+            expected = intent.get("id")
+            if expected is not None and actual not in {None, expected}:
+                raise HarnessFailure("build intent immutable identity mismatch")
+            if actual is not None and expected is None:
+                intent["id"] = actual
+                self.owned_image_refs[reference] = actual
+                self.manifest["resources"]["images"].append(
+                    {"ref": reference, "id": actual, "kind": "built", "removed": False}
+                )
+                self.save_manifest()
+            # Absence or a late tag is not evidence of daemon-side completion.
 
     def record_stage(self, name: str, **details: Any) -> None:
         self.active_stage = name
@@ -2262,21 +2321,61 @@ class Suite:
         pull: bool = True,
     ) -> str:
         self.begin_image_operation("image-build", role)
+        assert self.run_root is not None
+        if not self.build_progress_supported:
+            help_result = safe_call(
+                ["docker", "build", "--help"], timeout=30, capture=True
+            )
+            if help_result.returncode or b"--progress" not in (
+                help_result.stdout or b""
+            ):
+                raise HarnessFailure("plain build progress unsupported")
+            self.build_progress_supported = True
+        if (
+            not tag.startswith("local/jh6/")
+            or not tag.endswith(f":{self.run_id}")
+            or self.exact_build_tag(tag) is not None
+        ):
+            raise HarnessFailure("build tag is not absent and run-owned")
+        intents = self.manifest.setdefault("build_intents", [])
+        intent = {
+            "ref": tag,
+            "role": role,
+            "absent_before_launch": True,
+            "id": None,
+            "resolved": False,
+        }
+        intents.append(intent)
+        self.save_manifest()
         argv = ["docker", "build"]
         if pull:
             argv.append("--pull")
-        argv.extend(["--quiet", "--file", dockerfile, "--tag", tag])
+        argv.extend(["--progress=plain", "--file", dockerfile, "--tag", tag])
         for key, value in (args or {}).items():
             argv.extend(["--build-arg", f"{key}={value}"])
         argv.append(".")
         try:
-            result = safe_call(argv, timeout=BUILD_TIMEOUT, cwd=context)
+            outcome = run_build(
+                argv,
+                timeout=BUILD_TIMEOUT,
+                cwd=context,
+                log_path=self.run_root / f"build-{len(intents)}.private.log",
+            )
+            diagnostics = validate(outcome.diagnostics)
+            self.results["build_diagnostics"] = diagnostics
+            intent["resolved"] = not outcome.launched
+            self.save_manifest()
         except Exception as exc:
             self.fail_image_operation("image-build", role, "command-failed", error=exc)
             raise HarnessFailure("bounded image build failed") from None
-        if result.returncode:
+        if diagnostics["classification"] != "success":
             self.fail_image_operation(
-                "image-build", role, "command-failed", returncode=result.returncode
+                "image-build",
+                role,
+                "timeout"
+                if diagnostics["classification"] == "timeout"
+                else "command-failed",
+                returncode=diagnostics["returncode"],
             )
             raise HarnessFailure("bounded image build failed")
         image_id = self.operation_image_id(tag, role=role)
@@ -2292,6 +2391,8 @@ class Suite:
                 }
             )
             self.owned_image_refs[tag] = image_id
+            intent["id"] = image_id
+            intent["resolved"] = True
             self.save_manifest()
         except Exception as exc:
             self.fail_image_operation(
@@ -4974,6 +5075,10 @@ class Suite:
     def cleanup_run_root(self) -> None:
         if not self.created_run_root or self.run_root is None or self.marker is None:
             return
+        if any(not item["resolved"] for item in self.manifest.get("build_intents", [])):
+            raise HarnessFailure("run root has unresolved daemon build intents")
+        if self.results.get("build_diagnostics", {}).get("reader_complete") is False:
+            raise HarnessFailure("run root has an unresolved private build reader")
         if self.loop_device or (self.pool and os.path.ismount(self.pool)):
             raise HarnessFailure("run root still contains an attached or mounted pool")
         if self.manifest.get("loop_device") or (
@@ -5083,10 +5188,19 @@ class Suite:
             failures.append("xfs-pool-preserved-after-upstream-cleanup-failure")
         if not failures:
             try:
+                self.reconcile_build_intents()
                 self.remove_run_images()
             except Exception as exc:
                 self.record_cleanup_failure("cleanup-run-images", exc)
                 failures.append("run-images")
+        if self.manifest.get("build_intents"):
+            self.results["build_image_cleanup"] = {
+                "tracked_images": len(self.manifest["resources"]["images"]),
+                "removed_images": sum(
+                    bool(item.get("removed"))
+                    for item in self.manifest["resources"]["images"]
+                ),
+            }
         if not failures:
             try:
                 self.cleanup_run_root()
@@ -5207,6 +5321,14 @@ class Suite:
 
     def cleanup_resource_summary(self) -> list[dict[str, str]]:
         remaining = []
+        if any(not item["resolved"] for item in self.manifest.get("build_intents", [])):
+            remaining.append(
+                {"kind": "build-intent", "reason": "daemon-completion-unresolved"}
+            )
+        if self.results.get("build_diagnostics", {}).get("reader_complete") is False:
+            remaining.append(
+                {"kind": "build-reader", "reason": "private-reader-unresolved"}
+            )
         for resource in self.manifest["resources"]["containers"]:
             if resource.get("removed"):
                 continue
