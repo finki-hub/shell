@@ -10,7 +10,7 @@ In the validation branch, the preserved controller is **external test-only
 orchestration**, not shipping LEAN tooling. Its two-cycle migration/rollback
 scenario does **not** rehearse or validate the manual commands/overlays in the
 shipping README. `source_binding.py` requires the frozen LEAN commit
-`c05128bf581ff8c57f5dff9e216c00639e430416` via `--lean-ref` or
+`4f0dc370e3b2fb06b371b0387a7c1470f9b1c507` via `--lean-ref` or
 `FINKI_HUB_LEAN_SOURCE_REF`, and checks complete application Git trees/root blobs
 before daemon inspection and again before builds. V HEAD must contain the
 parent's checkpoint; matching unstaged copies are insufficient. Results record
@@ -99,7 +99,7 @@ that daemon is explicitly inside the disposable runner trust boundary.
 ```sh
 sudo env RUNNER_TEMP="$RUNNER_TEMP" python3 scripts/integration/run_suite.py \
   --workspace "$GITHUB_WORKSPACE" \
-  --lean-ref c05128bf581ff8c57f5dff9e216c00639e430416 \
+  --lean-ref 4f0dc370e3b2fb06b371b0387a7c1470f9b1c507 \
   --acknowledge-disposable --acknowledge-interruption \
   --acknowledge-ingress-fenced --acknowledge-updater-paused
 ```

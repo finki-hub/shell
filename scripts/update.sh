@@ -82,7 +82,13 @@ current_version=$(docker_bounded inspect --format '{{ index .Config.Labels "org.
 # errors as blockers, and ignores unrelated role-labelled decoys.
 container_ids=$(docker_bounded ps -aq)
 if [ -n "$container_ids" ]; then
-  printf '%s\n' "$container_ids" | timeout 30s xargs docker inspect | CANDIDATE_VERSION="$hub_version" EXPECTED_POOL="$expected_pool" EXPECTED_LAB_USER="$expected_lab_user" python_bounded -c '
+  if ! container_inspections=$(
+    printf '%s\n' "$container_ids" | timeout 30s xargs docker inspect 2>/dev/null
+  ); then
+    echo "failed to inspect retained Labs; refusing update" >&2
+    exit 1
+  fi
+  printf '%s\n' "$container_inspections" | CANDIDATE_VERSION="$hub_version" EXPECTED_POOL="$expected_pool" EXPECTED_LAB_USER="$expected_lab_user" python_bounded -c '
 import json,sys
 import os
 import pathlib

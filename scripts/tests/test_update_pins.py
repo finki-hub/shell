@@ -17,6 +17,10 @@ class UpdaterPinTests(unittest.TestCase):
         self.assertEqual(source.count(config_command), 2)
         self.assertIn("compose_pull --profile images pull", source)
         self.assertNotIn("COMPOSE_PROFILES", source)
+        self.assertIn("if ! container_inspections=$(", source)
+        self.assertIn(
+            'echo "failed to inspect retained Labs; refusing update" >&2', source
+        )
         activation = [
             line.strip()
             for line in source.splitlines()
@@ -55,6 +59,9 @@ class UpdaterPinTests(unittest.TestCase):
                         "candidate_versions": {"hub": "6.0.1", "lab": "6.0.1"},
                         "inventory": [],
                         "image_labels": {},
+                        "container_ids": [],
+                        "inspect_status": 0,
+                        "inspect_output": None,
                     }
                 ),
                 encoding="utf-8",
@@ -130,7 +137,7 @@ if args[:2] == ['image', 'inspect']:
     if os.environ.get('FAKE_FAIL_INSPECT') == ref:
         raise SystemExit(17)
     image_id = state['refs'].get(ref, ref)
-    if fmt == '{{json .Config.Labels}}' and ref == 'sha256:retained-lab':
+    if fmt == '{{json .Config.Labels}}' and ref in state['image_labels']:
         print(json.dumps(state['image_labels'].get(ref, {})))
         raise SystemExit(0)
     if fmt == '{{.Id}}':
@@ -154,12 +161,17 @@ if args and args[0] == 'inspect':
             state['retagged'] = True
             state_path.write_text(json.dumps(state))
         raise SystemExit(0)
-    if args[1:] == ['lab-container-id']:
-        print(json.dumps(state['inventory']))
-        raise SystemExit(0)
+    if args[1:] and all(item in state['container_ids'] for item in args[1:]):
+        if state['inspect_output'] is None:
+            print(json.dumps(state['inventory']))
+        else:
+            print(state['inspect_output'])
+        if state['inspect_status']:
+            print('fake inspect detail', file=sys.stderr)
+        raise SystemExit(state['inspect_status'])
 if args[:2] == ['ps', '-aq']:
-    if state['inventory']:
-        print('lab-container-id')
+    if state['container_ids']:
+        print('\\n'.join(state['container_ids']))
     raise SystemExit(0)
 raise SystemExit(0)
 """,
@@ -283,6 +295,9 @@ raise SystemExit(0)
                 candidate_versions: dict[str, str] | None = None,
                 inventory: list[dict[str, object]] | None = None,
                 image_labels: dict[str, dict[str, str]] | None = None,
+                container_ids: list[str] | None = None,
+                inspect_status: int = 0,
+                inspect_output: str | None = None,
             ) -> dict[str, str]:
                 state_path.write_text(
                     json.dumps(
@@ -295,6 +310,13 @@ raise SystemExit(0)
                             or {"hub": "6.0.1", "lab": "6.0.1"},
                             "inventory": inventory or [],
                             "image_labels": image_labels or {},
+                            "container_ids": (
+                                container_ids
+                                if container_ids is not None
+                                else (["lab-container-id"] if inventory else [])
+                            ),
+                            "inspect_status": inspect_status,
+                            "inspect_output": inspect_output,
                         }
                     ),
                     encoding="utf-8",
@@ -355,6 +377,109 @@ raise SystemExit(0)
             self.assertFalse(any("up" in call or "prune" in call for call in calls))
             self.assertFalse(log.exists())
 
+            retained_lab = {
+                "Name": "/lab-alice",
+                "Image": "sha256:retained-lab",
+                "Config": {"Labels": {"finki.role": "lab", "finki.user": "alice"}},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(root / "pool" / "users" / "alice"),
+                        "Destination": "/home/ubuntu",
+                    }
+                ],
+            }
+            retained_bob = {
+                "Name": "/lab-bob",
+                "Image": "sha256:retained-lab-bob",
+                "Config": {"Labels": {"finki.role": "lab", "finki.user": "bob"}},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(root / "pool" / "users" / "bob"),
+                        "Destination": "/home/ubuntu",
+                    }
+                ],
+            }
+            complete_inventory = [retained_lab, retained_bob]
+            matched_lab_labels = {
+                "sha256:retained-lab": {"org.finki-hub.jupyterhub-version": "6.0.1"},
+                "sha256:retained-lab-bob": {
+                    "org.finki-hub.jupyterhub-version": "6.0.1"
+                },
+            }
+            complete_env = reset_scenario(
+                inventory=complete_inventory,
+                image_labels=matched_lab_labels,
+                container_ids=["lab-container-alice", "lab-container-bob"],
+            )
+            complete = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=complete_env,
+                check=False,
+            )
+            self.assertEqual(complete.returncode, 0, complete.stderr)
+            self.assertEqual(
+                json.loads(log.read_text(encoding="utf-8")),
+                {
+                    "WEB_IMAGE": "sha256:web-original",
+                    "PROXY_IMAGE": "sha256:proxy-original",
+                    "HUB_IMAGE": "sha256:hub-original",
+                    "LAB_IMAGE": "sha256:lab-original",
+                },
+            )
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn(
+                ["inspect", "lab-container-alice", "lab-container-bob"], calls
+            )
+            self.assertFalse(any("prune" in call for call in calls))
+
+            for partial_output, partial_inventory, partial_ids in (
+                ("[]", complete_inventory, ["lab-container-alice"]),
+                (
+                    json.dumps([retained_lab]),
+                    complete_inventory,
+                    ["lab-container-alice", "lab-container-bob"],
+                ),
+            ):
+                with self.subTest(partial_inspect_output=partial_output):
+                    partial_env = reset_scenario(
+                        inventory=partial_inventory,
+                        image_labels=matched_lab_labels,
+                        container_ids=partial_ids,
+                        inspect_status=23,
+                        inspect_output=partial_output,
+                    )
+                    partial = subprocess.run(
+                        [shutil.which("bash") or "bash", str(updater), str(project)],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        env=partial_env,
+                        check=False,
+                    )
+                    self.assertNotEqual(partial.returncode, 0)
+                    self.assertEqual(
+                        partial.stderr.strip(),
+                        "failed to inspect retained Labs; refusing update",
+                    )
+                    self.assertEqual(partial.stdout, "")
+                    calls = [
+                        json.loads(line)
+                        for line in calls_path.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertIn(["inspect", *partial_ids], calls)
+                    self.assertFalse(
+                        any("up" in call or "prune" in call for call in calls)
+                    )
+                    self.assertFalse(log.exists())
+
             marker_env = reset_scenario()
             (project / ".jupyterhub-maintenance.json").write_text(
                 "{}", encoding="utf-8"
@@ -374,18 +499,6 @@ raise SystemExit(0)
             )
             self.assertFalse(log.exists())
 
-            retained_lab = {
-                "Name": "/lab-alice",
-                "Image": "sha256:retained-lab",
-                "Config": {"Labels": {"finki.role": "lab", "finki.user": "alice"}},
-                "Mounts": [
-                    {
-                        "Type": "bind",
-                        "Source": str(root / "pool" / "users" / "alice"),
-                        "Destination": "/home/ubuntu",
-                    }
-                ],
-            }
             retained_env = reset_scenario(
                 inventory=[retained_lab],
                 image_labels={

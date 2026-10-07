@@ -32,7 +32,7 @@ permissions:
   contents: read
 
 env:
-  FINKI_HUB_LEAN_SOURCE_REF: c05128bf581ff8c57f5dff9e216c00639e430416
+  FINKI_HUB_LEAN_SOURCE_REF: 4f0dc370e3b2fb06b371b0387a7c1470f9b1c507
 
 jobs:
   checks:
