@@ -18,7 +18,7 @@ ENV VITE_POSTHOG_KEY=$VITE_POSTHOG_KEY \
 
 RUN npm run build --workspace web
 
-FROM caddy:2.11.4-alpine
+FROM caddy:2.11.6-alpine
 
 COPY --from=build /repo/web/dist /srv
 COPY web/Caddyfile /etc/caddy/Caddyfile
