@@ -15,6 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v7
       - name: Test conservative image updater contracts
         run: timeout 180s python3 -m unittest scripts.tests.test_update_pins
