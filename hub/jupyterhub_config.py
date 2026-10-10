@@ -106,60 +106,56 @@ c.DockerSpawner.extra_host_config = {
     "oom_score_adj": 500,
 }
 
-c.JupyterHub.services = (
-    []
-    if settings.jupyterhub_allow_db_upgrade
-    else [
-        # max-age recreates busy containers; mounted homes remain intact.
-        {
-            "name": "idle-culler-servers",
-            "command": [
-                sys.executable,
-                "-m",
-                "jupyterhub_idle_culler",
-                f"--timeout={settings.lab_idle_min * 60}",
-                f"--max-age={settings.lab_container_max_age_h * 3600}",
-                "--cull-every=60",
-            ],
-        },
-        {
-            "name": "idle-culler-users",
-            "command": [
-                sys.executable,
-                "-m",
-                "jupyterhub_idle_culler",
-                "--cull-users=true",
-                f"--timeout={settings.lab_retention_h * 3600}",
-                f"--max-age={settings.lab_max_age_h * 3600}",
-                "--cull-every=3600",
-            ],
-        },
-    ]
-)
-c.JupyterHub.load_roles = (
-    []
-    if settings.jupyterhub_allow_db_upgrade
-    else [
-        {
-            "name": "idle-culler-servers",
-            "services": ["idle-culler-servers"],
-            "scopes": [
-                "list:users",
-                "read:users:activity",
-                "read:servers",
-                "delete:servers",
-            ],
-        },
-        {
-            "name": "idle-culler-users",
-            "services": ["idle-culler-users"],
-            "scopes": [
-                "list:users",
-                "read:users:activity",
-                "read:servers",
-                "delete:servers",
-                "delete:users",
-            ],
-        },
-    ]
-)
+c.JupyterHub.services = [
+    # max-age recreates busy containers; mounted homes remain intact.
+    {
+        "name": "idle-culler-servers",
+        "command": [
+            sys.executable,
+            "-m",
+            "jupyterhub_idle_culler",
+            f"--timeout={settings.lab_idle_min * 60}",
+            f"--max-age={settings.lab_container_max_age_h * 3600}",
+            "--cull-every=60",
+        ],
+    },
+    {
+        "name": "idle-culler-users",
+        "command": [
+            sys.executable,
+            "-m",
+            "jupyterhub_idle_culler",
+            "--cull-users=true",
+            f"--timeout={settings.lab_retention_h * 3600}",
+            f"--max-age={settings.lab_max_age_h * 3600}",
+            "--cull-every=3600",
+        ],
+    },
+]
+c.JupyterHub.load_roles = [
+    {
+        "name": "idle-culler-servers",
+        "services": ["idle-culler-servers"],
+        "scopes": [
+            "list:users",
+            "read:users:activity",
+            "read:servers",
+            "delete:servers",
+        ],
+    },
+    {
+        "name": "idle-culler-users",
+        "services": ["idle-culler-users"],
+        "scopes": [
+            "list:users",
+            "read:users:activity",
+            "read:servers",
+            "delete:servers",
+            "delete:users",
+        ],
+    },
+]
+
+if settings.jupyterhub_allow_db_upgrade:
+    c.JupyterHub.services = []
+    c.JupyterHub.load_roles = []

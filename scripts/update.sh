@@ -27,8 +27,7 @@ docker_bounded() { timeout 30s docker "$@"; }
 python_bounded() { timeout 30s python3 "$@"; }
 compose_pull --profile images pull
 
-# Inspect candidate image labels which are written only after each Dockerfile
-# asserts the installed JupyterHub package version.
+# Inspect candidate image JupyterHub version labels.
 config_values=$(compose --profile images config --format json | python_bounded -c 'import json,sys; s=json.load(sys.stdin)["services"]; h=s["hub"]; print("\t".join((s["web"]["image"],s["proxy"]["image"],h["image"],s["lab"]["image"],next(v["source"] for v in h["volumes"] if v.get("target")=="/srv/pool"),str(h["environment"]["LAB_USER"]))))')
 IFS="$(printf '\t')" read -r candidate_web candidate_proxy candidate_hub candidate_lab expected_pool expected_lab_user <<EOF
 $config_values

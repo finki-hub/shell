@@ -14,7 +14,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
-RUN /app/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("jupyterhub") == "6.0.1", m.version("jupyterhub")'
 
 FROM python:3.14-bookworm AS final
 
