@@ -3,12 +3,15 @@
 import sys
 from typing import TYPE_CHECKING
 
+import docker
+
 if TYPE_CHECKING:
     from traitlets.config import get_config
 
 from shell_hub.auth import EnvironmentTokenAuthenticator
 from shell_hub.quota import pre_spawn_hook
 from shell_hub.readiness import assert_pool
+from shell_hub.rollout import verify_rollout
 from shell_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
 
 c = get_config()
@@ -25,7 +28,7 @@ c.JupyterHub.hub_bind_url = "http://172.30.0.1:8081"
 c.JupyterHub.hub_connect_url = "http://172.30.0.1:8081"
 c.JupyterHub.log_level = settings.log_level
 c.JupyterHub.db_url = f"sqlite:///{settings.hub_data_dir}/jupyterhub.sqlite"
-c.JupyterHub.upgrade_db = True
+c.JupyterHub.upgrade_db = settings.jupyterhub_allow_db_upgrade
 c.JupyterHub.cookie_secret_file = f"{settings.hub_data_dir}/jupyterhub_cookie_secret"
 
 c.ConfigurableHTTPProxy.should_start = False
@@ -45,7 +48,12 @@ c.Spawner.server_token_scopes = ["users:activity!user", "access:servers!server"]
 c.Spawner.pre_spawn_hook = pre_spawn_hook
 
 c.JupyterHub.spawner_class = "dockerspawner.DockerSpawner"
-c.DockerSpawner.image = settings.lab_image
+c.DockerSpawner.image = verify_rollout(
+    lab_image=settings.lab_image,
+    pool_dir=settings.lab_pool_dir,
+    lab_user=settings.lab_user,
+    docker_client=docker.from_env(timeout=10),
+)
 c.DockerSpawner.network_name = "finki-hub-shell-users"
 c.DockerSpawner.use_internal_ip = True
 c.DockerSpawner.hub_connect_url = "http://172.30.0.1:8081"
@@ -147,3 +155,7 @@ c.JupyterHub.load_roles = [
         ],
     },
 ]
+
+if settings.jupyterhub_allow_db_upgrade:
+    c.JupyterHub.services = []
+    c.JupyterHub.load_roles = []

@@ -17,6 +17,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.14-bookworm AS final
 
+LABEL org.finki-hub.jupyterhub-version="6.0.1"
+
 # Seed homes from the Ubuntu lab image\'s /etc/skel.
 COPY --from=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 /etc/skel /opt/skel
 

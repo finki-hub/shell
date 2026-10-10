@@ -1,0 +1,556 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+class UpdaterPinTests(unittest.TestCase):
+    def test_image_profile_is_limited_to_config_and_not_final_activation(self) -> None:
+        updater = Path(__file__).parents[1] / "update.sh"
+        source = updater.read_text(encoding="utf-8")
+        config_command = "compose --profile images config --format json"
+        self.assertEqual(source.count(config_command), 2)
+        self.assertIn("compose_pull --profile images pull", source)
+        self.assertNotIn("COMPOSE_PROFILES", source)
+        self.assertIn("if ! container_inspections=$(", source)
+        self.assertIn(
+            'echo "failed to inspect retained Labs; refusing update" >&2', source
+        )
+        activation = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("timeout 180s docker compose")
+        ]
+        self.assertEqual(len(activation), 1)
+        self.assertIn(" up -d ", activation[0])
+        self.assertNotIn("--profile", activation[0])
+
+    @unittest.skipUnless(
+        os.name != "nt" and shutil.which("bash"),
+        "a POSIX Bash runtime is required for updater contract test",
+    )
+    def test_retag_after_preflight_does_not_change_activated_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            bin_dir = root / "bin"
+            project.mkdir()
+            bin_dir.mkdir()
+            (project / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+            log = root / "activation.json"
+            original_refs = {
+                "web:tag": "sha256:web-original",
+                "proxy:tag": "sha256:proxy-original",
+                "hub:tag": "sha256:hub-original",
+                "lab:tag": "sha256:lab-original",
+            }
+            (root / "image-state.json").write_text(
+                json.dumps(
+                    {
+                        "refs": original_refs,
+                        "retagged": False,
+                        "compose_config_profiles": [],
+                        "activation_profiled": None,
+                        "candidate_versions": {"hub": "6.0.1", "lab": "6.0.1"},
+                        "inventory": [],
+                        "image_labels": {},
+                        "container_ids": [],
+                        "inspect_status": 0,
+                        "inspect_output": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "name": "test-project",
+                "services": {
+                    "web": {"image": "web:tag"},
+                    "proxy": {"image": "proxy:tag"},
+                    "hub": {
+                        "image": "hub:tag",
+                        "environment": {
+                            "LAB_USER": "ubuntu",
+                            "LAB_POOL_DIR": str(root / "pool"),
+                            "LAB_IMAGE": "lab:tag",
+                        },
+                        "volumes": [
+                            {"source": str(root / "pool"), "target": "/srv/pool"}
+                        ],
+                    },
+                    "lab": {"image": "lab:tag"},
+                },
+            }
+            state_path = root / "image-state.json"
+            config_path = root / "compose-config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            cli = root / "fake_cli.py"
+            cli.write_text(
+                """
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ['FAKE_ROOT'])
+state_path = root / 'image-state.json'
+state = json.loads(state_path.read_text())
+with (root / 'docker-calls.jsonl').open('a') as calls:
+    calls.write(json.dumps(args) + '\\n')
+config = json.loads((root / 'compose-config.json').read_text())
+if args[0] == 'compose':
+    tail = args[args.index('--project-directory') + 2:]
+    if 'config' in tail:
+        if tail[:4] != ['--profile', 'images', 'config', '--format'] or tail[4:] != ['json']:
+            raise SystemExit(29)
+        state['compose_config_profiles'].append(tail[:2])
+        state_path.write_text(json.dumps(state))
+        services = config['services']
+        env = os.environ
+        for service, key in [('web','WEB_IMAGE'),('proxy','PROXY_IMAGE'),('hub','HUB_IMAGE'),('lab','LAB_IMAGE')]:
+            if key in env:
+                services[service]['image'] = env[key]
+        if 'LAB_IMAGE' in env:
+            services['hub']['environment']['LAB_IMAGE'] = env['LAB_IMAGE']
+        print(json.dumps(config))
+        raise SystemExit(0)
+    if 'pull' in tail:
+        if tail[:2] != ['--profile', 'images']:
+            raise SystemExit(29)
+        raise SystemExit(0)
+    if tail[:2] == ['ps', '-q']:
+        print('hub-current')
+        raise SystemExit(0)
+    if 'up' in tail:
+        state['activation_profiled'] = '--profile' in tail
+        state_path.write_text(json.dumps(state))
+        if state['activation_profiled']:
+            raise SystemExit(30)
+        payload = {key: os.environ[key] for key in ('WEB_IMAGE','PROXY_IMAGE','HUB_IMAGE','LAB_IMAGE')}
+        (root / 'activation.json').write_text(json.dumps(payload))
+        raise SystemExit(0)
+    raise SystemExit(0)
+if args[:2] == ['image', 'inspect']:
+    fmt = args[args.index('--format') + 1]
+    ref = args[-1] if args[2] == '--format' else args[2]
+    if os.environ.get('FAKE_FAIL_INSPECT') == ref:
+        raise SystemExit(17)
+    image_id = state['refs'].get(ref, ref)
+    if fmt == '{{json .Config.Labels}}' and ref in state['image_labels']:
+        print(json.dumps(state['image_labels'].get(ref, {})))
+        raise SystemExit(0)
+    if fmt == '{{.Id}}':
+        print(image_id)
+    elif '{{.Id}}|' in fmt:
+        if image_id == 'sha256:hub-original':
+            label = state['candidate_versions']['hub']
+        elif image_id == 'sha256:lab-original':
+            label = state['candidate_versions']['lab']
+        else:
+            label = ''
+        print(image_id + '|' + label)
+    else:
+        print('{}')
+    raise SystemExit(0)
+if args and args[0] == 'inspect':
+    if 'hub-current' in args:
+        print(os.environ.get('FAKE_CURRENT_VERSION', '6.0.1'))
+        if not state['retagged']:
+            state['refs'] = {key: 'sha256:' + key.split(':')[0] + '-retagged' for key in state['refs']}
+            state['retagged'] = True
+            state_path.write_text(json.dumps(state))
+        raise SystemExit(0)
+    if args[1:] and all(item in state['container_ids'] for item in args[1:]):
+        if state['inspect_output'] is None:
+            print(json.dumps(state['inventory']))
+        else:
+            print(state['inspect_output'])
+        if state['inspect_status']:
+            print('fake inspect detail', file=sys.stderr)
+        raise SystemExit(state['inspect_status'])
+if args[:2] == ['ps', '-aq']:
+    if state['container_ids']:
+        print('\\n'.join(state['container_ids']))
+    raise SystemExit(0)
+raise SystemExit(0)
+""",
+                encoding="utf-8",
+            )
+            python = shutil.which("python") or shutil.which("python3")
+            if not python:
+                self.skipTest("Python executable is not discoverable")
+            docker_script = bin_dir / "docker"
+            docker_script.write_text(
+                f"#!/bin/sh\nexec '{python}' '{cli}' \"$@\"\n", encoding="utf-8"
+            )
+            python_script = bin_dir / "python3"
+            python_script.write_text(
+                f"#!/bin/sh\nexec '{python}' \"$@\"\n", encoding="utf-8"
+            )
+            timeout_script = bin_dir / "timeout"
+            timeout_script.write_text('#!/bin/sh\nshift\nexec "$@"\n', encoding="utf-8")
+            flock_script = bin_dir / "flock"
+            flock_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for path in (docker_script, python_script, timeout_script, flock_script):
+                path.chmod(0o755)
+            updater = Path(__file__).parents[1] / "update.sh"
+            env = os.environ.copy()
+            for key in ("WEB_IMAGE", "PROXY_IMAGE", "HUB_IMAGE", "LAB_IMAGE"):
+                env.pop(key, None)
+            env.update(
+                {
+                    "PATH": str(bin_dir) + os.pathsep + env.get("PATH", ""),
+                    "FAKE_ROOT": str(root),
+                    "UPDATE_LOCK_FILE": str(root / "update.lock"),
+                }
+            )
+            result = subprocess.run(  # ruff: ignore[S603] - executes only fixture-owned scripts
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                json.loads(state_path.read_text(encoding="utf-8"))["retagged"]
+            )
+            self.assertEqual(
+                json.loads(log.read_text(encoding="utf-8")),
+                {
+                    "WEB_IMAGE": "sha256:web-original",
+                    "PROXY_IMAGE": "sha256:proxy-original",
+                    "HUB_IMAGE": "sha256:hub-original",
+                    "LAB_IMAGE": "sha256:lab-original",
+                },
+            )
+            successful_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                successful_state["compose_config_profiles"],
+                [["--profile", "images"], ["--profile", "images"]],
+            )
+            self.assertFalse(successful_state["activation_profiled"])
+            activated = log.read_bytes()
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["refs"] = original_refs.copy()
+            state["retagged"] = False
+            state["compose_config_profiles"] = []
+            state["activation_profiled"] = None
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            failure_env = env.copy()
+            failure_env["FAKE_FAIL_INSPECT"] = "hub:tag"
+            failed = subprocess.run(  # ruff: ignore[S603] - executes only fixture-owned scripts
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=failure_env,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(log.read_bytes(), activated)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["refs"] = original_refs.copy()
+            state["retagged"] = False
+            state["compose_config_profiles"] = []
+            state["activation_profiled"] = None
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            log.unlink()
+            old_stack_env = env.copy()
+            old_stack_env["FAKE_CURRENT_VERSION"] = "5.0.0"
+            refused = subprocess.run(  # ruff: ignore[S603] - executes only fixture-owned scripts
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=old_stack_env,
+                check=False,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(
+                "Hub version change 5.0.0 -> 6.0.1 may require a schema migration",
+                refused.stderr,
+            )
+            self.assertFalse(log.exists(), "version refusal must not activate images")
+            refusal_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                refusal_state["compose_config_profiles"],
+                [["--profile", "images"], ["--profile", "images"]],
+            )
+            self.assertIsNone(refusal_state["activation_profiled"])
+
+            calls_path = root / "docker-calls.jsonl"
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertFalse(any("prune" in call for call in calls))
+
+            def reset_scenario(
+                *,
+                candidate_versions: dict[str, str] | None = None,
+                inventory: list[dict[str, object]] | None = None,
+                image_labels: dict[str, dict[str, str]] | None = None,
+                container_ids: list[str] | None = None,
+                inspect_status: int = 0,
+                inspect_output: str | None = None,
+            ) -> dict[str, str]:
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "refs": original_refs,
+                            "retagged": False,
+                            "compose_config_profiles": [],
+                            "activation_profiled": None,
+                            "candidate_versions": candidate_versions
+                            or {"hub": "6.0.1", "lab": "6.0.1"},
+                            "inventory": inventory or [],
+                            "image_labels": image_labels or {},
+                            "container_ids": (
+                                container_ids
+                                if container_ids is not None
+                                else (["lab-container-id"] if inventory else [])
+                            ),
+                            "inspect_status": inspect_status,
+                            "inspect_output": inspect_output,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                calls_path.unlink(missing_ok=True)
+                log.unlink(missing_ok=True)
+                (project / ".jupyterhub-maintenance.json").unlink(missing_ok=True)
+                scenario_env = env.copy()
+                scenario_env.pop("FAKE_FAIL_INSPECT", None)
+                scenario_env["FAKE_CURRENT_VERSION"] = "6.0.1"
+                return scenario_env
+
+            for unknown_versions in (
+                {"hub": "<no value>", "lab": "6.0.1"},
+                {"hub": "6.0.1", "lab": "<no value>"},
+            ):
+                with self.subTest(candidate_versions=unknown_versions):
+                    unknown_env = reset_scenario(candidate_versions=unknown_versions)
+                    unknown = subprocess.run(
+                        [shutil.which("bash") or "bash", str(updater), str(project)],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        env=unknown_env,
+                        check=False,
+                    )
+                    self.assertNotEqual(unknown.returncode, 0)
+                    self.assertIn("version metadata is missing", unknown.stderr)
+                    calls = [
+                        json.loads(line)
+                        for line in calls_path.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertTrue(any("pull" in call for call in calls))
+                    self.assertFalse(
+                        any("up" in call or "prune" in call for call in calls)
+                    )
+                    self.assertFalse(log.exists())
+
+            mismatch_env = reset_scenario(
+                candidate_versions={"hub": "6.0.1", "lab": "5.5.1"}
+            )
+            mismatch = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=mismatch_env,
+                check=False,
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn(
+                "candidate Hub 6.0.1 and Lab 5.5.1 do not match", mismatch.stderr
+            )
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertFalse(any("up" in call or "prune" in call for call in calls))
+            self.assertFalse(log.exists())
+
+            retained_lab = {
+                "Name": "/lab-alice",
+                "Image": "sha256:retained-lab",
+                "Config": {"Labels": {"finki.role": "lab", "finki.user": "alice"}},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(root / "pool" / "users" / "alice"),
+                        "Destination": "/home/ubuntu",
+                    }
+                ],
+            }
+            retained_bob = {
+                "Name": "/lab-bob",
+                "Image": "sha256:retained-lab-bob",
+                "Config": {"Labels": {"finki.role": "lab", "finki.user": "bob"}},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(root / "pool" / "users" / "bob"),
+                        "Destination": "/home/ubuntu",
+                    }
+                ],
+            }
+            complete_inventory = [retained_lab, retained_bob]
+            matched_lab_labels = {
+                "sha256:retained-lab": {"org.finki-hub.jupyterhub-version": "6.0.1"},
+                "sha256:retained-lab-bob": {
+                    "org.finki-hub.jupyterhub-version": "6.0.1"
+                },
+            }
+            complete_env = reset_scenario(
+                inventory=complete_inventory,
+                image_labels=matched_lab_labels,
+                container_ids=["lab-container-alice", "lab-container-bob"],
+            )
+            complete = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=complete_env,
+                check=False,
+            )
+            self.assertEqual(complete.returncode, 0, complete.stderr)
+            self.assertEqual(
+                json.loads(log.read_text(encoding="utf-8")),
+                {
+                    "WEB_IMAGE": "sha256:web-original",
+                    "PROXY_IMAGE": "sha256:proxy-original",
+                    "HUB_IMAGE": "sha256:hub-original",
+                    "LAB_IMAGE": "sha256:lab-original",
+                },
+            )
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn(
+                ["inspect", "lab-container-alice", "lab-container-bob"], calls
+            )
+            self.assertFalse(any("prune" in call for call in calls))
+
+            for partial_output, partial_inventory, partial_ids in (
+                ("[]", complete_inventory, ["lab-container-alice"]),
+                (
+                    json.dumps([retained_lab]),
+                    complete_inventory,
+                    ["lab-container-alice", "lab-container-bob"],
+                ),
+            ):
+                with self.subTest(partial_inspect_output=partial_output):
+                    partial_env = reset_scenario(
+                        inventory=partial_inventory,
+                        image_labels=matched_lab_labels,
+                        container_ids=partial_ids,
+                        inspect_status=23,
+                        inspect_output=partial_output,
+                    )
+                    partial = subprocess.run(
+                        [shutil.which("bash") or "bash", str(updater), str(project)],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        env=partial_env,
+                        check=False,
+                    )
+                    self.assertNotEqual(partial.returncode, 0)
+                    self.assertEqual(
+                        partial.stderr.strip(),
+                        "failed to inspect retained Labs; refusing update",
+                    )
+                    self.assertEqual(partial.stdout, "")
+                    calls = [
+                        json.loads(line)
+                        for line in calls_path.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertIn(["inspect", *partial_ids], calls)
+                    self.assertFalse(
+                        any("up" in call or "prune" in call for call in calls)
+                    )
+                    self.assertFalse(log.exists())
+
+            marker_env = reset_scenario()
+            (project / ".jupyterhub-maintenance.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            marker_result = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=marker_env,
+                check=False,
+            )
+            self.assertNotEqual(marker_result.returncode, 0)
+            self.assertIn("maintenance interlock is present", marker_result.stderr)
+            self.assertFalse(
+                calls_path.exists(), "interlock must refuse before Docker pull"
+            )
+            self.assertFalse(log.exists())
+
+            retained_env = reset_scenario(
+                inventory=[retained_lab],
+                image_labels={
+                    "sha256:retained-lab": {"org.finki-hub.jupyterhub-version": "5.5.1"}
+                },
+            )
+            retained = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=retained_env,
+                check=False,
+            )
+            self.assertNotEqual(retained.returncode, 0)
+            self.assertIn("incompatible/unknown JupyterHub version", retained.stderr)
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(call[:2] == ["inspect", "lab-container-id"] for call in calls)
+            )
+            self.assertFalse(any("up" in call or "prune" in call for call in calls))
+            self.assertFalse(log.exists())
+
+            unknown_owner = dict(retained_lab)
+            unknown_owner["Config"] = {"Labels": {"finki.role": "lab"}}
+            owner_env = reset_scenario(inventory=[unknown_owner])
+            owner_result = subprocess.run(
+                [shutil.which("bash") or "bash", str(updater), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=owner_env,
+                check=False,
+            )
+            self.assertNotEqual(owner_result.returncode, 0)
+            self.assertIn(
+                "cannot establish ownership of retained Lab lab-alice",
+                owner_result.stderr,
+            )
+            calls = [
+                json.loads(line)
+                for line in calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(call[:2] == ["inspect", "lab-container-id"] for call in calls)
+            )
+            self.assertFalse(any("up" in call or "prune" in call for call in calls))
+            self.assertFalse(log.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

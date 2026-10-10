@@ -21,6 +21,7 @@ def test_defaults_match_the_contract(make_settings: Callable[..., Settings]) -> 
     assert settings.lab_env_quota_mb == 100
     assert settings.lab_env_max_inodes == 20_000
     assert settings.lab_image == "ghcr.io/finki-hub/shell-lab:latest"
+    assert settings.jupyterhub_allow_db_upgrade is False
     assert (settings.lab_user, settings.lab_uid, settings.lab_gid) == (
         "ubuntu",
         1000,
@@ -39,6 +40,15 @@ def test_defaults_match_the_contract(make_settings: Callable[..., Settings]) -> 
     assert settings.lab_log_max_size == "512k"
     assert settings.lab_log_max_files == 2
     assert settings.turnstile_configured is False
+
+
+def test_database_upgrade_requires_explicit_settings_override(
+    make_settings: Callable[..., Settings],
+) -> None:
+    assert (
+        make_settings(jupyterhub_allow_db_upgrade=True).jupyterhub_allow_db_upgrade
+        is True
+    )
 
 
 def test_memory_must_clear_the_tmpfs_total_plus_headroom(

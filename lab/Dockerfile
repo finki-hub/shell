@@ -24,6 +24,8 @@ RUN uv sync --frozen --no-dev --no-editable
 
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
+LABEL org.finki-hub.jupyterhub-version="6.0.1"
+
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
