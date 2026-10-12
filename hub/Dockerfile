@@ -1,4 +1,6 @@
-FROM ghcr.io/astral-sh/uv:python3.14-bookworm AS builder
+FROM ubuntu:26.04 AS skel
+
+FROM ghcr.io/astral-sh/uv:python3.14-trixie AS builder
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_PYTHON_DOWNLOADS=0 \
@@ -15,10 +17,10 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-FROM python:3.14-bookworm AS final
+FROM python:3.14-trixie AS final
 
 # Seed homes from the Ubuntu lab image\'s /etc/skel.
-COPY --from=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 /etc/skel /opt/skel
+COPY --from=skel /etc/skel /opt/skel
 
 # curl serves the Compose healthcheck; xfsprogs provides xfs_quota for /srv/pool.
 RUN apt-get update \
