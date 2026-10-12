@@ -380,8 +380,8 @@ export const startTerminal = ({
     for (const wait of RECONNECT_DELAYS_MS) {
       callbacks.onStatus('reconnecting');
       await sleep(wait);
-      if (live.epoch !== epoch) return;
-      if ((await attemptOnce(epoch)) === 'ended') return;
+      if (live.epoch !== epoch || (await attemptOnce(epoch)) === 'ended')
+        return;
     }
     finish(classifySocketClose(false));
   };

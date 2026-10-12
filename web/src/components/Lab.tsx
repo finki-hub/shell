@@ -103,10 +103,12 @@ export const Lab = () => {
     const uploadIds = mainUploadIdsRef.current;
     const currentIds = new Set(files.uploads.map((upload) => upload.id));
     for (const id of uploadIds) {
-      if (!currentIds.has(id)) {
-        toast.dismiss(`main-upload-${id}`);
-        uploadIds.delete(id);
+      if (currentIds.has(id)) {
+        continue;
       }
+
+      toast.dismiss(`main-upload-${id}`);
+      uploadIds.delete(id);
     }
     for (const upload of files.uploads) {
       updateMainUploadToast(upload, uploadIds, t);
