@@ -99,6 +99,36 @@ describe('hub API', () => {
     await expect(pending).resolves.toEqual({ kind: 'ready' });
   });
 
+  it('accepts additive user and server metadata while polling a bodyless spawn', async () => {
+    vi.useFakeTimers();
+    const fetchRequest = vi
+      .fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(response(202))
+      .mockResolvedValueOnce(
+        response(
+          200,
+          '{"name":"user name","pending":null,"servers":{"":{"display_name":"Default server","ready":true}},"user_info":{"admin":false,"groups":[],"name":"user name"}}',
+        ),
+      );
+    vi.stubGlobal('fetch', fetchRequest);
+
+    const pending = spawnServer(SESSION);
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(pending).resolves.toEqual({ kind: 'ready' });
+    expect(fetchRequest).toHaveBeenCalledTimes(2);
+    const [spawnUrl, spawnInit] = fetchRequest.mock.calls[0] ?? [];
+    expect(spawnUrl).toBe('/hub/api/users/user%20name/server');
+    expect(spawnInit?.method).toBe('POST');
+    expect(spawnInit?.body).toBeUndefined();
+    expect(new Headers(spawnInit?.headers).has('Content-Type')).toBe(false);
+    expect(spawnInit?.headers).toMatchObject({
+      Authorization: 'token api-token',
+    });
+    expect(fetchRequest.mock.calls[1]?.[1]?.method).toBe('GET');
+  });
+
   it('reports a completed-but-unready spawn as start-failed', async () => {
     vi.useFakeTimers();
     const fetchRequest = vi
