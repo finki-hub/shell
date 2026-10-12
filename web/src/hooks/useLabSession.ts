@@ -271,9 +271,12 @@ export const useLabSession = () => {
     const begin = async (): Promise<void> => {
       if (container === null) return;
       const active = recovery ?? (await authenticate());
-      if (active === null) return;
-      if (!(await startServer(active, recovery !== null))) return;
-      if (!owned.isCurrent()) return;
+      if (
+        active === null ||
+        !(await startServer(active, recovery !== null)) ||
+        !owned.isCurrent()
+      )
+        return;
       setSession(active);
       openTerminal(active, container);
     };

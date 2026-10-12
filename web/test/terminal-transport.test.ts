@@ -214,12 +214,11 @@ describe('terminal transport', () => {
       (input: RequestInfo | URL, init?: RequestInit) => {
         if (init?.method === 'DELETE') return Promise.resolve(response(204));
         const url = requestUrl(input);
-        if (url.endsWith('/tokens')) {
-          return Promise.resolve(
-            response(201, JSON.stringify({ token: 'short-token' })),
-          );
-        }
-        return Promise.resolve(Response.json([{ name: REMEMBERED }]));
+        return url.endsWith('/tokens')
+          ? Promise.resolve(
+              response(201, JSON.stringify({ token: 'short-token' })),
+            )
+          : Promise.resolve(Response.json([{ name: REMEMBERED }]));
       },
     );
     vi.stubGlobal('fetch', fetchRequest);

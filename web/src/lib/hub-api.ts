@@ -71,9 +71,9 @@ const SPAWN_DEADLINE_MS = 190_000;
 const STOP_DEADLINE_MS = 60_000;
 const URL_TOKEN_TTL_S = 60;
 
-const delay = (ms: number): Promise<void> =>
+const delay = (): Promise<void> =>
   new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    setTimeout(resolve, POLL_INTERVAL_MS);
   });
 
 export const sendJson = async ({
@@ -241,7 +241,7 @@ const pollUntilReady = async (
   const deadline = Date.now() + SPAWN_DEADLINE_MS;
   while (Date.now() < deadline) {
     try {
-      await waitForAbortSignal(delay(POLL_INTERVAL_MS), signal);
+      await waitForAbortSignal(delay(), signal);
     } catch {
       return { failure: { kind: 'aborted' }, kind: 'failed' };
     }
@@ -327,7 +327,7 @@ const pollUntilStopped = async (
   const deadline = Date.now() + STOP_DEADLINE_MS;
   while (Date.now() < deadline) {
     try {
-      await waitForAbortSignal(delay(POLL_INTERVAL_MS), signal);
+      await waitForAbortSignal(delay(), signal);
     } catch {
       return { failure: { kind: 'aborted' }, kind: 'failed' };
     }
