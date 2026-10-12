@@ -1,4 +1,4 @@
-(() => {
+{
   const storageKey = 'theme';
   const isTheme = (value) => value === 'dark' || value === 'light';
   let theme;
@@ -23,4 +23,4 @@
   }
 
   document.documentElement.dataset.kbTheme = theme;
-})();
+}

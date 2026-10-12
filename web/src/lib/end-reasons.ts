@@ -47,10 +47,9 @@ export const classifyHubFailure = (failure: HubFailure): SessionEnd => {
   if (failure.status === 429) {
     return end('capacity');
   }
-  if (CULLED_STATUSES.has(failure.status)) {
-    return end('idle');
-  }
-  return end('unreachable', failure.message ?? failure.reason);
+  return CULLED_STATUSES.has(failure.status)
+    ? end('idle')
+    : end('unreachable', failure.message ?? failure.reason);
 };
 
 // Login 403 carries a challenge verdict in error; other failures are unreachable.

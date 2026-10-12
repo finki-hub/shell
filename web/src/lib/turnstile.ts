@@ -60,15 +60,15 @@ export const solveChallenge = async (
   action: ChallengeAction,
   {
     chrome,
-    environmentToken,
-    issued,
+    environmentToken = null,
+    issued = null,
     onInteractive,
     signal,
     target,
   }: {
     readonly chrome?: ChallengeChrome;
     readonly environmentToken?: null | string;
-    readonly issued?: string;
+    readonly issued?: null | string;
     readonly onInteractive?: () => void;
     readonly signal?: AbortSignal;
     readonly target?: HTMLElement;
@@ -92,10 +92,10 @@ export const solveChallenge = async (
     return null;
   }
 
-  let nonce: null | string = issued ?? null;
+  let nonce: null | string = issued;
   if (nonce === null) {
     const requested = await attempt.waitFor(
-      requestNonce(action, environmentToken ?? null, signal),
+      requestNonce(action, environmentToken, signal),
     );
     if (requested.kind === 'aborted') {
       host?.release();

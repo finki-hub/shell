@@ -8,7 +8,7 @@ class InteractionTarget extends EventTarget {
   }
 
   public closest(selector: string): InteractionTarget | null {
-    return this.persistent && selector === '[data-dialog-persistent]'
+    return selector === '[data-dialog-persistent]' && this.persistent
       ? this
       : null;
   }
