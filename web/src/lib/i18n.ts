@@ -1,228 +1,35 @@
-export type Language = 'en' | 'mk';
+import { en } from './locales/en.ts';
+import { mk } from './locales/mk.ts';
+import { sq } from './locales/sq.ts';
+import { tr } from './locales/tr.ts';
+
+export type Language = 'en' | 'mk' | 'sq' | 'tr';
 
 // Keep reasons and file errors in sync with their typed unions.
+export type Translations = Localized<typeof en>;
 
-const en = {
-  actions: {
-    cancel: 'Cancel',
-    dismiss: 'Dismiss',
-    download: 'Download files',
-    downloadAll: 'Download files',
-    downloadHome: 'Download home folder',
-    downloadTgz: 'tar.gz archive',
-    downloadZip: 'ZIP archive',
-    theme: 'Change theme',
-    upload: 'Upload files',
-  },
-  brand: 'FINKI Hub',
-  files: {
-    close: 'Close the file browser',
-    columnModified: 'Modified',
-    columnName: 'Name',
-    columnSize: 'Size',
-    create: 'Create',
-    delete: 'Delete',
-    deleteConfirm: 'Delete',
-    deleteTitle: 'Are you sure you want to delete this?',
-    download: 'Download',
-    downloadAll: 'Download everything',
-    downloadCurrent: 'Download current folder',
-    empty: 'This folder is empty',
-    errors: {
-      aborted: 'The upload was interrupted',
-      'bad-request': 'Invalid request',
-      conflict: 'A file or folder with that name already exists',
-      forbidden: 'The request was refused',
-      gone: 'The environment is no longer available',
-      'insufficient-storage': 'Not enough space left',
-      malformed: 'The environment returned an invalid response',
-      network: 'The connection was lost',
-      'not-found': 'File or folder no longer exists',
-      'rate-limited': 'Too many requests — try again later',
-      'too-large': 'The file is too large',
-      unavailable: 'The environment is temporarily unavailable',
-    },
-    home: 'Home',
-    invalidName: 'A name cannot be empty or contain a slash',
-    loading: 'Loading…',
-    name: 'Name',
-    newFolder: 'New folder',
-    open: 'Open folder',
-    parent: 'Up one level',
-    refresh: 'Refresh list',
-    rename: 'Rename',
-    title: 'Files',
-    toggle: 'File browser',
-    uploadCancel: 'Cancel upload',
-    uploadClear: 'Clear finished uploads',
-    uploaded: 'Uploaded',
-    uploads: 'Uploads',
-  },
-  reasons: {
-    capacity: 'No capacity for a new environment — try again later.',
-    'challenge-blocked':
-      'Verification could not load: something on this network or in this browser is blocking challenges.cloudflare.com.',
-    'challenge-failed': 'Verification failed — try again.',
-    'challenge-required':
-      'The session ended: a verification check went unanswered. Your files are preserved.',
-    'challenge-unanswered':
-      'The verification was not completed in time — try again.',
-    'connection-lost': 'The connection to the environment was lost.',
-    'environment-expired':
-      'This environment no longer exists. A new one will be started.',
-    idle: 'The session ended due to inactivity. Your files are preserved.',
-    'shell-exited': 'The terminal exited. Your files are preserved.',
-    'start-failed': 'The environment could not be started.',
-    'terminal-limit': 'Tab limit reached. Close another tab first.',
-    unreachable: 'The server could not be reached. Check your connection.',
-  },
-  session: {
-    challengeStartBody: 'Verify you are human to start an environment.',
-    challengeTitle: 'Verification',
-    challengeVerifying: 'Verifying…',
-    'connecting-terminal': 'connecting…',
-    deleting: 'deleting…',
-    ended: 'ended',
-    loading: {
-      'connecting-terminal': 'Connecting terminal…',
-      deleting: 'Deleting old environment…',
-      preparing: 'Preparing environment…',
-      starting: 'Starting environment…',
-    },
-    newEnvironmentBody:
-      'This deletes the current environment and all data in it. Download anything you want to keep first.',
-    newEnvironmentConfirm: 'Start a new one',
-    newEnvironmentNotDownloaded: 'The old environment was deleted',
-    newEnvironmentTitle: 'Start a new environment?',
-    preparing: 'preparing…',
-    running: 'running',
-    starting: 'starting…',
-    startNew: 'Start a new environment',
-    tryAgain: 'Try again',
-  },
-  storage: {
-    files: 'files',
-    full: 'Almost out of space — new files may fail to save. Delete something to make space.',
-    title: 'Home directory usage',
-  },
-  title: 'Shell',
-  upload: {
-    dropHere: 'Drop files to upload them into the current folder',
-    progress: 'Upload progress',
-  },
-} as const;
+type Localized<T> = T extends string
+  ? string
+  : { readonly [Key in keyof T]: Localized<T[Key]> };
 
-const mk = {
-  actions: {
-    cancel: 'Откажи',
-    dismiss: 'Затвори',
-    download: 'Преземи ги датотеките',
-    downloadAll: 'Преземи ги датотеките',
-    downloadHome: 'Преземи ја домашната папка',
-    downloadTgz: 'tar.gz архива',
-    downloadZip: 'ZIP архива',
-    theme: 'Промени тема',
-    upload: 'Прикачи датотеки',
-  },
-  brand: 'ФИНКИ Хаб',
-  files: {
-    close: 'Затвори го прелистувачот на датотеки',
-    columnModified: 'Изменето',
-    columnName: 'Име',
-    columnSize: 'Големина',
-    create: 'Создај',
-    delete: 'Избриши',
-    deleteConfirm: 'Избриши',
-    deleteTitle: 'Дали сте сигурни дека сакате да го избришете ова?',
-    download: 'Преземи',
-    downloadAll: 'Преземи сè',
-    downloadCurrent: 'Преземи ја тековната папка',
-    empty: 'Оваа папка е празна',
-    errors: {
-      aborted: 'Прикачувањето беше прекинато',
-      'bad-request': 'Невалидно барање',
-      conflict: 'Веќе постои датотека или папка со тоа име',
-      forbidden: 'Барањето беше одбиено',
-      gone: 'Околината повеќе не е достапна',
-      'insufficient-storage': 'Нема доволно слободен простор',
-      malformed: 'Околината врати невалиден одговор',
-      network: 'Врската беше изгубена',
-      'not-found': 'Датотеката или папката повеќе не постои',
-      'rate-limited': 'Премногу барања — обидете се подоцна',
-      'too-large': 'Датотеката е преголема',
-      unavailable: 'Околината е привремено недостапна',
-    },
-    home: 'Дома',
-    invalidName: 'Името не смее да биде празно или да содржи коса црта',
-    loading: 'Се вчитува…',
-    name: 'Име',
-    newFolder: 'Нова папка',
-    open: 'Отвори ја папката',
-    parent: 'Едно ниво погоре',
-    refresh: 'Освежи ја листата',
-    rename: 'Преименувај',
-    title: 'Датотеки',
-    toggle: 'Прелистувач на датотеки',
-    uploadCancel: 'Откажи го прикачувањето',
-    uploadClear: 'Исчисти ги завршените прикачувања',
-    uploaded: 'Прикачено',
-    uploads: 'Прикачувања',
-  },
-  reasons: {
-    capacity: 'Нема капацитет за нова околина — обидете се подоцна.',
-    'challenge-blocked':
-      'Проверката не може да се вчита: нешто на мрежата или во прелистувачот го блокира challenges.cloudflare.com.',
-    'challenge-failed': 'Проверката не успеа — обидете се повторно.',
-    'challenge-required':
-      'Сесијата заврши: проверката остана без одговор. Вашите датотеки се зачувани.',
-    'challenge-unanswered':
-      'Проверката не беше завршена навреме — обидете се повторно.',
-    'connection-lost': 'Врската со околината беше изгубена.',
-    'environment-expired':
-      'Околината повеќе не постои. Ќе биде подигната нова.',
-    idle: 'Сесијата заврши поради неактивност. Вашите датотеки се зачувани.',
-    'shell-exited': 'Терминалот заврши. Вашите датотеки се зачувани.',
-    'start-failed': 'Околината не можеше да се подигне.',
-    'terminal-limit':
-      'Достигнат е лимитот на јазичиња. Затворете едно од постоечките.',
-    unreachable: 'Серверот е недостапен. Проверете ја врската.',
-  },
-  session: {
-    challengeStartBody: 'Потврдете дека сте човек за да подигнете околина.',
-    challengeTitle: 'Потврда',
-    challengeVerifying: 'Се потврдува…',
-    'connecting-terminal': 'поврзување…',
-    deleting: 'бришење…',
-    ended: 'завршена',
-    loading: {
-      'connecting-terminal': 'Поврзување со терминалот…',
-      deleting: 'Бришење на старата околина…',
-      preparing: 'Подготовка на околината…',
-      starting: 'Подигање на околината…',
-    },
-    newEnvironmentBody:
-      'Ова ја брише тековната околина и сите податоци во неа. Прво преземете го тоа што сакате да го задржите.',
-    newEnvironmentConfirm: 'Започни нова',
-    newEnvironmentNotDownloaded: 'Старата околина беше избришана',
-    newEnvironmentTitle: 'Дали сакате да подигнете нова околина?',
-    preparing: 'подготовка…',
-    running: 'активна',
-    starting: 'подигање…',
-    startNew: 'Подигни нова околина',
-    tryAgain: 'Обиди се повторно',
-  },
-  storage: {
-    files: 'датотеки',
-    full: 'Снемува слободен простор — зачувувањето на нови датотеки може да не успее. Избришете нешто за да ослободите простор.',
-    title: 'Искористеност на домашниот директориум',
-  },
-  title: 'Школка',
-  upload: {
-    dropHere: 'Повлечете датотеки за да ги прикачите во тековната папка',
-    progress: 'Прогрес на прикачувањето',
-  },
-} as const;
+export const translations: Record<Language, Translations> = { en, mk, sq, tr };
 
-export const translations = { en, mk } as const;
+export const languageNames = {
+  en: 'English',
+  mk: 'Македонски',
+  sq: 'Shqip',
+  tr: 'Türkçe',
+} as const satisfies Record<Language, string>;
 
-export type Translations = (typeof translations)[Language];
+export const languageLocales: Record<Language, string> = {
+  en: 'en-GB',
+  mk: 'mk-MK',
+  sq: 'sq-AL',
+  tr: 'tr-TR',
+};
+
+export const isLanguage = (value: unknown): value is Language =>
+  typeof value === 'string' && Object.hasOwn(translations, value);
+
+export const formatNumber = (value: number, language: Language): string =>
+  new Intl.NumberFormat(languageLocales[language]).format(value);

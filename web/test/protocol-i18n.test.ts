@@ -23,30 +23,23 @@ const collator = new Intl.Collator('en');
 const sorted = (values: readonly string[]): readonly string[] =>
   values.toSorted((left, right) => collator.compare(left, right));
 
-describe('outcome translations', () => {
-  it('has one nonempty string per end reason in both languages', () => {
-    expect(sorted(Object.keys(translations.en.reasons))).toEqual(
-      sorted(END_REASONS),
-    );
-    expect(sorted(Object.keys(translations.mk.reasons))).toEqual(
-      sorted(END_REASONS),
-    );
-    for (const reason of END_REASONS) {
-      expect(translations.en.reasons[reason]).not.toBe('');
-      expect(translations.mk.reasons[reason]).not.toBe('');
-    }
-  });
+describe.each(Object.entries(translations))(
+  '%s outcome translations',
+  (_language, t) => {
+    it('has one nonempty string per end reason', () => {
+      expect(sorted(Object.keys(t.reasons))).toEqual(sorted(END_REASONS));
+      for (const reason of END_REASONS) {
+        expect(t.reasons[reason]).not.toBe('');
+      }
+    });
 
-  it('has one nonempty string per contents error in both languages', () => {
-    expect(sorted(Object.keys(translations.en.files.errors))).toEqual(
-      sorted(CONTENTS_ERRORS),
-    );
-    expect(sorted(Object.keys(translations.mk.files.errors))).toEqual(
-      sorted(CONTENTS_ERRORS),
-    );
-    for (const kind of CONTENTS_ERRORS) {
-      expect(translations.en.files.errors[kind]).not.toBe('');
-      expect(translations.mk.files.errors[kind]).not.toBe('');
-    }
-  });
-});
+    it('has one nonempty string per contents error', () => {
+      expect(sorted(Object.keys(t.files.errors))).toEqual(
+        sorted(CONTENTS_ERRORS),
+      );
+      for (const kind of CONTENTS_ERRORS) {
+        expect(t.files.errors[kind]).not.toBe('');
+      }
+    });
+  },
+);

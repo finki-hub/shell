@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react';
 
-import { type Language, translations } from '@/lib/i18n';
+import { isLanguage, type Language, translations } from '@/lib/i18n';
+import { updatePageMetadata } from '@/lib/page-metadata';
 
 import { LanguageContext } from './LanguageContext';
 
@@ -16,7 +17,7 @@ export const LanguageProvider = ({
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
 
-      if (saved === 'mk' || saved === 'en') {
+      if (isLanguage(saved)) {
         return saved;
       }
     } catch {
@@ -37,9 +38,7 @@ export const LanguageProvider = ({
   };
 
   useEffect(() => {
-    const copy = translations[language];
-    document.documentElement.lang = language;
-    document.title = `${copy.brand} / ${copy.title}`;
+    updatePageMetadata(language, document);
   }, [language]);
 
   const t = translations[language];

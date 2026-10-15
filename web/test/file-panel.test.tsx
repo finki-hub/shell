@@ -309,9 +309,10 @@ describe('file panel model', () => {
   });
 
   it('has localized panel text for every contents failure', () => {
-    for (const kind of CONTENTS_ERRORS) {
-      expect(translations.en.files.errors[kind]).not.toBe('');
-      expect(translations.mk.files.errors[kind]).not.toBe('');
+    for (const t of Object.values(translations)) {
+      for (const kind of CONTENTS_ERRORS) {
+        expect(t.files.errors[kind]).not.toBe('');
+      }
     }
   });
 });

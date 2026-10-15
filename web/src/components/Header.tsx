@@ -3,7 +3,7 @@ import { useRef } from 'react';
 import { siGithub } from 'simple-icons';
 
 import { DownloadMenu } from '@/components/header/DownloadMenu';
-import { LanguageToggle } from '@/components/header/LanguageToggle';
+import { LanguageSelect } from '@/components/header/LanguageSelect';
 import { StorageBadge } from '@/components/header/StorageBadge';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { IconButton, IconLink } from '@/components/ui/icon-controls';
@@ -143,10 +143,6 @@ export const Header = ({
               className="h-4 w-4"
             />
           </IconButton>
-          <LanguageToggle
-            language={language}
-            setLanguage={setLanguage}
-          />
           <span
             className="hidden sm:inline-flex"
             data-dialog-persistent=""
@@ -160,6 +156,11 @@ export const Header = ({
               <GitHubIcon />
             </IconLink>
           </span>
+          <LanguageSelect
+            label={t.language}
+            language={language}
+            setLanguage={setLanguage}
+          />
           <ThemeToggle />
         </div>
       </div>
