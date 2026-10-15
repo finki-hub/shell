@@ -8,6 +8,7 @@ import {
 
 import { useLanguage } from '@/hooks/useLanguage';
 import { type ContentsEntry } from '@/lib/contents-api';
+import { languageLocales } from '@/lib/i18n';
 import { formatBytes } from '@/lib/storage';
 
 type EntryRowProps = RowActions & {
@@ -42,7 +43,7 @@ const EntryRow = ({
   const isDirectory = entry.type === 'directory';
   // eslint-disable-next-line unicorn/prefer-temporal -- Temporal is not available in every browser this ships to
   const modified = new Date(entry.modifiedAt);
-  const when = modified.toLocaleString(language === 'mk' ? 'mk-MK' : 'en-GB', {
+  const when = modified.toLocaleString(languageLocales[language], {
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
@@ -82,11 +83,13 @@ const EntryRow = ({
         </span>
       )}
       <span className="w-14 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-        {isDirectory || entry.size === null ? '—' : formatBytes(entry.size)}
+        {isDirectory || entry.size === null
+          ? '—'
+          : formatBytes(entry.size, language)}
       </span>
       <span
         className="hidden w-28 shrink-0 text-right text-xs tabular-nums text-muted-foreground sm:block"
-        title={modified.toLocaleString()}
+        title={modified.toLocaleString(languageLocales[language])}
       >
         {when}
       </span>

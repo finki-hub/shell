@@ -225,6 +225,23 @@ image can be pulled with the rest of the stack; the Hub creates the actual user 
 - Accepting the refresh or tab-close prompt closes the terminal. The environment's home files
   remain until its retention limit is reached or the user starts a new environment.
 
+## Localization
+
+The web interface supports Macedonian (the default), English, Albanian, and Turkish.
+The header language selector uses the same control as the FINKI Hub homepage.
+It saves the choice under `finki-hub-lang` in local storage; unavailable storage
+falls back to Macedonian and still allows language changes in memory.
+
+UI dictionaries live in `web/src/lib/locales/`. The English dictionary defines
+the shared `Translations` shape in `web/src/lib/i18n.ts`; each language must
+provide the same keys. Dates and numbers use the selected locale. Language
+changes update the page title, description, social metadata, and document
+language without resetting the session, file browser, or open dialogs.
+The initial HTML uses Macedonian metadata from the same dictionary.
+
+Terminal output, filenames, paths, and messages returned by the environment
+remain in their original language.
+
 ## Local Checks
 
 The Python projects require Python 3.14 and [`uv`](https://docs.astral.sh/uv/).

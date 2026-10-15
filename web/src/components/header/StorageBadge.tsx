@@ -1,4 +1,5 @@
 import { useLanguage } from '@/hooks/useLanguage';
+import { formatNumber } from '@/lib/i18n';
 import {
   formatBytes,
   formatUsage,
@@ -20,7 +21,7 @@ const fillClass = (percent: number) => {
 };
 
 export const StorageBadge = ({ usage }: { readonly usage: StorageUsage }) => {
-  const { t } = useLanguage();
+  const { language, t } = useLanguage();
   const percent = storagePercent(usage);
   const full = isStorageFull(usage);
 
@@ -32,7 +33,7 @@ export const StorageBadge = ({ usage }: { readonly usage: StorageUsage }) => {
           ? 'inline-flex border-destructive text-destructive'
           : 'hidden border-input bg-background text-muted-foreground',
       )}
-      title={`${t.storage.title}: ${formatBytes(usage.usedBytes)} / ${formatBytes(usage.totalBytes)} · ${usage.inodesUsed} / ${usage.inodesTotal} ${t.storage.files}`}
+      title={`${t.storage.title}: ${formatBytes(usage.usedBytes, language)} / ${formatBytes(usage.totalBytes, language)} · ${formatNumber(usage.inodesUsed, language)} / ${formatNumber(usage.inodesTotal, language)} ${t.storage.files}`}
     >
       {/* Native progress exposes storage usage to assistive technology. */}
       <progress
@@ -46,7 +47,9 @@ export const StorageBadge = ({ usage }: { readonly usage: StorageUsage }) => {
         max={100}
         value={Math.max(percent > 0 ? 4 : 0, percent)}
       />
-      <span className="font-mono tabular-nums">{formatUsage(usage)}</span>
+      <span className="font-mono tabular-nums">
+        {formatUsage(usage, language)}
+      </span>
     </span>
   );
 };

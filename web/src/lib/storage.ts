@@ -1,3 +1,4 @@
+import { formatNumber, type Language, languageLocales } from '@/lib/i18n';
 import { type StorageUsage } from '@/lib/storage-api';
 
 export const storagePercent = (usage: StorageUsage) => {
@@ -17,26 +18,36 @@ export const isStorageFull = (usage: StorageUsage) =>
 
 const MB = 1_024 * 1_024;
 
-export const formatUsage = (usage: StorageUsage) => {
+export const formatUsage = (usage: StorageUsage, language: Language) => {
   const total = usage.totalBytes / MB;
   const used = usage.usedBytes / MB;
   const decimals = total < 10 ? 1 : 0;
 
-  return `${used.toFixed(decimals)} / ${total.toFixed(decimals)} MB`;
+  const formatter = new Intl.NumberFormat(languageLocales[language], {
+    maximumFractionDigits: decimals,
+    minimumFractionDigits: decimals,
+  });
+
+  return `${formatter.format(used)} / ${formatter.format(total)} MB`;
 };
 
-export const formatBytes = (bytes: number) => {
+export const formatBytes = (bytes: number, language: Language) => {
   if (bytes < 1_024) {
-    return `${bytes} B`;
+    return `${formatNumber(bytes, language)} B`;
   }
 
   const megabytes = bytes / (1_024 * 1_024);
 
   if (megabytes < 1) {
-    return `${Math.round(bytes / 1_024)} KB`;
+    return `${formatNumber(Math.round(bytes / 1_024), language)} KB`;
   }
 
   const decimals = megabytes < 10 ? 1 : 0;
 
-  return `${megabytes.toFixed(decimals)} MB`;
+  const formatted = new Intl.NumberFormat(languageLocales[language], {
+    maximumFractionDigits: decimals,
+    minimumFractionDigits: decimals,
+  }).format(megabytes);
+
+  return `${formatted} MB`;
 };

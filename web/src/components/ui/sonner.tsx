@@ -1,13 +1,16 @@
 import { Toaster as Sonner } from 'sonner';
 
+import { useLanguage } from '@/hooks/useLanguage';
 import { useTheme } from '@/hooks/useTheme';
 
 export const Toaster = (props: Parameters<typeof Sonner>[0]) => {
   const theme = useTheme();
+  const { t } = useLanguage();
 
   return (
     <Sonner
       className="toaster group"
+      containerAriaLabel={t.notifications}
       richColors
       theme={theme}
       toastOptions={{
