@@ -2,8 +2,20 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'node:path';
 
+import { localizeHtml } from './src/lib/page-metadata.ts';
+
 const config = {
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: 'localized-page-metadata',
+      transformIndexHtml: {
+        handler: (html) => localizeHtml(html),
+        order: 'pre',
+      },
+    },
+  ],
   resolve: {
     alias: {
       '@': resolve(import.meta.dirname, './src'),
