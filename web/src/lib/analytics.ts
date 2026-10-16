@@ -70,7 +70,7 @@ const analyticsOptions = (host: string) =>
     [postHogOption.advancedDisableToolbarMetrics]: true,
     [postHogOption.apiHost]: host,
     [postHogOption.beforeSend]: (event) =>
-      event?.event === 'lab_protocol_failure' ? event : null,
+      event.event === 'lab_protocol_failure' ? event : null,
     [postHogOption.captureDeadClicks]: false,
     [postHogOption.captureExceptions]: false,
     [postHogOption.captureHeatmaps]: false,
