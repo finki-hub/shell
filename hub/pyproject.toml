@@ -10,7 +10,7 @@ dependencies = [
     "jupyterhub>=6.0.1,<6.1",
     "jupyterhub-idle-culler>=2.0.0",
     "pydantic>=2.14.1",
-    "pydantic-settings>=2.15.0",
+    "pydantic-settings>=2.16.0",
     "requests>=2.34.2",
     "tzdata>=2026.5",
 ]
