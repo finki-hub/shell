@@ -6,7 +6,7 @@
     "@xterm/xterm": "^6.0.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.55.0",
-    "posthog-js": "^1.438.9",
+    "posthog-js": "^1.438.12",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "simple-icons": "^16.35.0",
