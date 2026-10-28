@@ -19,7 +19,6 @@ type BrowserAnalyticsInput = {
 const defaultAnalyticsHost = 'https://eu.i.posthog.com';
 
 const postHogOption = {
-  advancedDisableDecide: 'advanced_disable_decide',
   advancedDisableFeatureFlags: 'advanced_disable_feature_flags',
   advancedDisableFeatureFlagsOnFirstLoad:
     'advanced_disable_feature_flags_on_first_load',
@@ -63,7 +62,6 @@ const analyticsOptions = (host: string) =>
     autocapture: false,
     disableDeviceModel: true,
     persistence: 'memory',
-    [postHogOption.advancedDisableDecide]: true,
     [postHogOption.advancedDisableFeatureFlags]: true,
     [postHogOption.advancedDisableFeatureFlagsOnFirstLoad]: true,
     [postHogOption.advancedDisableFlags]: true,

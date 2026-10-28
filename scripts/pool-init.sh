@@ -14,7 +14,7 @@
 # or already-mounted pool directories.
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
+if [[ "$#" -ne 2 ]]; then
     echo "usage: $0 <pool-dir> <size>" >&2
     echo "  <size> is anything mkfs/fallocate accepts, e.g. 150G" >&2
     exit 1
@@ -23,7 +23,7 @@ fi
 POOL_DIR=$1
 SIZE=$2
 
-if [ "$(id -u)" -ne 0 ]; then
+if [[ "$(id -u)" -ne 0 ]]; then
     echo "pool-init.sh must run as root (it writes /etc/fstab and mounts a filesystem)." >&2
     exit 1
 fi
@@ -54,7 +54,7 @@ if grep -qsE "^[^#[:space:]]+[[:space:]]+${POOL_DIR}[[:space:]]" /etc/fstab; the
     exit 1
 fi
 
-if [ -e "$POOL_DIR" ] && [ -n "$(ls -A "$POOL_DIR" 2> /dev/null)" ]; then
+if [[ -e "$POOL_DIR" ]] && [[ -n "$(ls -A "$POOL_DIR" 2> /dev/null)" ]]; then
     echo "pool-init.sh: $POOL_DIR already exists and is not empty; refusing to reinitialize it." >&2
     exit 1
 fi

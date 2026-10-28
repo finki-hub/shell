@@ -103,7 +103,7 @@ class LoginBackend(Protocol):
     def home_exists(self, username: str) -> bool: ...
     def free_space_ok(self) -> bool: ...
     async def verify_turnstile(self, token: str | None) -> TurnstileVerdict: ...
-    async def create_environment(self, username: str) -> None: ...
+    def create_environment(self, username: str) -> None: ...
     def issue(self, username: str, *, created: bool) -> LoginResponse: ...
 
 
@@ -150,7 +150,7 @@ async def perform_login(backend: LoginBackend, request: LoginRequest) -> LoginRe
     if verdict.error is not None:
         raise LoginError(403, verdict.error, verdict.reason)
 
-    await backend.create_environment(username)
+    backend.create_environment(username)
     return backend.issue(username, created=True)
 
 
@@ -184,7 +184,6 @@ def check_login_headers(content_type: str | None, fetch_site: str | None) -> Non
 class LabLoginHandler(BaseHandler):  # type: ignore[misc] # jupyterhub ships no type information
     def check_xsrf_cookie(self) -> None:
         """The credential is in the body, so cookie XSRF checks do not apply."""
-        return
 
     async def post(self) -> None:
         try:
@@ -263,7 +262,7 @@ class _HubLoginBackend:
         async with httpx.AsyncClient() as client:
             return await check(secret.get_secret_value(), client, token)
 
-    async def create_environment(self, username: str) -> None:
+    def create_environment(self, username: str) -> None:
         self._handler.user_from_username(username)
 
     def issue(self, username: str, *, created: bool) -> LoginResponse:

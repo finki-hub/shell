@@ -58,7 +58,8 @@ def test_username_is_the_truncated_sha256_of_the_token() -> None:
 def test_username_is_stable_and_collision_free_for_neighbours() -> None:
     other = "AbC012_-" * 3 + "AbC012_X"
 
-    assert username_for_token(VALID_TOKEN) == username_for_token(VALID_TOKEN)
+    first = username_for_token(VALID_TOKEN)
+    assert username_for_token(VALID_TOKEN) == first
     assert username_for_token(VALID_TOKEN) != username_for_token(other)
 
 

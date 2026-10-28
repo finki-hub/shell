@@ -1,7 +1,7 @@
-FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
 # Keep /opt/jupyter/bin off PATH to separate server Python from shell Python.
-FROM ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944 AS jupyter
+FROM ubuntu:26.10@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118 AS jupyter
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -12,19 +12,20 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1
 
-RUN uv python install 3.14
+RUN uv python install 3.15.2
 
 WORKDIR /src
 
 COPY extension/pyproject.toml extension/uv.lock extension/.python-version ./
-RUN uv sync --frozen --no-dev --no-editable --no-install-project
+RUN uv sync --frozen --no-dev --no-editable --no-install-project --no-build
 
 COPY extension/ ./
 # Install non-editably so runtime does not depend on this stage's source tree;
 # the extension config installs under /opt/jupyter/etc/jupyter for startup.
-RUN uv sync --frozen --no-dev --no-editable
+RUN uv build --wheel --out-dir /wheels \
+    && uv pip install --python /opt/jupyter/bin/python --no-deps --no-build /wheels/*.whl
 
-FROM ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
+FROM ubuntu:26.10@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118
 
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \

@@ -48,7 +48,9 @@
   padding-inline: 1.5rem;
 
   @media (min-width: 80rem) {
-    max-width: var(--container-2xl);
+    & {
+      max-width: var(--container-2xl);
+    }
   }
 }
 

@@ -30,9 +30,9 @@ df -i "$POOL_DIR" 2> /dev/null || echo "df -i: $POOL_DIR not available"
 echo
 
 bold "== Per-project quota usage =="
-if [ ! -f "$POOL_DIR/.pool-id" ]; then
+if [[ ! -f "$POOL_DIR/.pool-id" ]]; then
     echo "$POOL_DIR/.pool-id not found; pool is not initialized (see scripts/pool-init.sh)."
-elif [ "$(id -u)" -ne 0 ]; then
+elif [[ "$(id -u)" -ne 0 ]]; then
     echo "xfs_quota needs root; re-run with sudo for the per-project report."
 elif ! command -v xfs_quota > /dev/null 2>&1; then
     echo "xfs_quota not found; install xfsprogs on the host."
@@ -42,7 +42,7 @@ fi
 echo
 
 bold "== Environments on disk =="
-if [ -d "$POOL_DIR/users" ]; then
+if [[ -d "$POOL_DIR/users" ]]; then
     COUNT=$(find "$POOL_DIR/users" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
     echo "$COUNT environment(s) under $POOL_DIR/users"
     find "$POOL_DIR/users" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort

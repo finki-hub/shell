@@ -210,10 +210,11 @@ def test_a_username_that_could_escape_the_pool_is_refused(
     record: Callable[[Sequence[str]], None],
     username: str,
 ) -> None:
+    settings = make_settings()
     with pytest.raises(QuotaError, match="invalid username"):
-        provision_home(make_settings(), username, run=record)
+        provision_home(settings, username, run=record)
     with pytest.raises(QuotaError, match="invalid username"):
-        remove_home(make_settings(), username, run=record)
+        remove_home(settings, username, run=record)
 
 
 def test_every_mutation_holds_the_pool_lock(
@@ -383,8 +384,9 @@ def test_ensure_home_refuses_a_pool_without_project_quotas(
         readiness, "MOUNTINFO", mountinfo(str(pool), "ext4 /dev/sda1 rw,noatime")
     )
 
+    settings = make_settings()
     with pytest.raises(PoolAssertionError, match="pool-not-xfs"):
-        ensure_home(make_settings(), "abcdef", run=record)
+        ensure_home(settings, "abcdef", run=record)
 
     assert not (pool / "users" / "abcdef").exists()
 

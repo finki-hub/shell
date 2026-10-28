@@ -218,6 +218,36 @@ describe('file panel model', () => {
     ]);
   });
 
+  it('serializes uploads added while another upload is running', async () => {
+    const first = Promise.withResolvers<{ ok: true; value: true }>();
+    const second = Promise.withResolvers<{ ok: true; value: true }>();
+    services.uploadFile
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const setTransferring = vi.fn();
+    const queue = useUploadQueue({
+      directory: () => '',
+      onSettled: vi.fn(),
+      session: SESSION,
+      setTransferring,
+    });
+
+    queue.enqueue([new File(['one'], 'one.txt')]);
+    queue.enqueue([new File(['two'], 'two.txt')]);
+    await flush();
+    expect(services.uploadFile).toHaveBeenCalledOnce();
+
+    first.resolve({ ok: true, value: true });
+    await flush();
+    expect(services.uploadFile).toHaveBeenCalledTimes(2);
+    expect(services.uploadFile.mock.calls[1]?.[1]?.file.name).toBe('two.txt');
+    expect(setTransferring.mock.calls).toEqual([[true]]);
+
+    second.resolve({ ok: true, value: true });
+    await flush();
+    expect(setTransferring.mock.calls).toEqual([[true], [false]]);
+  });
+
   it('returns queued IDs for main-screen upload progress', () => {
     services.uploadFile.mockReturnValue(new Promise(() => {}));
     const queue = useUploadQueue({
@@ -314,5 +344,157 @@ describe('file panel model', () => {
         expect(t.files.errors[kind]).not.toBe('');
       }
     }
+  });
+});
+
+const createEntry = (
+  name: string,
+  type: ContentsEntry['type'],
+): ContentsEntry => ({
+  modifiedAt: '',
+  name,
+  path: `work/${name}`,
+  size: null,
+  type,
+});
+
+describe('file panel regression contracts', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRuntime();
+    services.createDirectory.mockResolvedValue({ ok: true, value: true });
+    services.listDirectory.mockResolvedValue({ ok: true, value: [] });
+    services.mintUrlToken.mockResolvedValue({ kind: 'token', token: 'short' });
+  });
+
+  it('sorts directory listings, navigates, and aborts on cleanup', async () => {
+    const folder = createEntry('folder', 'directory');
+    const file = createEntry('a.txt', 'file');
+    services.listDirectory.mockResolvedValue({
+      ok: true,
+      value: [createEntry('z.txt', 'file'), file, folder],
+    });
+    const files = useRenderedFiles(vi.fn());
+    const cleanups = runtime.effects.map((effect) => effect());
+    await flush();
+    expect(useRenderedFiles(vi.fn()).entries.map((item) => item.name)).toEqual([
+      'folder',
+      'a.txt',
+      'z.txt',
+    ]);
+    files.open(file);
+    expect(useRenderedFiles(vi.fn()).path).toBe('');
+    files.open(folder);
+    expect(useRenderedFiles(vi.fn()).path).toBe('work/folder');
+    files.navigate('elsewhere');
+    expect(useRenderedFiles(vi.fn()).path).toBe('elsewhere');
+    for (const cleanup of cleanups) cleanup?.();
+    expect(services.listDirectory.mock.calls[0]?.[2]?.aborted).toBe(true);
+  });
+
+  it('preserves Promise mutation and file-download contracts', async () => {
+    services.renameEntry.mockResolvedValue({ ok: true, value: true });
+    services.deleteEntry.mockResolvedValue({ ok: true, value: true });
+    services.fileDownloadUrl.mockReturnValue('file-url');
+    const refreshStorage = vi.fn();
+    const files = useRenderedFiles(refreshStorage);
+    const entry: ContentsEntry = {
+      modifiedAt: '',
+      name: 'old.txt',
+      path: 'work/old.txt',
+      size: 1,
+      type: 'file',
+    };
+    await expect(files.rename(entry, 'new.txt')).resolves.toBeNull();
+    expect(services.renameEntry).toHaveBeenCalledWith(SESSION, {
+      newPath: 'work/new.txt',
+      path: 'work/old.txt',
+    });
+    await expect(files.remove(entry)).resolves.toBeNull();
+    expect(services.deleteEntry).toHaveBeenCalledWith(SESSION, entry.path);
+    await expect(files.downloadFile(entry)).resolves.toBeNull();
+    expect(services.fileDownloadUrl).toHaveBeenCalledWith(
+      SESSION,
+      entry.path,
+      'short',
+    );
+    expect(services.startDownload).toHaveBeenCalledWith('file-url');
+    expect(refreshStorage).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns service failures without refreshing or starting downloads', async () => {
+    const failure = {
+      error: { kind: 'forbidden', message: null, status: 403 },
+      ok: false,
+    } as const;
+    services.createDirectory.mockResolvedValue(failure);
+    services.listDirectory.mockResolvedValue(failure);
+    services.mintUrlToken.mockResolvedValue({
+      failure: { kind: 'network' },
+      kind: 'failed',
+    });
+    const refreshStorage = vi.fn();
+    const files = useRenderedFiles(refreshStorage);
+    await expect(files.createFolder('blocked')).resolves.toBe('forbidden');
+    expect(useRenderedFiles(refreshStorage).busy).toBe(false);
+    files.refresh();
+    await flush();
+    expect(useRenderedFiles(refreshStorage).error).toBe('forbidden');
+    await expect(files.downloadDirectory('', 'zip')).resolves.toBe(
+      'unavailable',
+    );
+    expect(refreshStorage).not.toHaveBeenCalled();
+    expect(services.startDownload).not.toHaveBeenCalled();
+  });
+
+  it('does not perform work without a session', async () => {
+    const files = useFiles({
+      markActive: vi.fn(),
+      refreshStorage: vi.fn(),
+      session: null,
+      setTransferring: vi.fn(),
+      storage: null,
+    });
+    files.refresh();
+    expect(files.enqueue([new File(['a'], 'a.txt')])).toEqual([]);
+    await expect(files.createFolder('new')).resolves.toBe('gone');
+    await expect(files.downloadDirectory('', 'zip')).resolves.toBe('gone');
+    expect(services.listDirectory).not.toHaveBeenCalled();
+    expect(services.createDirectory).not.toHaveBeenCalled();
+  });
+
+  it('clears only finished uploads and resets pending work on a session change', async () => {
+    const first = Promise.withResolvers<ContentsResult<true>>();
+    services.uploadFile.mockReturnValueOnce(first.promise);
+    const onSettled = vi.fn();
+    const useRenderedQueue = () => {
+      runtime.cursor = 0;
+      return useUploadQueue({
+        directory: () => '',
+        onSettled,
+        session: SESSION,
+        setTransferring: vi.fn(),
+      });
+    };
+    const queue = useRenderedQueue();
+    expect(queue.enqueue([])).toEqual([]);
+    queue.enqueue([new File(['a'], 'a.txt'), new File(['b'], 'b.txt')]);
+    queue.cancelUpload(999);
+    queue.cancelUpload(2);
+    queue.clearFinished();
+    expect(useRenderedQueue().uploads.map((upload) => upload.name)).toEqual([
+      'a.txt',
+    ]);
+    const signal = services.uploadFile.mock.calls[0]?.[1]?.signal;
+    runtime.effects[0]?.();
+    expect(signal?.aborted).toBe(true);
+    expect(useRenderedQueue().uploads).toEqual([]);
+    first.resolve({
+      error: { kind: 'aborted', message: null, status: null },
+      ok: false,
+    });
+    await flush();
+    expect(onSettled).toHaveBeenCalledWith('', false);
+    expect(services.uploadFile).toHaveBeenCalledOnce();
   });
 });
