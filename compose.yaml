@@ -24,7 +24,7 @@ services:
     logging: *default-logging
 
   proxy:
-    image: quay.io/jupyterhub/configurable-http-proxy:5.3.0
+    image: quay.io/jupyterhub/configurable-http-proxy:5.3.0@sha256:69a7170eeedadb139dda5aef038d0a45378295c0d24cb0dc9da58641ef698ebe
     restart: unless-stopped
     network_mode: host
     command:

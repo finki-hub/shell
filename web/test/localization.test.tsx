@@ -135,7 +135,12 @@ describe('localization', () => {
   );
 
   it('builds Macedonian metadata by default', () => {
-    expect(localizeHtml(index)).toBe(localizeHtml(index, 'mk'));
+    const html = localizeHtml(index);
+    expect(html).toContain('lang="mk"');
+    expect(html).toContain(
+      `<title>${translations.mk.brand} / ${translations.mk.title}</title>`,
+    );
+    expect(html).not.toContain('__LOCALIZED_');
   });
 
   it.each(languages)(

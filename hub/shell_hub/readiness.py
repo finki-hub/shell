@@ -87,14 +87,14 @@ def pool_reasons(
         if not (facts.options & PRJQUOTA_OPTIONS):
             reasons.append("pool-without-prjquota")
 
-    sentinel = pool_mount / ".pool-id"
+    pool_id_path = pool_mount / ".pool-id"
     try:
-        pool_id = sentinel.read_text(encoding="utf-8").strip()
+        pool_id = pool_id_path.read_text(encoding="utf-8").strip()
     except OSError:
-        reasons.append(f"pool-id-missing: {sentinel}")
+        reasons.append(f"pool-id-missing: {pool_id_path}")
         return reasons
     if not pool_id:
-        reasons.append(f"pool-id-empty: {sentinel}")
+        reasons.append(f"pool-id-empty: {pool_id_path}")
     elif expected_pool_id is not None and pool_id != expected_pool_id:
         reasons.append("pool-id-mismatch")
     return reasons

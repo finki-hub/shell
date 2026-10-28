@@ -1,6 +1,10 @@
-FROM ubuntu:26.04 AS skel
+FROM ubuntu:26.10@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118 AS skel
 
-FROM ghcr.io/astral-sh/uv:python3.14-trixie AS builder
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
+
+FROM python:3.15.2-trixie@sha256:b9dc13dd9e9c69543a3a8ae44ecae5f6a17ddd45f52ac335315de0ff1d9a67ae AS builder
+
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_PYTHON_DOWNLOADS=0 \
@@ -11,13 +15,14 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --frozen --no-install-project --no-dev --no-build
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv build --wheel --out-dir /wheels \
+    && uv pip install --python /app/.venv/bin/python --no-deps --no-build /wheels/*.whl
 
-FROM python:3.15-trixie AS final
+FROM python:3.15.2-trixie@sha256:b9dc13dd9e9c69543a3a8ae44ecae5f6a17ddd45f52ac335315de0ff1d9a67ae AS final
 
 # Seed homes from the Ubuntu lab image\'s /etc/skel.
 COPY --from=skel /etc/skel /opt/skel

@@ -35,10 +35,6 @@ type PanelBodyProps = {
   readonly onRename: (entry: ContentsEntry) => void;
 };
 
-type Prompt =
-  | { readonly entry: ContentsEntry; readonly kind: 'rename' }
-  | { readonly kind: 'create' };
-
 const PanelBody = ({
   files,
   onDelete,
@@ -105,6 +101,9 @@ const PanelBody = ({
 };
 
 export const FilePanel = ({ container, files, onClose }: FilePanelProps) => {
+  type Prompt =
+    | { readonly entry: ContentsEntry; readonly kind: 'rename' }
+    | { readonly kind: 'create' };
   const { t } = useLanguage();
   const [deleting, setDeleting] = useState<ContentsEntry | null>(null);
   const [prompt, setPrompt] = useState<null | Prompt>(null);

@@ -22,13 +22,6 @@ export type UploadQueue = {
 
 export type UploadState = 'done' | 'failed' | 'running' | 'waiting';
 
-type Job = {
-  readonly controller: AbortController;
-  readonly directory: string;
-  readonly file: File;
-  readonly id: number;
-};
-
 type UseUploadQueueInput = {
   readonly directory: () => string;
   readonly onSettled: (directory: string, ok: boolean) => void;
@@ -46,6 +39,12 @@ export const useUploadQueue = ({
   session,
   setTransferring,
 }: UseUploadQueueInput): UploadQueue => {
+  type Job = {
+    readonly controller: AbortController;
+    readonly directory: string;
+    readonly file: File;
+    readonly id: number;
+  };
   const [uploads, setUploads] = useState<readonly FileUpload[]>([]);
 
   const idRef = useRef(0);
@@ -98,15 +97,21 @@ export const useUploadQueue = ({
     if (runningRef.current) return;
     runningRef.current = true;
     setTransferring(true);
-    try {
-      let job = pendingRef.current.shift();
-      while (job !== undefined) {
-        await runJob(job);
-        job = pendingRef.current.shift();
-      }
-    } finally {
+    // Read the queue after each job so newly enqueued work stays serial too.
+    const runNext = async (): Promise<void> => {
+      const job = pendingRef.current.shift();
+      if (job === undefined) return;
+      await runJob(job);
+      await runNext();
+    };
+    const finish = () => {
       runningRef.current = false;
       setTransferring(false);
+    };
+    try {
+      await runNext();
+    } finally {
+      finish();
     }
   }, [runJob, setTransferring]);
 

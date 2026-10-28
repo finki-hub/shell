@@ -72,7 +72,7 @@ class FakeBackend:
         self.turnstile_calls += 1
         return self._verdict
 
-    async def create_environment(self, username: str) -> None:
+    def create_environment(self, username: str) -> None:
         self.created.append(username)
 
     def issue(self, username: str, *, created: bool) -> LoginResponse:
@@ -161,8 +161,9 @@ def test_the_global_creation_limit_is_429(
     settings = make_settings(lab_max_creates_per_min=1)
 
     login(FakeBackend(settings), "create")
+    backend = FakeBackend(settings)
     with pytest.raises(LoginError) as refusal:
-        login(FakeBackend(settings), "create")
+        login(backend, "create")
 
     assert refusal.value.status == 429
     assert refusal.value.to_json() == {"error": "rate-limited", "reason": "create-rate"}
