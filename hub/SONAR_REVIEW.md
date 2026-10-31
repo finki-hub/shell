@@ -65,7 +65,7 @@ also reduce dependency-installation risks through wheel-only installation.
 
 Key `AaEyULsuC6DD4rHk_bZQ` points to `Path.is_file(follow_symlinks=False)` in
 `lab/extension/shell_lab_extension/__init__.py`, not a chmod call in the current
-source. Python added this keyword in 3.13, and both packages require 3.15.
+source. Python added this keyword in 3.13, and both packages require 3.14.
 Keep the argument: it prevents upload cleanup from treating a symlink target as
 a regular leftover file. `Path.chmod(follow_symlinks=False)` is likewise valid
 since Python 3.10 and must not be weakened if separately reported.
@@ -73,11 +73,12 @@ This finding is `FALSE_POSITIVE` with the version-specific API
 rationale, rather than changing safe code or marking it fixed.
 
 Primary API reference:
-https://docs.python.org/3.15/library/pathlib.html#pathlib.Path.is_file
+https://docs.python.org/3.14/library/pathlib.html#pathlib.Path.is_file
 
 ## Verification evidence
 
-Both projects were validated under WSL Ubuntu on CPython 3.15.2 using isolated
+Before the wheel-only installation correction below, both projects were
+validated under WSL Ubuntu on CPython 3.15.2 using isolated
 Linux virtual environments outside the repository. Hub: 129 tests passed. Lab:
 42 tests passed, including all bounded HTTP integration fixtures with pytest
 teardown; seven upstream warnings concern synchronous ContentsManager deprecation
@@ -89,3 +90,33 @@ new Python 3.15 `sentinel` builtin.
 Windows still lacks `fcntl` and `os.statvfs`, so native Windows execution is not
 the runtime evidence for these Linux deployment components. No checks were
 suppressed and no persistent standalone services were started.
+
+### Wheel-only runtime correction (PR91)
+
+The previous Python 3.15 validation did not establish clean wheel-only installs:
+PyYAML 6.0.3 has no CPython 3.15 wheel. Official uv settings document a global
+`no-build` switch and per-package build bans, but no reviewed package allowlist
+that overrides the reusable Ruff/mypy workflows' explicit `--no-build` switch.
+Those reusable workflows expose only a working-directory input. Rather than
+weakening that policy, both projects now use Python 3.14.10, with matching Python
+metadata, lockfiles, type/lint targets, documentation, and Docker runtimes.
+Reference: https://docs.astral.sh/uv/reference/settings/#no-build
+
+On WSL Ubuntu x86_64, fresh external environments and `uv --no-cache sync
+--locked --dev --no-install-project --no-build` succeeded for both projects
+(78 Hub and 111 Lab packages). The Docker dependency commands also succeeded
+with `--no-cache` in separate fresh external environments (66 Hub and 84 Lab
+packages). This excludes previously built cached wheels as an explanation.
+Cross-platform dry runs with the same CI flags succeeded for Linux aarch64,
+Windows x86_64, and macOS aarch64. uv's generic macOS x86_64 target failed on
+cryptography 50.0.2 (Hub) and argon2-cffi-bindings 26.1.0 (Lab); this is not a
+claim of universal wheel coverage or native non-Linux runtime support.
+Final WSL validation on Python 3.14.10 also passed: Hub 129 tests, Lab 42 tests
+(including HTTP integration fixtures), Ruff lint/format, mypy, and wheel/sdist
+builds for both projects. The seven Lab warnings are the upstream Jupyter
+synchronous ContentsManager deprecation noted above.
+
+Both Dockerfiles use digest-only image references with adjacent version comments
+for S8431, without analyzer suppressions. The Python 3.14.10-trixie multi-platform
+index digest was verified against Docker Hub's registry. Root Hub execution and
+the required internal HTTP endpoint remain unchanged.

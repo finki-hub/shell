@@ -1,7 +1,9 @@
-FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
+# uv 0.13.6
+FROM ghcr.io/astral-sh/uv@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
 # Keep /opt/jupyter/bin off PATH to separate server Python from shell Python.
-FROM ubuntu:26.10@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118 AS jupyter
+# Ubuntu 26.10
+FROM ubuntu@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118 AS jupyter
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -12,7 +14,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1
 
-RUN uv python install 3.15.2
+RUN uv python install 3.14.10
 
 WORKDIR /src
 
@@ -25,7 +27,8 @@ COPY extension/ ./
 RUN uv build --wheel --out-dir /wheels \
     && uv pip install --python /opt/jupyter/bin/python --no-deps --no-build /wheels/*.whl
 
-FROM ubuntu:26.10@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118
+# Ubuntu 26.10
+FROM ubuntu@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118
 
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \

@@ -26,7 +26,7 @@ quotas in the storage pool. Full-stack setup and configuration belong in the
 
 ## Local Checks
 
-Requires Python 3.15.2 and [`uv`](https://docs.astral.sh/uv/).
+Requires Python 3.14.10 and [`uv`](https://docs.astral.sh/uv/).
 
 ```sh
 cd hub

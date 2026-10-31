@@ -46,11 +46,11 @@
   width: 100%;
   margin-inline: auto;
   padding-inline: 1.5rem;
+}
 
-  @media (min-width: 80rem) {
-    & {
-      max-width: var(--container-2xl);
-    }
+@media (min-width: 80rem) {
+  .container {
+    max-width: var(--container-2xl);
   }
 }
 

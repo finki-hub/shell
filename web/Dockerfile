@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
-FROM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS build
+# node:26-alpine
+FROM node@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS build
 WORKDIR /repo
 
 COPY package.json package-lock.json ./
@@ -18,7 +19,8 @@ ENV VITE_POSTHOG_KEY=$VITE_POSTHOG_KEY \
 
 RUN npm run build --workspace web
 
-FROM caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+# caddy:2.11.7-alpine
+FROM caddy@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
 
 RUN addgroup -S -g 10001 caddy \
     && adduser -S -D -H -u 10001 -G caddy caddy \
