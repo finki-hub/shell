@@ -11,6 +11,8 @@ from shell_hub.quota import pre_spawn_hook
 from shell_hub.readiness import assert_pool
 from shell_hub.settings import COOKIE_MAX_AGE_DAYS, get_settings
 
+HUB_INTERNAL_URL = "http://172.30.0.1:8081"
+
 c = get_config()
 
 settings = get_settings()
@@ -21,8 +23,8 @@ lab_home = f"/home/{settings.lab_user}"
 quota_bytes = settings.lab_env_quota_mb * 1024 * 1024
 
 c.JupyterHub.bind_url = "http://127.0.0.1:8000"
-c.JupyterHub.hub_bind_url = "http://172.30.0.1:8081"
-c.JupyterHub.hub_connect_url = "http://172.30.0.1:8081"
+c.JupyterHub.hub_bind_url = HUB_INTERNAL_URL
+c.JupyterHub.hub_connect_url = HUB_INTERNAL_URL
 c.JupyterHub.log_level = settings.log_level
 c.JupyterHub.db_url = f"sqlite:///{settings.hub_data_dir}/jupyterhub.sqlite"
 c.JupyterHub.upgrade_db = True
@@ -48,7 +50,7 @@ c.JupyterHub.spawner_class = "dockerspawner.DockerSpawner"
 c.DockerSpawner.image = settings.lab_image
 c.DockerSpawner.network_name = "finki-hub-shell-users"
 c.DockerSpawner.use_internal_ip = True
-c.DockerSpawner.hub_connect_url = "http://172.30.0.1:8081"
+c.DockerSpawner.hub_connect_url = HUB_INTERNAL_URL
 c.DockerSpawner.name_template = "lab-{username}"
 c.DockerSpawner.port = 8888
 c.DockerSpawner.remove = True

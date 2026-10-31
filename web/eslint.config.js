@@ -9,7 +9,7 @@ import {
 } from 'eslint-config-imperium';
 
 const config = [
-  { ignores: ['dist'] },
+  { ignores: ['dist', 'coverage'] },
   ...base,
   { files: ['**/*.mts'], plugins: { jsdoc: base[0].plugins.jsdoc } },
   browser,

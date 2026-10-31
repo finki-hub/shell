@@ -165,7 +165,7 @@ export const useFiles = ({
   );
 
   const createFolder = useCallback(
-    async (name: string): Promise<ContentsErrorKind | null> =>
+    (name: string): Promise<ContentsErrorKind | null> =>
       mutate((active) =>
         createDirectory(active, { directory: pathRef.current, name }),
       ),
@@ -173,10 +173,7 @@ export const useFiles = ({
   );
 
   const rename = useCallback(
-    async (
-      entry: ContentsEntry,
-      name: string,
-    ): Promise<ContentsErrorKind | null> =>
+    (entry: ContentsEntry, name: string): Promise<ContentsErrorKind | null> =>
       mutate((active) =>
         renameEntry(active, {
           newPath: joinPath(parentPath(entry.path), name),
@@ -187,7 +184,7 @@ export const useFiles = ({
   );
 
   const remove = useCallback(
-    async (entry: ContentsEntry): Promise<ContentsErrorKind | null> =>
+    (entry: ContentsEntry): Promise<ContentsErrorKind | null> =>
       mutate((active) => deleteEntry(active, entry.path)),
     [mutate],
   );
@@ -209,13 +206,13 @@ export const useFiles = ({
   );
 
   const downloadFile = useCallback(
-    async (entry: ContentsEntry): Promise<ContentsErrorKind | null> =>
+    (entry: ContentsEntry): Promise<ContentsErrorKind | null> =>
       download((active, token) => fileDownloadUrl(active, entry.path, token)),
     [download],
   );
 
   const downloadDirectory = useCallback(
-    async (
+    (
       archivePath: string,
       format: ArchiveFormat,
     ): Promise<ContentsErrorKind | null> =>

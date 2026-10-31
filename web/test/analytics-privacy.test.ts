@@ -6,11 +6,6 @@ import {
   createAnalyticsController,
 } from '@/lib/analytics';
 
-type AnalyticsCall = {
-  readonly eventName: string;
-  readonly properties: { readonly boundary: 'server_message' };
-};
-
 describe('browser analytics privacy boundary', () => {
   it('does nothing for missing or whitespace-only build keys', async () => {
     let loads = 0;
@@ -33,6 +28,10 @@ describe('browser analytics privacy boundary', () => {
   });
 
   it('loads once after an intentional key and emits only the stable protocol marker', async () => {
+    type AnalyticsCall = {
+      readonly eventName: string;
+      readonly properties: { readonly boundary: 'server_message' };
+    };
     const load = Promise.withResolvers<BrowserAnalyticsClient>();
     const calls: AnalyticsCall[] = [];
     let loads = 0;
@@ -71,6 +70,7 @@ describe('browser analytics privacy boundary', () => {
       'https://eu.i.posthog.com',
     );
     expect(initialization.value?.options.autocapture).toBe(false);
+    expect(initialization.value?.options.advanced_disable_flags).toBe(true);
     expect(initialization.value?.options.capture_dead_clicks).toBe(false);
     expect(initialization.value?.options.capture_exceptions).toBe(false);
     expect(initialization.value?.options.capture_heatmaps).toBe(false);

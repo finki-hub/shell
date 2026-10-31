@@ -10,13 +10,13 @@ dependencies = [
     "jupyterhub>=6.1.1,<6.2",
     "jupyterhub-idle-culler>=2.0.0",
     "pydantic>=2.14.1",
-    "pydantic-settings>=2.16.1",
+    "pydantic-settings>=2.16.2",
     "requests>=2.34.2",
-    "tzdata>=2026.5",
+    "tzdata>=2026.6",
 ]
 
 [build-system]
-requires = ["hatchling>=1.32.4"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -24,8 +24,8 @@ packages = ["shell_hub"]
 
 [dependency-groups]
 dev = [
-    "mypy>=2.4.0",
-    "pytest>=9.1.1",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
     "ruff>=0.17.3",
     "types-docker>=7.2.0.20261006",
 ]

@@ -22,13 +22,6 @@ export type UploadQueue = {
 
 export type UploadState = 'done' | 'failed' | 'running' | 'waiting';
 
-type Job = {
-  readonly controller: AbortController;
-  readonly directory: string;
-  readonly file: File;
-  readonly id: number;
-};
-
 type UseUploadQueueInput = {
   readonly directory: () => string;
   readonly onSettled: (directory: string, ok: boolean) => void;
@@ -46,6 +39,12 @@ export const useUploadQueue = ({
   session,
   setTransferring,
 }: UseUploadQueueInput): UploadQueue => {
+  type Job = {
+    readonly controller: AbortController;
+    readonly directory: string;
+    readonly file: File;
+    readonly id: number;
+  };
   const [uploads, setUploads] = useState<readonly FileUpload[]>([]);
 
   const idRef = useRef(0);
@@ -101,6 +100,8 @@ export const useUploadQueue = ({
     try {
       let job = pendingRef.current.shift();
       while (job !== undefined) {
+        // Serial by design; iteration releases each completed File instead of
+        // retaining it in a recursive promise chain until the queue empties.
         await runJob(job);
         job = pendingRef.current.shift();
       }

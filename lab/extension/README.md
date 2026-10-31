@@ -32,7 +32,7 @@ and applies their project quotas.
 
 ## Local Checks
 
-Requires Python 3.14 and [`uv`](https://docs.astral.sh/uv/).
+Requires Python 3.14.10 and [`uv`](https://docs.astral.sh/uv/).
 
 ```sh
 cd lab/extension

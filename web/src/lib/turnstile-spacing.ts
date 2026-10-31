@@ -11,12 +11,6 @@ export type AttemptSpacing = {
   readonly acquire: (signal: AbortSignal) => Promise<'aborted' | 'ready'>;
 };
 
-type Entry = {
-  abort: (() => void) | null;
-  readonly resolve: (outcome: 'aborted' | 'ready') => void;
-  readonly signal: AbortSignal;
-};
-
 const systemClock: AttemptClock = {
   clearTimer: (timer) => {
     clearTimeout(timer);
@@ -29,6 +23,11 @@ export const createAttemptSpacing = (
   gapMs: number,
   clock: AttemptClock = systemClock,
 ): AttemptSpacing => {
+  type Entry = {
+    abort: (() => void) | null;
+    readonly resolve: (outcome: 'aborted' | 'ready') => void;
+    readonly signal: AbortSignal;
+  };
   const queue: Entry[] = [];
   let lastStartedAt: null | number = null;
   let timer: null | ReturnType<typeof setTimeout> = null;
