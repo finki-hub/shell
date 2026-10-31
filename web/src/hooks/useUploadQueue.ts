@@ -97,21 +97,17 @@ export const useUploadQueue = ({
     if (runningRef.current) return;
     runningRef.current = true;
     setTransferring(true);
-    // Read the queue after each job so newly enqueued work stays serial too.
-    const runNext = async (): Promise<void> => {
-      const job = pendingRef.current.shift();
-      if (job === undefined) return;
-      await runJob(job);
-      await runNext();
-    };
-    const finish = () => {
+    try {
+      let job = pendingRef.current.shift();
+      while (job !== undefined) {
+        // Serial by design; iteration releases each completed File instead of
+        // retaining it in a recursive promise chain until the queue empties.
+        await runJob(job);
+        job = pendingRef.current.shift();
+      }
+    } finally {
       runningRef.current = false;
       setTransferring(false);
-    };
-    try {
-      await runNext();
-    } finally {
-      finish();
     }
   }, [runJob, setTransferring]);
 
