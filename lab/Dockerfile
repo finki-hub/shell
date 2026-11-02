@@ -3,7 +3,7 @@ FROM ghcr.io/astral-sh/uv@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0
 
 # Keep /opt/jupyter/bin off PATH to separate server Python from shell Python.
 # Ubuntu 26.10
-FROM ubuntu@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118 AS jupyter
+FROM ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS jupyter
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -28,7 +28,7 @@ RUN uv build --wheel --out-dir /wheels \
     && uv pip install --python /opt/jupyter/bin/python --no-deps --no-build /wheels/*.whl
 
 # Ubuntu 26.10
-FROM ubuntu@sha256:9c3a42b7c0016cbf87ceb71fd72d26c0e73b37e532e2c6071707f124c489c118
+FROM ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
 
 RUN sed -i '\|path-exclude=/usr/share/man/\*|d' /etc/dpkg/dpkg.cfg.d/excludes \
     && apt-get update \
