@@ -860,7 +860,7 @@ wheels = [
 
 [[package]]
 name = "jupyterhub"
-version = "6.1.1"
+version = "6.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiodns" },
@@ -882,9 +882,9 @@ dependencies = [
     { name = "tornado" },
     { name = "traitlets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7f/2d/da2a9565b0a6b6fce11aa8e494f576a1e1ad5db54227d1f30044c7ed63d7/jupyterhub-6.1.1.tar.gz", hash = "sha256:1d7b6713b31ebd76d61a13c202f9323e66c4e8cf731adc5d3052bb6ee6178a95", size = 19336148, upload-time = "2026-10-20T19:51:40.711Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/1c/1a27edef8afa8f6b74576e2b3775b576c1921c299dffae8c066f400903ad/jupyterhub-6.2.0.tar.gz", hash = "sha256:9b610f59dab1d53ffab52c7f3905d43a4582ced7724ac27f67882be60131d5d7", size = 19337538, upload-time = "2026-11-05T19:37:09.714Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/70/8a769c5434db19b4ee3b07efff8426df97e3370f6006a652b28ebc2116f0/jupyterhub-6.1.1-py3-none-any.whl", hash = "sha256:ae20ed7b3d7cef1dd5d51e28723fd53853d69f732e7a9e84a73136acab454248", size = 15387758, upload-time = "2026-10-20T19:51:37.465Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/e0/8ccfa8427554bd00cd228de0c1136d0324392ae9bce7ca2430bcaef0833d/jupyterhub-6.2.0-py3-none-any.whl", hash = "sha256:cf40c31c39785a98113e4b38a041fd9fedc02127a9f06fd340d55fff11e79824", size = 15389496, upload-time = "2026-11-05T19:37:06.312Z" },
 ]
 
 [[package]]
@@ -1763,7 +1763,7 @@ requires-dist = [
     { name = "jupyter-archive", specifier = "==3.5.1" },
     { name = "jupyter-server", specifier = "==2.21.1" },
     { name = "jupyter-server-terminals", specifier = "==0.5.4" },
-    { name = "jupyterhub", specifier = "==6.1.1" },
+    { name = "jupyterhub", specifier = "==6.2.0" },
 ]
 
 [package.metadata.requires-dev]
