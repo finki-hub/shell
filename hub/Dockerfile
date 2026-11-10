@@ -5,7 +5,7 @@ FROM ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4
 FROM ghcr.io/astral-sh/uv@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 AS uv
 
 # Python 3.14.10 (Debian trixie)
-FROM python@sha256:f17ec845ebdd4f3347431579e1c22eaeec82913f039f2a54b937c7ff870bacdb AS builder
+FROM python@sha256:8c9a3bf2d6dea60d60a2ae2a07c2b2fb1e7d8daed64b146b6792c74ae0d62ac4 AS builder
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip install --python /app/.venv/bin/python --no-deps --no-build /wheels/*.whl
 
 # Python 3.14.10 (Debian trixie)
-FROM python@sha256:f17ec845ebdd4f3347431579e1c22eaeec82913f039f2a54b937c7ff870bacdb AS final
+FROM python@sha256:8c9a3bf2d6dea60d60a2ae2a07c2b2fb1e7d8daed64b146b6792c74ae0d62ac4 AS final
 
 # Seed homes from the Ubuntu lab image\'s /etc/skel.
 COPY --from=skel /etc/skel /opt/skel
