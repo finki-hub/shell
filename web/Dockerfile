@@ -20,7 +20,7 @@ ENV VITE_POSTHOG_KEY=$VITE_POSTHOG_KEY \
 RUN npm run build --workspace web
 
 # caddy:2.11.7-alpine
-FROM caddy@sha256:36c24ad91a7ff7bc4c87fe22bfa8df3c4b18da0773d73fc12ee2c52b98c0bb7e
+FROM caddy@sha256:ce773ec7a742ce15ee6bf2bb5f65882b9e2a4487b10733e6f1484f86e6b5d8bc
 
 RUN addgroup -S -g 10001 caddy \
     && adduser -S -D -H -u 10001 -G caddy caddy \
