@@ -19,6 +19,13 @@ updates:
       - /web
     schedule:
       interval: daily
+    ignore:
+      # The Hub runtime is locked to Python 3.14 until the projects are re-locked
+      # for 3.15 and all dependencies publish wheel-only installs.
+      - dependency-name: python
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
 
   - package-ecosystem: docker-compose
     directory: /
